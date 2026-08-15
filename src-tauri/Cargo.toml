@@ -1,6 +1,6 @@
 [package]
 name = "nexus-manager"
-version = "0.2.0"
+version = "0.2.1"
 description = "Nexus Mods manager for Linux and Windows"
 authors = ["nexus-manager contributors"]
 edition = "2021"

@@ -57,6 +57,11 @@ pub trait GamePlugin: Send + Sync {
         false
     }
 
+    /// Name of the directory used when wrapping a staged mod.
+    fn wrap_mod_folder_name(&self, _content_root: &Path, staged_name: &str) -> String {
+        sanitize_filename::sanitize(staged_name)
+    }
+
     /// When true, link files at the game install root instead of via `resolve_deploy_root`
     /// (e.g. SMAPI installer packages).
     fn deploys_to_install_root(&self, _content_root: &Path) -> bool {
@@ -78,7 +83,7 @@ pub trait GamePlugin: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Called after files are linked. `enabled_mod_folders` are sanitized wrap names
+    /// Called after files are linked. `enabled_mod_folders` are resolved wrap names
     /// for mods that should appear in a native load-order file (may be empty).
     /// Returns optional warning strings (deploy succeeds even if warnings are returned).
     fn after_deploy(
@@ -154,6 +159,32 @@ pub fn normalize_relative(relative: &Path) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+/// Prefer a peeled content-folder name over the Nexus title when wrapping.
+///
+/// Staging directories are `{safe}_{mod_id}_{file_id}`; those names are never used
+/// as the on-disk wrap folder.
+pub fn content_folder_wrap_name(content_root: &Path, staged_name: &str) -> String {
+    if let Some(name) = content_root.file_name().and_then(|n| n.to_str()) {
+        let sanitized = sanitize_filename::sanitize(name);
+        if !sanitized.is_empty() && !looks_like_staging_dir_name(&sanitized) {
+            return sanitized;
+        }
+    }
+    sanitize_filename::sanitize(staged_name)
+}
+
+fn looks_like_staging_dir_name(name: &str) -> bool {
+    let mut parts = name.rsplitn(3, '_');
+    let file_id = parts.next();
+    let mod_id = parts.next();
+    let rest = parts.next();
+    matches!(
+        (file_id, mod_id, rest),
+        (Some(f), Some(m), Some(r))
+            if !r.is_empty() && f.parse::<u64>().is_ok() && m.parse::<u64>().is_ok()
+    )
+}
+
 /// Strip a single top-level archive folder if the archive contained one root dir,
 /// unless that folder is a meaningful game-root name for the plugin.
 pub fn normalize_staging_root(staging_dir: &Path, plugin: &dyn GamePlugin) -> Result<PathBuf> {
@@ -208,6 +239,21 @@ mod tests {
         std::fs::create_dir_all(red4.path().join("red4ext").join("plugins")).unwrap();
         let kept_red = normalize_staging_root(red4.path(), &Cyberpunk2077Plugin).unwrap();
         assert_eq!(kept_red, red4.path());
+    }
+
+    #[test]
+    fn content_folder_wrap_name_skips_staging_suffix() {
+        let staging = tempfile::tempdir().unwrap();
+        let named = staging.path().join("CoolMod_12_34");
+        std::fs::create_dir_all(&named).unwrap();
+        assert_eq!(
+            content_folder_wrap_name(&named, "Cool Mod"),
+            "Cool Mod"
+        );
+
+        let peeled = staging.path().join("CoolMod");
+        std::fs::create_dir_all(&peeled).unwrap();
+        assert_eq!(content_folder_wrap_name(&peeled, "Cool Mod"), "CoolMod");
     }
 
     #[test]

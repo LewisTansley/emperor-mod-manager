@@ -369,9 +369,9 @@ pub fn deploy(
         let wrap = !to_root
             && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(&root));
         if wrap {
-            let safe = sanitize_filename::sanitize(&staged.name);
-            if !safe.is_empty() {
-                enabled_mod_folders.push(safe);
+            let folder_name = plugin.wrap_mod_folder_name(&root, &staged.name);
+            if !folder_name.is_empty() {
+                enabled_mod_folders.push(folder_name);
             }
         }
         let (files, copied) =
@@ -423,7 +423,7 @@ fn deploy_tree(
     let to_root = plugin.deploys_to_install_root(content_root);
     let wrap = !to_root
         && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root));
-    let safe_name = sanitize_filename::sanitize(mod_name);
+    let folder_name = plugin.wrap_mod_folder_name(content_root, mod_name);
 
     for entry in WalkDir::new(content_root)
         .into_iter()
@@ -436,7 +436,7 @@ fn deploy_tree(
         let rel = path.strip_prefix(content_root)?;
         let rel = normalize_relative(rel);
         let deploy_rel: PathBuf = if wrap {
-            Path::new(&safe_name).join(&rel)
+            Path::new(&folder_name).join(&rel)
         } else {
             rel
         };
@@ -656,7 +656,7 @@ mod tests {
             &LoadOrder {
                 mods: vec![StagedMod {
                     id: "4_4".into(),
-                    name: "MyRedMod".into(),
+                    name: "Nexus REDmod Title".into(),
                     nexus_mod_id: 4,
                     nexus_file_id: 4,
                     version: None,
@@ -672,6 +672,7 @@ mod tests {
         let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("mods/MyRedMod/info.json").exists());
+        assert!(!install.path().join("mods/Nexus REDmod Title").exists());
     }
 
     fn stage_stardew(
@@ -717,8 +718,9 @@ mod tests {
 
         let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
-        assert!(install.path().join("Mods/Cool Mod/manifest.json").exists());
-        assert!(install.path().join("Mods/Cool Mod/Cool.dll").exists());
+        assert!(install.path().join("Mods/CoolMod/manifest.json").exists());
+        assert!(install.path().join("Mods/CoolMod/Cool.dll").exists());
+        assert!(!install.path().join("Mods/Cool Mod/manifest.json").exists());
         assert!(!result.warnings.iter().any(|w| w.contains("SMAPI not found")));
     }
 
@@ -827,10 +829,10 @@ mod tests {
         )
         .unwrap();
 
-        let score_staging = paths.mods_dir(game_id).join("Scoreboard_1_1");
-        let score_inner = score_staging.join("scoreboard");
-        std::fs::create_dir_all(&score_inner).unwrap();
-        std::fs::write(score_inner.join("scoreboard.mod"), b"mod").unwrap();
+        let holy_light_staging = paths.mods_dir(game_id).join("Holy Light_1_1");
+        let holy_light_inner = holy_light_staging.join("HolyLight");
+        std::fs::create_dir_all(&holy_light_inner).unwrap();
+        std::fs::write(holy_light_inner.join("HolyLight.mod"), b"mod").unwrap();
 
         let dmf_staging = paths.mods_dir(game_id).join("DMF_2_2");
         std::fs::create_dir_all(dmf_staging.join("dmf")).unwrap();
@@ -848,12 +850,12 @@ mod tests {
                 mods: vec![
                     StagedMod {
                         id: "1_1".into(),
-                        name: "Scoreboard".into(),
+                        name: "Holy Light".into(),
                         nexus_mod_id: 1,
                         nexus_file_id: 1,
                         version: None,
                         domain: "warhammer40kdarktide".into(),
-                        staging_path: score_staging.to_string_lossy().into(),
+                        staging_path: holy_light_staging.to_string_lossy().into(),
                         enabled: true,
                         order: 1,
                     },
@@ -886,16 +888,15 @@ mod tests {
 
         let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path()).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
-        assert!(install
-            .path()
-            .join("mods/Scoreboard/scoreboard.mod")
-            .exists());
+        assert!(install.path().join("mods/HolyLight/HolyLight.mod").exists());
+        assert!(!install.path().join("mods/Holy Light").exists());
         assert!(install.path().join("mods/dmf/dmf.lua").exists());
         assert!(!install.path().join("mods/Healthbars").exists());
 
         let order_txt =
             std::fs::read_to_string(install.path().join("mods/mod_load_order.txt")).unwrap();
-        assert!(order_txt.contains("Scoreboard\n"));
+        assert!(order_txt.contains("HolyLight\n"));
+        assert!(!order_txt.contains("Holy Light\n"));
         assert!(!order_txt.lines().any(|l| l.trim() == "dmf"));
         assert!(!order_txt.contains("Healthbars"));
         assert!(!order_txt.contains("Darktide Mod Framework"));

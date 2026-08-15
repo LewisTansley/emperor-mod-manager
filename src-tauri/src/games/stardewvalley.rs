@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 
-use super::{normalize_relative, GamePlugin, GamePluginInfo};
+use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
 
 pub const STARDEW_ROOT_DIRS: &[&str] = &["Mods"];
 
@@ -29,6 +29,11 @@ impl GamePlugin for StardewValleyPlugin {
     fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
         // Single SMAPI mod with manifest at the (possibly peeled) root.
         !looks_like_smapi_installer(content_root) && content_root.join("manifest.json").is_file()
+    }
+
+    fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
+        // Prefer the author folder from the archive (after peel) over the Nexus title.
+        content_folder_wrap_name(content_root, staged_name)
     }
 
     fn deploys_to_install_root(&self, content_root: &Path) -> bool {
@@ -113,6 +118,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("manifest.json"), "{}").unwrap();
         assert!(plugin().should_wrap_as_mod_folder(dir.path()));
+    }
+
+    #[test]
+    fn wrap_name_prefers_peeled_folder_over_nexus_title() {
+        let staging = tempfile::tempdir().unwrap();
+        let content = staging.path().join("CoolMod");
+        std::fs::create_dir_all(&content).unwrap();
+        std::fs::write(content.join("manifest.json"), "{}").unwrap();
+        assert_eq!(
+            plugin().wrap_mod_folder_name(&content, "Cool Mod"),
+            "CoolMod"
+        );
     }
 
     #[test]

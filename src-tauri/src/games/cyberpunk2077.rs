@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 
-use super::{normalize_relative, GamePlugin, GamePluginInfo};
+use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
 
 /// Top-level folders that belong at the Cyberpunk 2077 install root.
 pub const CYBERPUNK_ROOT_DIRS: &[&str] = &["archive", "bin", "engine", "mods", "r6", "red4ext"];
@@ -30,6 +30,17 @@ impl GamePlugin for Cyberpunk2077Plugin {
     fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
         // REDmod packs use mods/<ModName>/info.json after a wrapper folder is peeled.
         content_root.join("info.json").is_file()
+    }
+
+    fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
+        // REDmod docs: folder name should match info.json "name".
+        if let Some(name) = redmod_name_from_info(content_root) {
+            let sanitized = sanitize_filename::sanitize(&name);
+            if !sanitized.is_empty() {
+                return sanitized;
+            }
+        }
+        content_folder_wrap_name(content_root, staged_name)
     }
 
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
@@ -69,6 +80,18 @@ impl GamePlugin for Cyberpunk2077Plugin {
         // Default: REDmod / leftover content under mods/
         Ok(install_path.join("mods").join(&normalized))
     }
+}
+
+fn redmod_name_from_info(content_root: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(content_root.join("info.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("name")
+        .or_else(|| value.get("Name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 fn path_components_lower(path: &Path) -> Vec<String> {
@@ -225,6 +248,20 @@ mod tests {
         assert!(plugin().should_wrap_as_mod_folder(dir.path()));
         let empty = tempfile::tempdir().unwrap();
         assert!(!plugin().should_wrap_as_mod_folder(empty.path()));
+    }
+
+    #[test]
+    fn wrap_name_uses_info_json_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("info.json"),
+            r#"{"name":"MyRedMod","version":"1.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plugin().wrap_mod_folder_name(dir.path(), "Nexus Display Title"),
+            "MyRedMod"
+        );
     }
 
     #[test]

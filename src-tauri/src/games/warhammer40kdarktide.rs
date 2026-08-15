@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::{normalize_relative, GamePlugin, GamePluginInfo};
+use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
 
 /// Top-level folders that belong at the Darktide install root (Mod Loader layout).
 pub const DARKTIDE_ROOT_DIRS: &[&str] = &["mods", "tools", "binaries", "bundle"];
@@ -47,6 +47,26 @@ impl GamePlugin for Warhammer40kDarktidePlugin {
         !is_loader_or_framework_root(content_root)
     }
 
+    fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
+        let mod_ids = root_mod_ids(content_root);
+        if mod_ids.len() == 1 {
+            return mod_ids[0].clone();
+        }
+
+        content_folder_wrap_name(content_root, staged_name)
+    }
+
+    fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
+        let mod_ids = root_mod_ids(content_root);
+        if mod_ids.len() > 1 {
+            vec![format!(
+                "{mod_name} contains multiple root .mod files; using the content folder name for Darktide deployment."
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
         let normalized = normalize_relative(relative);
         let components = path_components_lower(&normalized);
@@ -86,6 +106,30 @@ impl GamePlugin for Warhammer40kDarktidePlugin {
         }
         Ok(warnings)
     }
+}
+
+fn root_mod_ids(content_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(content_root) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_file() {
+                return None;
+            }
+            let path = entry.path();
+            let is_mod = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mod"));
+            is_mod
+                .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect()
 }
 
 fn is_loader_or_framework_root(content_root: &Path) -> bool {
@@ -411,6 +455,35 @@ mod tests {
         let normal = tempfile::tempdir().unwrap();
         std::fs::write(normal.path().join("scoreboard.mod"), b"x").unwrap();
         assert!(plugin().should_wrap_as_mod_folder(normal.path()));
+    }
+
+    #[test]
+    fn wrap_name_uses_root_mod_file_id() {
+        let normal = tempfile::tempdir().unwrap();
+        std::fs::write(normal.path().join("HolyLight.mod"), b"x").unwrap();
+
+        assert_eq!(
+            plugin().wrap_mod_folder_name(normal.path(), "Holy Light"),
+            "HolyLight"
+        );
+    }
+
+    #[test]
+    fn wrap_name_falls_back_to_content_folder_and_warns_for_multiple_mod_files() {
+        let staging = tempfile::tempdir().unwrap();
+        let content = staging.path().join("MultiPack");
+        std::fs::create_dir_all(&content).unwrap();
+        std::fs::write(content.join("First.mod"), b"x").unwrap();
+        std::fs::write(content.join("Second.mod"), b"x").unwrap();
+
+        assert_eq!(
+            plugin().wrap_mod_folder_name(&content, "Nexus Display Name"),
+            "MultiPack"
+        );
+        assert!(plugin()
+            .staging_deploy_warnings(&content, "Nexus Display Name")
+            .iter()
+            .any(|warning| warning.contains("multiple root .mod files")));
     }
 
     #[test]
