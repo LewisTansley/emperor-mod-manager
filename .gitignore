@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Frontend build
+dist/
+dist-ssr/
+*.local
+
+# Packaged app outputs
+dist-packages/
+*.deb
+*.rpm
+*.AppImage
+*.dmg
+*.msi
+*.exe
+*.app
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# Local caches and scratch dirs
+.cargo-tmp/
+.tmp/
+.cache/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.cursor/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
