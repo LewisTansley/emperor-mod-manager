@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { renderRichText } from "./richText";
+import { renderRichText } from "./richTextFormat";
 
 type RichTextProps = {
   text: string | null | undefined;

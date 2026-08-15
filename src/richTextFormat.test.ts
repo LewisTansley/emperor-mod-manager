@@ -8,7 +8,7 @@ import {
   looksLikeHtml,
   renderRichText,
   sanitizeRichHtml,
-} from "./richText";
+} from "./richTextFormat";
 
 describe("escapeHtml", () => {
   it("escapes markup characters", () => {
