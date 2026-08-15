@@ -366,6 +366,7 @@ function App() {
   const [tagsOpen, setTagsOpen] = useState(false);
   const [browseTotalCount, setBrowseTotalCount] = useState(0);
   const [browseHasMore, setBrowseHasMore] = useState(false);
+  const [browseSearched, setBrowseSearched] = useState(false);
   const [browseMeta, setBrowseMeta] = useState<BrowseMeta | null>(null);
   const [browseDetail, setBrowseDetail] = useState<BrowseDetail | null>(null);
   const [libraryDetail, setLibraryDetail] = useState<{
@@ -395,6 +396,8 @@ function App() {
   const mainScrollRef = useRef<HTMLElement | null>(null);
   const browseSentinelRef = useRef<HTMLDivElement | null>(null);
   const browseLoadingMoreRef = useRef(false);
+  const browseNextOffsetRef = useRef(0);
+  const browseAppendFailedRef = useRef(false);
   const browseRequestIdRef = useRef(0);
   const browseModeRef = useRef(browseMode);
   browseModeRef.current = browseMode;
@@ -417,6 +420,11 @@ function App() {
   );
   const activeGameRef = useRef(activeGame);
   activeGameRef.current = activeGame;
+
+  const unmanaged = useMemo(() => {
+    const managedIds = new Set(managed.map((g) => g.id));
+    return detected.filter((g) => !managedIds.has(g.id));
+  }, [detected, managed]);
 
   const themePref: ThemePreference = settings?.theme ?? "system";
 
@@ -443,11 +451,25 @@ function App() {
     setDownloads(await api.listDownloads());
   }, []);
 
+  const scan = useCallback(async () => {
+    setBusy("Scanning installed games…");
+    setError(null);
+    setNotice(null);
+    try {
+      setDetected(await api.scanGames());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
   useEffect(() => {
     (async () => {
       try {
         const s = await refreshSettings();
         await refreshManaged();
+        await scan();
         if (s.has_api_key) {
           try {
             await api.validateUser();
@@ -461,7 +483,7 @@ function App() {
         setError(String(e));
       }
     })();
-  }, [refreshManaged, refreshSettings]);
+  }, [refreshManaged, refreshSettings, scan]);
 
   useEffect(() => {
     if (themePref !== "system") {
@@ -537,15 +559,26 @@ function App() {
   }, [tagsOpen]);
 
   useEffect(() => {
-    if (tab !== "browse" || !browseHasMore) return;
+    // List (and sentinel) unmount while browseDetail is open — re-bind on Back.
+    if (tab !== "browse" || browseDetail || !browseHasMore) return;
     const sentinel = browseSentinelRef.current;
     const root = mainScrollRef.current;
     if (!sentinel || !root) return;
 
     const observer = new IntersectionObserver(
       (entries) => {
-        if (!entries.some((e) => e.isIntersecting)) return;
-        if (browseLoadingMoreRef.current || !browseHasMoreRef.current) return;
+        const visible = entries.some((e) => e.isIntersecting);
+        if (!visible) {
+          browseAppendFailedRef.current = false;
+          return;
+        }
+        if (
+          browseLoadingMoreRef.current ||
+          !browseHasMoreRef.current ||
+          browseAppendFailedRef.current
+        ) {
+          return;
+        }
         void runSearch(
           browseModeRef.current,
           searchQueryRef.current,
@@ -557,9 +590,17 @@ function App() {
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-    // Re-bind when result list size / mode / view changes so the sentinel stays observed.
+    // Re-bind when list remounts / size / mode / view changes so the sentinel stays observed.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runSearch reads latest via refs
-  }, [tab, browseMode, browseView, browseHasMore, modHits.length, collectionHits.length]);
+  }, [
+    tab,
+    browseDetail,
+    browseMode,
+    browseView,
+    browseHasMore,
+    modHits.length,
+    collectionHits.length,
+  ]);
 
   const isPremium = settings?.user?.is_premium ?? false;
 
@@ -1181,15 +1222,9 @@ function App() {
     });
   }
 
-  async function scan() {
-    await withBusy("Scanning installed games…", async () => {
-      setDetected(await api.scanGames());
-    });
-  }
-
   async function manage(game: DetectedGame) {
     if (!game.supported || !game.plugin_id || !game.nexus_domain || !game.install_path) {
-      setError("This game is detected but not supported yet.");
+      setError("This game is not supported yet.");
       return;
     }
     await withBusy(`Managing ${game.title}…`, async () => {
@@ -1259,20 +1294,70 @@ function App() {
       return;
     }
     if (append) {
-      if (browseLoadingMoreRef.current || !browseHasMore) return;
+      if (
+        browseLoadingMoreRef.current ||
+        !browseHasMoreRef.current ||
+        browseAppendFailedRef.current
+      ) {
+        return;
+      }
       browseLoadingMoreRef.current = true;
     }
 
     const requestId = ++browseRequestIdRef.current;
-    const offset = append
-      ? mode === "mods"
-        ? modHits.length
-        : collectionHits.length
-      : 0;
+    const offset = append ? browseNextOffsetRef.current : 0;
     const requestOpts: BrowseSearchOpts = { ...opts, offset };
+    let appendOk = false;
+
+    const applyPage = (
+      items: ModSearchHit[] | CollectionHit[],
+      totalCount: number,
+      merge: "mods" | "collections" | "replace-mods" | "replace-collections",
+    ) => {
+      const nextOffset = offset + items.length;
+      browseNextOffsetRef.current = nextOffset;
+      const hasMore = items.length > 0 && nextOffset < totalCount;
+      browseHasMoreRef.current = hasMore;
+      setBrowseHasMore(hasMore);
+      setBrowseTotalCount(totalCount);
+
+      if (merge === "replace-mods") {
+        setModHits(items as ModSearchHit[]);
+        setBrowseSearched(true);
+      } else if (merge === "replace-collections") {
+        setCollectionHits(items as CollectionHit[]);
+        setBrowseSearched(true);
+      } else if (merge === "mods") {
+        setModHits((prev) => {
+          const seen = new Set(prev.map((m) => m.mod_id));
+          const merged = [...prev];
+          for (const item of items as ModSearchHit[]) {
+            if (!seen.has(item.mod_id)) {
+              seen.add(item.mod_id);
+              merged.push(item);
+            }
+          }
+          return merged;
+        });
+      } else {
+        setCollectionHits((prev) => {
+          const seen = new Set(prev.map((c) => c.slug));
+          const merged = [...prev];
+          for (const item of items as CollectionHit[]) {
+            if (!seen.has(item.slug)) {
+              seen.add(item.slug);
+              merged.push(item);
+            }
+          }
+          return merged;
+        });
+      }
+    };
 
     try {
       if (!append) {
+        browseNextOffsetRef.current = 0;
+        browseAppendFailedRef.current = false;
         await withBusy("Searching Nexus…", async () => {
           if (mode === "mods") {
             const page = await api.searchMods(
@@ -1281,12 +1366,7 @@ function App() {
               requestOpts,
             );
             if (requestId !== browseRequestIdRef.current) return;
-            setModHits(page.items);
-            setBrowseTotalCount(page.total_count);
-            setBrowseHasMore(
-              page.items.length > 0 &&
-                page.items.length + offset < page.total_count,
-            );
+            applyPage(page.items, page.total_count, "replace-mods");
           } else {
             const page = await api.searchCollections(
               activeGame.nexus_domain,
@@ -1294,12 +1374,7 @@ function App() {
               requestOpts,
             );
             if (requestId !== browseRequestIdRef.current) return;
-            setCollectionHits(page.items);
-            setBrowseTotalCount(page.total_count);
-            setBrowseHasMore(
-              page.items.length > 0 &&
-                page.items.length + offset < page.total_count,
-            );
+            applyPage(page.items, page.total_count, "replace-collections");
           }
         });
       } else if (mode === "mods") {
@@ -1309,21 +1384,9 @@ function App() {
           requestOpts,
         );
         if (requestId !== browseRequestIdRef.current) return;
-        setModHits((prev) => {
-          const seen = new Set(prev.map((m) => m.mod_id));
-          const merged = [...prev];
-          for (const item of page.items) {
-            if (!seen.has(item.mod_id)) {
-              seen.add(item.mod_id);
-              merged.push(item);
-            }
-          }
-          setBrowseHasMore(
-            page.items.length > 0 && merged.length < page.total_count,
-          );
-          return merged;
-        });
-        setBrowseTotalCount(page.total_count);
+        applyPage(page.items, page.total_count, "mods");
+        appendOk = true;
+        browseAppendFailedRef.current = false;
       } else {
         const page = await api.searchCollections(
           activeGame.nexus_domain,
@@ -1331,30 +1394,53 @@ function App() {
           requestOpts,
         );
         if (requestId !== browseRequestIdRef.current) return;
-        setCollectionHits((prev) => {
-          const seen = new Set(prev.map((c) => c.slug));
-          const merged = [...prev];
-          for (const item of page.items) {
-            if (!seen.has(item.slug)) {
-              seen.add(item.slug);
-              merged.push(item);
-            }
-          }
-          setBrowseHasMore(
-            page.items.length > 0 && merged.length < page.total_count,
-          );
-          return merged;
-        });
-        setBrowseTotalCount(page.total_count);
+        applyPage(page.items, page.total_count, "collections");
+        appendOk = true;
+        browseAppendFailedRef.current = false;
       }
     } catch (e) {
       if (requestId === browseRequestIdRef.current) {
         setError(String(e));
-        if (!append) setBrowseHasMore(false);
+        if (!append) {
+          browseHasMoreRef.current = false;
+          setBrowseHasMore(false);
+        } else {
+          browseAppendFailedRef.current = true;
+        }
       }
     } finally {
-      if (append) browseLoadingMoreRef.current = false;
+      if (append) {
+        browseLoadingMoreRef.current = false;
+        if (
+          appendOk &&
+          requestId === browseRequestIdRef.current &&
+          browseHasMoreRef.current &&
+          isBrowseSentinelNearView()
+        ) {
+          queueMicrotask(() => {
+            void runSearch(
+              browseModeRef.current,
+              searchQueryRef.current,
+              browseOptsRef.current,
+              true,
+            );
+          });
+        }
+      }
     }
+  }
+
+  function isBrowseSentinelNearView(): boolean {
+    const sentinel = browseSentinelRef.current;
+    const root = mainScrollRef.current;
+    if (!sentinel || !root) return false;
+    const margin = 240;
+    const rootRect = root.getBoundingClientRect();
+    const sentRect = sentinel.getBoundingClientRect();
+    return (
+      sentRect.top < rootRect.bottom + margin &&
+      sentRect.bottom > rootRect.top - margin
+    );
   }
 
   async function search() {
@@ -2058,7 +2144,7 @@ function App() {
                   2077, Days Gone, S.T.A.L.K.E.R. 2: Heart of Chornobyl, Warhammer
                   40,000: Darktide, Dark Souls, Dark Souls Remastered, Dark Souls 2,
                   Dark Souls 3, Elden Ring, Resident Evil 7, Village, Requiem, 2/3/4
-                  Remake. Other detected games appear as unsupported.
+                  Remake. Other unmanaged games appear as unsupported.
                 </p>
                 {managed.length > 0 && (
                   <>
@@ -2102,10 +2188,10 @@ function App() {
                     )}
                   </>
                 )}
-                <h2>Detected</h2>
+                <h2>Unmanaged</h2>
                 {libraryView === "grid" ? (
                   <div className="media-grid">
-                    {detected.map((g) =>
+                    {unmanaged.map((g) =>
                       g.supported ? (
                         <MediaCard
                           key={g.id}
@@ -2124,13 +2210,16 @@ function App() {
                         />
                       ),
                     )}
-                    {detected.length === 0 && (
-                      <p className="note">Scan to find Steam / Heroic / Lutris / Bottles games.</p>
+                    {unmanaged.length === 0 && (
+                      <p className="note">
+                        No unmanaged games found. Scan again if you installed something
+                        while the app was open.
+                      </p>
                     )}
                   </div>
                 ) : (
                   <ul className="list">
-                    {detected.map((g) => (
+                    {unmanaged.map((g) => (
                       <li key={g.id}>
                         <div>
                           <strong>{g.title}</strong>
@@ -2145,8 +2234,11 @@ function App() {
                         ) : null}
                       </li>
                     ))}
-                    {detected.length === 0 && (
-                      <li className="empty">Scan to find Steam / Heroic / Lutris / Bottles games.</li>
+                    {unmanaged.length === 0 && (
+                      <li className="empty">
+                        No unmanaged games found. Scan again if you installed something
+                        while the app was open.
+                      </li>
                     )}
                   </ul>
                 )}
@@ -2516,11 +2608,15 @@ function App() {
                         onClick={() => {
                           setBrowseMode("mods");
                           setBrowseSort("endorsements");
+                          setBrowseCategory("");
+                          setBrowseVersion("");
                           setBrowseTags({});
                           setBrowseDetail(null);
                           runSearch("mods", searchQuery, {
                             ...browseOpts,
                             sort: "endorsements",
+                            category: null,
+                            gameVersion: null,
                             tagsInclude: [],
                             tagsExclude: [],
                             offset: 0,
@@ -2534,11 +2630,15 @@ function App() {
                         onClick={() => {
                           setBrowseMode("collections");
                           setBrowseSort("endorsements");
+                          setBrowseCategory("");
+                          setBrowseVersion("");
                           setBrowseTags({});
                           setBrowseDetail(null);
                           runSearch("collections", searchQuery, {
                             ...browseOpts,
                             sort: "endorsements",
+                            category: null,
+                            gameVersion: null,
                             tagsInclude: [],
                             tagsExclude: [],
                             offset: 0,
@@ -2774,7 +2874,11 @@ function App() {
                             );
                           })}
                           {modHits.length === 0 && (
-                            <p className="note">Search to find mods for this game.</p>
+                            <p className="note">
+                              {browseSearched
+                                ? "No results for this search."
+                                : "Search to find mods for this game."}
+                            </p>
                           )}
                         </div>
                       ) : (
@@ -2851,7 +2955,11 @@ function App() {
                           );
                         })}
                         {collectionHits.length === 0 && (
-                          <p className="note">Search to find collections for this game.</p>
+                          <p className="note">
+                            {browseSearched
+                              ? "No results for this search."
+                              : "Search to find collections for this game."}
+                          </p>
                         )}
                       </div>
                     ) : (

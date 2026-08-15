@@ -582,7 +582,7 @@ impl NexusClient {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        Ok(files
+        let mut out: Vec<ModFileInfo> = files
             .into_iter()
             .filter_map(|n| {
                 Some(ModFileInfo {
@@ -604,7 +604,13 @@ impl NexusClient {
                         .unwrap_or(false),
                 })
             })
-            .collect())
+            .collect();
+        out.sort_by(|a, b| {
+            b.uploaded_timestamp
+                .cmp(&a.uploaded_timestamp)
+                .then_with(|| b.file_id.cmp(&a.file_id))
+        });
+        Ok(out)
     }
 
     pub async fn download_file(
@@ -1426,7 +1432,8 @@ fn build_mods_filter(
     });
     apply_adult_content_filter(&mut filter, adult_content, true);
     if !query.trim().is_empty() {
-        filter["name"] = json!([{ "value": format!("*{}*", query.trim()), "op": "WILDCARD" }]);
+        // WILDCARD already applies leading/trailing wildcards; do not wrap with '*'.
+        filter["name"] = json!([{ "value": query.trim(), "op": "WILDCARD" }]);
     }
     if let Some(cat) = opts.category.as_ref().filter(|s| !s.is_empty()) {
         filter["categoryName"] = json!([{ "value": cat, "op": "EQUALS" }]);
@@ -1744,6 +1751,17 @@ mod tests {
             filter["adultContent"],
             json!([{ "value": false, "op": "EQUALS" }])
         );
+    }
+
+    #[test]
+    fn mods_filter_query_uses_bare_wildcard_value() {
+        let filter = build_mods_filter("skyrim", "SKSE", true, &base_opts());
+        assert_eq!(
+            filter["name"],
+            json!([{ "value": "SKSE", "op": "WILDCARD" }])
+        );
+        let value = filter["name"][0]["value"].as_str().unwrap();
+        assert!(!value.contains('*'), "WILDCARD must not wrap query with '*'");
     }
 
     #[test]
