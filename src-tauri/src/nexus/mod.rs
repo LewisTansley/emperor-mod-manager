@@ -1,13 +1,18 @@
 //! Nexus Mods REST v1 + GraphQL v2 client.
 
 use std::path::Path;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_RANGE, RANGE, USER_AGENT};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::{APP_NAME, APP_VERSION};
@@ -15,9 +20,13 @@ use crate::config::{APP_NAME, APP_VERSION};
 const REST_BASE: &str = "https://api.nexusmods.com/v1";
 const GQL_URL: &str = "https://api.nexusmods.com/v2/graphql";
 
-/// Cooperative cancel flag for an in-flight HTTP transfer.
+pub const CANCELLED_MSG: &str = "CANCELLED";
+pub const PAUSED_MSG: &str = "PAUSED";
+
+/// Cooperative cancel / pause flags for an in-flight HTTP transfer.
 pub struct TransferControl {
     pub cancel: Arc<AtomicBool>,
+    pub pause: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -51,6 +60,27 @@ pub struct ModSearchHit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameCategory {
+    pub category_id: u64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameInfo {
+    pub id: u64,
+    pub name: String,
+    pub domain_name: String,
+    pub genre: Option<String>,
+    pub forum_url: Option<String>,
+    pub nexusmods_url: Option<String>,
+    pub mods: Option<u64>,
+    pub file_count: Option<u64>,
+    pub downloads: Option<u64>,
+    #[serde(default)]
+    pub categories: Vec<GameCategory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModDetail {
     pub mod_id: u64,
     pub name: String,
@@ -65,7 +95,17 @@ pub struct ModDetail {
     pub updated_timestamp: Option<u64>,
     pub domain_name: String,
     #[serde(default)]
+    pub category_id: Option<u64>,
+    #[serde(default)]
     pub category: Option<String>,
+    #[serde(default)]
+    pub uploaded_by: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub contains_adult_content: bool,
+    #[serde(default)]
+    pub uploaded_users_profile_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +130,28 @@ pub struct CollectionHit {
     pub revision_number: Option<i64>,
     #[serde(default)]
     pub tile_image_url: Option<String>,
+    pub author: Option<String>,
+    pub category: Option<String>,
+    pub overall_rating: Option<f64>,
+    pub overall_rating_count: Option<u64>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub mod_count: Option<u64>,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionDetail {
+    pub slug: String,
+    pub name: String,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub endorsements: Option<u64>,
+    pub total_downloads: Option<u64>,
+    pub domain_name: Option<String>,
+    pub revision_number: Option<i64>,
+    #[serde(default)]
+    pub tile_image_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +168,10 @@ pub struct CollectionModFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowseMeta {
     pub categories: Vec<String>,
-    pub tags: Vec<String>,
+    /// Searchable mod tags (`legacyTags` + mod facets).
+    pub mod_tags: Vec<String>,
+    /// Collection tags (`availableTags` / `specificTags` + collection facets).
+    pub collection_tags: Vec<String>,
     pub game_versions: Vec<String>,
 }
 
@@ -114,9 +179,29 @@ pub struct BrowseMeta {
 pub struct BrowseSearchOpts {
     pub sort: String,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    pub tags_include: Vec<String>,
+    pub tags_exclude: Vec<String>,
     pub game_version: Option<String>,
+    pub offset: u32,
+    pub count: u32,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModSearchPage {
+    pub items: Vec<ModSearchHit>,
+    pub nodes_count: u64,
+    pub total_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSearchPage {
+    pub items: Vec<CollectionHit>,
+    pub nodes_count: u64,
+    pub total_count: u64,
+}
+
+const DEFAULT_MODS_PAGE_SIZE: u32 = 30;
+const DEFAULT_COLLECTIONS_PAGE_SIZE: u32 = 25;
 
 impl NexusClient {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
@@ -176,18 +261,38 @@ impl NexusClient {
         query: &str,
         adult_content: bool,
         opts: &BrowseSearchOpts,
-    ) -> Result<Vec<ModSearchHit>> {
+    ) -> Result<ModSearchPage> {
         let sort_key = normalize_sort(&opts.sort);
-        if query.trim().is_empty() && sort_key == "trending" && !has_extra_filters(opts) {
-            return self.trending_mods(domain).await;
+        let count = if opts.count == 0 {
+            DEFAULT_MODS_PAGE_SIZE
+        } else {
+            opts.count
+        };
+        let offset = opts.offset;
+
+        // Unpaged REST trending shortcut only for the first empty trending page.
+        if query.trim().is_empty()
+            && sort_key == "trending"
+            && !has_extra_filters(opts)
+            && offset == 0
+        {
+            let items = self.trending_mods(domain).await?;
+            let n = items.len() as u64;
+            return Ok(ModSearchPage {
+                items,
+                nodes_count: n,
+                total_count: n,
+            });
         }
 
         let sort = mods_sort_json(&sort_key, !query.trim().is_empty());
         let filter = build_mods_filter(domain, query, adult_content, opts);
 
         let gql = r#"
-        query SearchMods($filter: ModsFilter, $count: Int!, $sort: [ModsSort!]) {
-          mods(filter: $filter, count: $count, sort: $sort) {
+        query SearchMods($filter: ModsFilter, $count: Int!, $offset: Int, $sort: [ModsSort!]) {
+          mods(filter: $filter, count: $count, offset: $offset, sort: $sort) {
+            nodesCount
+            totalCount
             nodes {
               modId
               name
@@ -206,29 +311,54 @@ impl NexusClient {
 
         let variables = json!({
             "filter": filter,
-            "count": 30,
+            "count": count,
+            "offset": offset,
             "sort": [sort],
         });
 
         match self.graphql(gql, variables).await {
             Ok(data) => {
-                let nodes = data
-                    .pointer("/mods/nodes")
+                let page = data.get("mods").cloned().unwrap_or(Value::Null);
+                let nodes = page
+                    .get("nodes")
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
-                Ok(nodes
+                let items: Vec<ModSearchHit> = nodes
                     .into_iter()
                     .filter_map(|n| parse_mod_hit(&n, domain))
-                    .collect())
+                    .collect();
+                let nodes_count = page
+                    .get("nodesCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(items.len() as u64);
+                let total_count = page
+                    .get("totalCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(nodes_count);
+                Ok(ModSearchPage {
+                    items,
+                    nodes_count,
+                    total_count,
+                })
             }
             Err(e) => {
-                log::warn!("GraphQL search failed, falling back to REST: {e}");
-                if query.trim().is_empty() {
-                    self.trending_mods(domain).await
-                } else {
-                    self.search_mods_rest(domain, query).await
+                // REST fallback cannot honor offset / tag filters.
+                if offset > 0 || has_extra_filters(opts) {
+                    return Err(e);
                 }
+                log::warn!("GraphQL search failed, falling back to REST: {e}");
+                let items = if query.trim().is_empty() {
+                    self.trending_mods(domain).await?
+                } else {
+                    self.search_mods_rest(domain, query).await?
+                };
+                let n = items.len() as u64;
+                Ok(ModSearchPage {
+                    items,
+                    nodes_count: n,
+                    total_count: n,
+                })
             }
         }
     }
@@ -316,6 +446,59 @@ impl NexusClient {
             .collect())
     }
 
+    pub async fn get_game(&self, domain: &str) -> Result<GameInfo> {
+        let url = format!("{REST_BASE}/games/{domain}.json");
+        let resp = self.http.get(&url).send().await?;
+        self.check_rate_limit(&resp);
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("get game failed ({status}): {body}");
+        }
+        let n: Value = resp.json().await?;
+        let domain_name = n
+            .get("domain_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(domain)
+            .to_string();
+        let name = n
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(domain)
+            .to_string();
+        let id = n.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let categories = n
+            .get("categories")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some(GameCategory {
+                    category_id: c.get("category_id")?.as_u64()?,
+                    name: c.get("name")?.as_str()?.to_string(),
+                })
+            })
+            .collect();
+        Ok(GameInfo {
+            id,
+            name,
+            domain_name,
+            genre: n.get("genre").and_then(|v| v.as_str()).map(str::to_string),
+            forum_url: n
+                .get("forum_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            nexusmods_url: n
+                .get("nexusmods_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            mods: n.get("mods").and_then(|v| v.as_u64()),
+            file_count: n.get("file_count").and_then(|v| v.as_u64()),
+            downloads: n.get("downloads").and_then(|v| v.as_u64()),
+            categories,
+        })
+    }
+
     pub async fn get_mod(&self, domain: &str, mod_id: u64) -> Result<ModDetail> {
         let url = format!("{REST_BASE}/games/{domain}/mods/{mod_id}.json");
         let resp = self.http.get(&url).send().await?;
@@ -337,6 +520,7 @@ impl NexusClient {
             .and_then(|v| v.as_str())
             .unwrap_or(domain)
             .to_string();
+        let category_id = n.get("category_id").and_then(|v| v.as_u64());
         Ok(ModDetail {
             mod_id,
             name,
@@ -365,7 +549,21 @@ impl NexusClient {
             created_timestamp: n.get("created_timestamp").and_then(|v| v.as_u64()),
             updated_timestamp: n.get("updated_timestamp").and_then(|v| v.as_u64()),
             domain_name,
+            category_id,
             category: None,
+            uploaded_by: n
+                .get("uploaded_by")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            status: n.get("status").and_then(|v| v.as_str()).map(str::to_string),
+            contains_adult_content: n
+                .get("contains_adult_content")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            uploaded_users_profile_url: n
+                .get("uploaded_users_profile_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         })
     }
 
@@ -418,6 +616,7 @@ impl NexusClient {
         is_premium: bool,
         nxm_key: Option<&str>,
         nxm_expires: Option<u64>,
+        start_offset: u64,
         control: Option<&TransferControl>,
         on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
     ) -> Result<()> {
@@ -451,71 +650,178 @@ impl NexusClient {
             .ok_or_else(|| anyhow!("no download URI in response"))?
             .to_string();
 
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let resp = self.http.get(&download_url).send().await?;
-        let total = resp.content_length();
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut stream = resp.bytes_stream();
-        let mut downloaded: u64 = 0;
-        let started = std::time::Instant::now();
-        let mut last_report = started;
-        while let Some(chunk) = stream.next().await {
-            if control
-                .map(|c| c.cancel.load(std::sync::atomic::Ordering::SeqCst))
-                .unwrap_or(false)
-            {
-                drop(file);
-                let _ = tokio::fs::remove_file(dest).await;
-                bail!("CANCELLED");
-            }
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            let now = std::time::Instant::now();
-            if now.duration_since(last_report).as_millis() >= 150
-                || downloaded == total.unwrap_or(u64::MAX)
-            {
-                let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                let speed = (downloaded as f64 / elapsed) as u64;
-                if let Some(cb) = on_progress {
-                    cb(downloaded, total, speed);
-                }
-                last_report = now;
-            }
-        }
-        file.flush().await?;
-        if let Some(cb) = on_progress {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let speed = (downloaded as f64 / elapsed) as u64;
-            cb(downloaded, total.or(Some(downloaded)), speed);
-        }
-        Ok(())
+        stream_url_to_file(
+            &self.http,
+            &download_url,
+            dest,
+            start_offset,
+            None,
+            control,
+            on_progress,
+        )
+        .await
+    }
+}
+
+/// Stream an HTTP URL to `dest`, optionally resuming with a Range request.
+pub async fn stream_url_to_file(
+    http: &reqwest::Client,
+    download_url: &str,
+    dest: &Path,
+    start_offset: u64,
+    extra_headers: Option<&HeaderMap>,
+    control: Option<&TransferControl>,
+    on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
+) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
 
+    let mut offset = start_offset;
+    let mut req = http.get(download_url);
+    if let Some(headers) = extra_headers {
+        req = req.headers(headers.clone());
+    }
+    if offset > 0 {
+        req = req.header(RANGE, format!("bytes={offset}-"));
+    }
+
+    let resp = req.send().await?;
+    let status = resp.status();
+
+    if offset > 0 && status == StatusCode::OK {
+        // Server ignored Range — restart from scratch.
+        offset = 0;
+    } else if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
+        // Resume from offset.
+    } else if offset > 0
+        && (status == StatusCode::FORBIDDEN
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::GONE
+            || status == StatusCode::NOT_FOUND)
+    {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("resume failed ({status}): link expired or unavailable. {body}");
+    } else if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("download failed ({status}): {body}");
+    }
+
+    let content_len = resp.content_length();
+    let total = if status == StatusCode::PARTIAL_CONTENT {
+        parse_content_range_total(resp.headers().get(CONTENT_RANGE))
+            .or_else(|| content_len.map(|n| n + offset))
+    } else {
+        content_len
+    };
+
+    let mut file = if offset > 0 {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dest)
+            .await?
+    } else {
+        tokio::fs::File::create(dest).await?
+    };
+
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = offset;
+    let started = std::time::Instant::now();
+    let mut last_report = started;
+    // Bytes transferred this session (for speed).
+    let session_start = offset;
+
+    while let Some(chunk) = stream.next().await {
+        if control.map(|c| c.cancel.load(Ordering::SeqCst)).unwrap_or(false) {
+            drop(file);
+            let _ = tokio::fs::remove_file(dest).await;
+            bail!("{CANCELLED_MSG}");
+        }
+        if control.map(|c| c.pause.load(Ordering::SeqCst)).unwrap_or(false) {
+            file.flush().await?;
+            drop(file);
+            if let Some(cb) = on_progress {
+                cb(downloaded, total, 0);
+            }
+            bail!("{PAUSED_MSG}");
+        }
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        let now = std::time::Instant::now();
+        if now.duration_since(last_report).as_millis() >= 150
+            || downloaded == total.unwrap_or(u64::MAX)
+        {
+            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            let speed = ((downloaded - session_start) as f64 / elapsed) as u64;
+            if let Some(cb) = on_progress {
+                cb(downloaded, total, speed);
+            }
+            last_report = now;
+        }
+    }
+    file.flush().await?;
+    if let Some(cb) = on_progress {
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let speed = ((downloaded - session_start) as f64 / elapsed) as u64;
+        cb(downloaded, total.or(Some(downloaded)), speed);
+    }
+    Ok(())
+}
+
+fn parse_content_range_total(header: Option<&HeaderValue>) -> Option<u64> {
+    let s = header?.to_str().ok()?;
+    // e.g. "bytes 1000-1999/5000" or "bytes 1000-1999/*"
+    let total = s.split('/').nth(1)?.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+impl NexusClient {
     pub async fn search_collections(
         &self,
         domain: &str,
         query: &str,
         adult_content: bool,
         opts: &BrowseSearchOpts,
-    ) -> Result<Vec<CollectionHit>> {
+    ) -> Result<CollectionSearchPage> {
         let sort_key = normalize_sort(&opts.sort);
         let sort = collections_sort_json(&sort_key, !query.trim().is_empty());
         let filters = build_collections_filter(domain, query, adult_content, opts);
+        let count = if opts.count == 0 {
+            DEFAULT_COLLECTIONS_PAGE_SIZE
+        } else {
+            opts.count
+        };
+        let offset = opts.offset;
 
         let gql = r#"
-        query SearchCollections($filters: CollectionsSearchFilter, $count: Int, $sort: [CollectionsSearchSort!]) {
-          collectionsV2(filter: $filters, count: $count, sort: $sort) {
+        query SearchCollections($filters: CollectionsSearchFilter, $count: Int, $offset: Int, $sort: [CollectionsSearchSort!]) {
+          collectionsV2(filter: $filters, count: $count, offset: $offset, sort: $sort) {
+            nodesCount
+            totalCount
             nodes {
               slug
               name
               summary
               endorsements
               totalDownloads
+              overallRating
+              overallRatingCount
+              firstPublishedAt
+              updatedAt
+              category { name }
+              user { name }
               game { domainName }
-              latestPublishedRevision { revisionNumber }
+              latestPublishedRevision {
+                revisionNumber
+                modCount
+                fileSize
+                updatedAt
+              }
               tileImage {
                 url
                 thumbnailUrl(size: med)
@@ -530,19 +836,21 @@ impl NexusClient {
                 gql,
                 json!({
                     "filters": filters,
-                    "count": 25,
+                    "count": count,
+                    "offset": offset,
                     "sort": [sort],
                 }),
             )
             .await?;
 
-        let nodes = data
-            .pointer("/collectionsV2/nodes")
+        let page = data.get("collectionsV2").cloned().unwrap_or(Value::Null);
+        let nodes = page
+            .get("nodes")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
 
-        Ok(nodes
+        let items: Vec<CollectionHit> = nodes
             .into_iter()
             .filter_map(|n| {
                 let tile = n.get("tileImage");
@@ -550,6 +858,22 @@ impl NexusClient {
                     .and_then(|t| t.get("thumbnailUrl").and_then(|v| v.as_str()))
                     .or_else(|| tile.and_then(|t| t.get("url").and_then(|v| v.as_str())))
                     .map(str::to_string);
+                let updated_at = n
+                    .get("updatedAt")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        n.pointer("/latestPublishedRevision/updatedAt")
+                            .and_then(|v| v.as_str())
+                    })
+                    .map(str::to_string);
+                let overall_rating = n
+                    .get("overallRating")
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| {
+                        n.get("overallRating")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                    });
                 Some(CollectionHit {
                     slug: n.get("slug")?.as_str()?.to_string(),
                     name: n.get("name")?.as_str()?.to_string(),
@@ -567,9 +891,53 @@ impl NexusClient {
                         .pointer("/latestPublishedRevision/revisionNumber")
                         .and_then(|v| v.as_i64()),
                     tile_image_url,
+                    author: n
+                        .pointer("/user/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    category: n
+                        .pointer("/category/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    overall_rating,
+                    overall_rating_count: n.get("overallRatingCount").and_then(|v| v.as_u64()),
+                    created_at: n
+                        .get("firstPublishedAt")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    updated_at,
+                    mod_count: n
+                        .pointer("/latestPublishedRevision/modCount")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_i64().map(|i| i as u64))
+                                .or_else(|| v.as_f64().map(|f| f as u64))
+                        }),
+                    file_size: n
+                        .pointer("/latestPublishedRevision/fileSize")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_i64().map(|i| i as u64))
+                                .or_else(|| v.as_f64().map(|f| f as u64))
+                        }),
                 })
             })
-            .collect())
+            .collect();
+
+        let nodes_count = page
+            .get("nodesCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(items.len() as u64);
+        let total_count = page
+            .get("totalCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(nodes_count);
+
+        Ok(CollectionSearchPage {
+            items,
+            nodes_count,
+            total_count,
+        })
     }
 
     pub async fn browse_meta(&self, domain: &str, adult_content: bool) -> Result<BrowseMeta> {
@@ -592,14 +960,52 @@ impl NexusClient {
                 .and_then(|s| s.parse().ok())
         });
 
-        let mut tags: Vec<String> = Vec::new();
+        let mut collection_tags: Vec<String> = Vec::new();
         for key in ["availableTags", "specificTags"] {
             if let Some(arr) = game.get(key).and_then(|v| v.as_array()) {
                 for t in arr {
                     if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
-                        push_unique(&mut tags, name);
+                        push_unique(&mut collection_tags, name);
                     }
                 }
+            }
+        }
+
+        let mut mod_tags: Vec<String> = Vec::new();
+        if let Some(gid) = game_id {
+            let legacy_gql = r#"
+            query LegacyTags($gameId: ID, $excludeAdult: Boolean) {
+              legacyTags(gameId: $gameId, excludeAdult: $excludeAdult) {
+                name
+                searchable
+              }
+            }
+            "#;
+            let exclude_adult = if adult_content { Value::Null } else { json!(true) };
+            match self
+                .graphql(
+                    legacy_gql,
+                    json!({ "gameId": gid.to_string(), "excludeAdult": exclude_adult }),
+                )
+                .await
+            {
+                Ok(data) => {
+                    if let Some(arr) = data.get("legacyTags").and_then(|v| v.as_array()) {
+                        for t in arr {
+                            let searchable = t
+                                .get("searchable")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if !searchable {
+                                continue;
+                            }
+                            if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
+                                push_unique(&mut mod_tags, name);
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::warn!("legacyTags query failed: {e}"),
             }
         }
 
@@ -644,10 +1050,10 @@ impl NexusClient {
           }
         }
         "#;
-        let collection_filters = json!({
-            "gameDomain": { "value": domain, "op": "EQUALS" },
-            "adultContent": { "value": adult_content, "op": "EQUALS" },
+        let mut collection_filters = json!({
+            "gameDomain": [{ "value": domain, "op": "EQUALS" }],
         });
+        apply_adult_content_filter(&mut collection_filters, adult_content, false);
         match self
             .graphql(
                 collection_facet_gql,
@@ -668,7 +1074,7 @@ impl NexusClient {
                     "/collectionsV2/nodesFacets",
                     "/collectionsV2/facetsData",
                     &["tag"],
-                    &mut tags,
+                    &mut collection_tags,
                 );
                 merge_facet_bucket(
                     &data,
@@ -697,10 +1103,10 @@ impl NexusClient {
           }
         }
         "#;
-        let mods_filter = json!({
+        let mut mods_filter = json!({
             "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
-            "adultContent": [{ "value": adult_content, "op": "EQUALS" }],
         });
+        apply_adult_content_filter(&mut mods_filter, adult_content, true);
         match self
             .graphql(
                 mods_facet_gql,
@@ -714,7 +1120,7 @@ impl NexusClient {
                     "/mods/nodesFacets",
                     "/mods/facetsData",
                     &["tag"],
-                    &mut tags,
+                    &mut mod_tags,
                 );
                 merge_facet_bucket(
                     &data,
@@ -727,23 +1133,107 @@ impl NexusClient {
             Err(e) => log::warn!("mod facets failed: {e}"),
         }
 
-        // Version-like tags as fallback for mods game-version filter
+        // Version-like collection tags as fallback for game-version filter
         if game_versions.is_empty() {
-            for t in &tags {
+            for t in &collection_tags {
                 if looks_like_version(t) {
                     push_unique(&mut game_versions, t);
                 }
             }
         }
 
-        tags.sort_by_key(|s| s.to_lowercase());
+        mod_tags.sort_by_key(|s| s.to_lowercase());
+        collection_tags.sort_by_key(|s| s.to_lowercase());
         categories.sort_by_key(|s| s.to_lowercase());
         game_versions.sort_by_key(|s| s.to_lowercase());
 
         Ok(BrowseMeta {
             categories,
-            tags,
+            mod_tags,
+            collection_tags,
             game_versions,
+        })
+    }
+
+    pub async fn get_collection(
+        &self,
+        slug: &str,
+        domain: Option<&str>,
+        adult_content: bool,
+    ) -> Result<CollectionDetail> {
+        let gql = r#"
+        query CollectionDetail($slug: String!, $viewAdultContent: Boolean, $domainName: String) {
+          collection(slug: $slug, viewAdultContent: $viewAdultContent, domainName: $domainName) {
+            slug
+            name
+            summary
+            description
+            endorsements
+            totalDownloads
+            game { domainName }
+            latestPublishedRevision { revisionNumber }
+            tileImage {
+              url
+              thumbnailUrl(size: med)
+            }
+          }
+        }
+        "#;
+
+        let data = self
+            .graphql(
+                gql,
+                json!({
+                    "slug": slug,
+                    "viewAdultContent": adult_content,
+                    "domainName": domain,
+                }),
+            )
+            .await?;
+
+        let n = data
+            .get("collection")
+            .cloned()
+            .ok_or_else(|| anyhow!("collection detail missing collection node"))?;
+        if n.is_null() {
+            bail!("collection not found: {slug}");
+        }
+
+        let tile = n.get("tileImage");
+        let tile_image_url = tile
+            .and_then(|t| t.get("thumbnailUrl").and_then(|v| v.as_str()))
+            .or_else(|| tile.and_then(|t| t.get("url").and_then(|v| v.as_str())))
+            .map(str::to_string);
+
+        Ok(CollectionDetail {
+            slug: n
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or(slug)
+                .to_string(),
+            name: n
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("collection missing name"))?
+                .to_string(),
+            summary: n
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            description: n
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            endorsements: n.get("endorsements").and_then(|v| v.as_u64()),
+            total_downloads: n.get("totalDownloads").and_then(|v| v.as_u64()),
+            domain_name: n
+                .pointer("/game/domainName")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            revision_number: n
+                .pointer("/latestPublishedRevision/revisionNumber")
+                .and_then(|v| v.as_i64()),
+            tile_image_url,
         })
     }
 
@@ -852,7 +1342,8 @@ fn normalize_sort(sort: &str) -> String {
 
 fn has_extra_filters(opts: &BrowseSearchOpts) -> bool {
     opts.category.as_ref().is_some_and(|s| !s.is_empty())
-        || !opts.tags.is_empty()
+        || !opts.tags_include.is_empty()
+        || !opts.tags_exclude.is_empty()
         || opts.game_version.as_ref().is_some_and(|s| !s.is_empty())
 }
 
@@ -880,6 +1371,50 @@ fn collections_sort_json(sort_key: &str, has_query: bool) -> Value {
     json!({ key: { "direction": "DESC" } })
 }
 
+/// Official Nexus clients only set adultContent when excluding adult results.
+fn apply_adult_content_filter(filter: &mut Value, adult_content: bool, as_array: bool) {
+    if adult_content {
+        return;
+    }
+    let clause = json!({ "value": false, "op": "EQUALS" });
+    filter["adultContent"] = if as_array {
+        json!([clause])
+    } else {
+        clause
+    };
+}
+
+fn tag_value(value: &str, op: &str) -> Value {
+    json!({ "value": value, "op": op })
+}
+
+fn apply_tag_filters(filter: &mut Value, include: &[String], exclude: &[String]) {
+    let includes: Vec<&String> = include.iter().filter(|t| !t.is_empty()).collect();
+    let excludes: Vec<&String> = exclude.iter().filter(|t| !t.is_empty()).collect();
+    let total = includes.len() + excludes.len();
+    if total == 0 {
+        return;
+    }
+    if total == 1 {
+        if let Some(t) = includes.first() {
+            filter["tag"] = json!([tag_value(t, "EQUALS")]);
+        } else if let Some(t) = excludes.first() {
+            filter["tag"] = json!([tag_value(t, "NOT_EQUALS")]);
+        }
+        return;
+    }
+
+    let mut nested: Vec<Value> = Vec::with_capacity(total);
+    for t in includes {
+        nested.push(json!({ "tag": [tag_value(t, "EQUALS")] }));
+    }
+    for t in excludes {
+        nested.push(json!({ "tag": [tag_value(t, "NOT_EQUALS")] }));
+    }
+    filter["filter"] = Value::Array(nested);
+    filter["op"] = json!("AND");
+}
+
 fn build_mods_filter(
     domain: &str,
     query: &str,
@@ -888,26 +1423,16 @@ fn build_mods_filter(
 ) -> Value {
     let mut filter = json!({
         "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
-        "adultContent": [{ "value": adult_content, "op": "EQUALS" }],
     });
+    apply_adult_content_filter(&mut filter, adult_content, true);
     if !query.trim().is_empty() {
         filter["name"] = json!([{ "value": format!("*{}*", query.trim()), "op": "WILDCARD" }]);
     }
     if let Some(cat) = opts.category.as_ref().filter(|s| !s.is_empty()) {
         filter["categoryName"] = json!([{ "value": cat, "op": "EQUALS" }]);
     }
-    let mut tag_values: Vec<Value> = opts
-        .tags
-        .iter()
-        .filter(|t| !t.is_empty())
-        .map(|t| json!({ "value": t, "op": "EQUALS" }))
-        .collect();
-    if let Some(ver) = opts.game_version.as_ref().filter(|s| !s.is_empty()) {
-        tag_values.push(json!({ "value": ver, "op": "EQUALS" }));
-    }
-    if !tag_values.is_empty() {
-        filter["tag"] = Value::Array(tag_values);
-    }
+    // ModsFilter has no gameVersion field; do not stuff versions into tag.
+    apply_tag_filters(&mut filter, &opts.tags_include, &opts.tags_exclude);
     filter
 }
 
@@ -918,33 +1443,19 @@ fn build_collections_filter(
     opts: &BrowseSearchOpts,
 ) -> Value {
     let mut filter = json!({
-        "gameDomain": { "value": domain, "op": "EQUALS" },
-        "adultContent": { "value": adult_content, "op": "EQUALS" },
+        "gameDomain": [{ "value": domain, "op": "EQUALS" }],
     });
+    apply_adult_content_filter(&mut filter, adult_content, true);
     if !query.trim().is_empty() {
-        filter["generalSearch"] = json!({ "value": query.trim(), "op": "WILDCARD" });
+        filter["generalSearch"] = json!([{ "value": query.trim(), "op": "WILDCARD" }]);
     }
     if let Some(cat) = opts.category.as_ref().filter(|s| !s.is_empty()) {
-        filter["categoryName"] = json!({ "value": cat, "op": "EQUALS" });
+        filter["categoryName"] = json!([{ "value": cat, "op": "EQUALS" }]);
     }
     if let Some(ver) = opts.game_version.as_ref().filter(|s| !s.is_empty()) {
-        filter["gameVersion"] = json!({ "value": ver, "op": "EQUALS" });
+        filter["gameVersion"] = json!([{ "value": ver, "op": "EQUALS" }]);
     }
-    if !opts.tags.is_empty() {
-        // Collections filter accepts a single tag field; AND via nested filters when multiple.
-        if opts.tags.len() == 1 {
-            filter["tag"] = json!({ "value": &opts.tags[0], "op": "EQUALS" });
-        } else {
-            let nested: Vec<Value> = opts
-                .tags
-                .iter()
-                .filter(|t| !t.is_empty())
-                .map(|t| json!({ "tag": { "value": t, "op": "EQUALS" } }))
-                .collect();
-            filter["filter"] = Value::Array(nested);
-            filter["op"] = json!("AND");
-        }
-    }
+    apply_tag_filters(&mut filter, &opts.tags_include, &opts.tags_exclude);
     filter
 }
 
@@ -1211,5 +1722,131 @@ mod tests {
         assert_eq!(link.file_id, 12345);
         assert_eq!(link.key.as_deref(), Some("abc"));
         assert_eq!(link.expires, Some(1));
+    }
+
+    fn base_opts() -> BrowseSearchOpts {
+        BrowseSearchOpts {
+            sort: "endorsements".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mods_filter_omits_adult_when_included() {
+        let filter = build_mods_filter("skyrim", "", true, &base_opts());
+        assert!(filter.get("adultContent").is_none());
+    }
+
+    #[test]
+    fn mods_filter_excludes_adult_when_disabled() {
+        let filter = build_mods_filter("skyrim", "", false, &base_opts());
+        assert_eq!(
+            filter["adultContent"],
+            json!([{ "value": false, "op": "EQUALS" }])
+        );
+    }
+
+    #[test]
+    fn mods_filter_single_include_tag() {
+        let mut opts = base_opts();
+        opts.tags_include = vec!["Performance".into()];
+        let filter = build_mods_filter("skyrim", "", true, &opts);
+        assert_eq!(
+            filter["tag"],
+            json!([{ "value": "Performance", "op": "EQUALS" }])
+        );
+        assert!(filter.get("filter").is_none());
+    }
+
+    #[test]
+    fn mods_filter_single_exclude_tag() {
+        let mut opts = base_opts();
+        opts.tags_exclude = vec!["NSFW".into()];
+        let filter = build_mods_filter("skyrim", "", true, &opts);
+        assert_eq!(
+            filter["tag"],
+            json!([{ "value": "NSFW", "op": "NOT_EQUALS" }])
+        );
+    }
+
+    #[test]
+    fn mods_filter_multi_include_uses_and() {
+        let mut opts = base_opts();
+        opts.tags_include = vec!["A".into(), "B".into()];
+        let filter = build_mods_filter("skyrim", "", true, &opts);
+        assert_eq!(filter["op"], json!("AND"));
+        assert_eq!(
+            filter["filter"],
+            json!([
+                { "tag": [{ "value": "A", "op": "EQUALS" }] },
+                { "tag": [{ "value": "B", "op": "EQUALS" }] },
+            ])
+        );
+    }
+
+    #[test]
+    fn mods_filter_mixed_include_exclude() {
+        let mut opts = base_opts();
+        opts.tags_include = vec!["A".into()];
+        opts.tags_exclude = vec!["B".into()];
+        let filter = build_mods_filter("skyrim", "", true, &opts);
+        assert_eq!(filter["op"], json!("AND"));
+        assert_eq!(
+            filter["filter"],
+            json!([
+                { "tag": [{ "value": "A", "op": "EQUALS" }] },
+                { "tag": [{ "value": "B", "op": "NOT_EQUALS" }] },
+            ])
+        );
+    }
+
+    #[test]
+    fn mods_filter_ignores_game_version() {
+        let mut opts = base_opts();
+        opts.game_version = Some("1.6.0".into());
+        let filter = build_mods_filter("skyrim", "", true, &opts);
+        assert!(filter.get("tag").is_none());
+        assert!(filter.get("gameVersion").is_none());
+    }
+
+    #[test]
+    fn collections_filter_arrays_and_version() {
+        let mut opts = base_opts();
+        opts.game_version = Some("1.6.0".into());
+        opts.tags_include = vec!["Gameplay".into()];
+        let filter = build_collections_filter("skyrim", "quest", false, &opts);
+        assert_eq!(
+            filter["gameDomain"],
+            json!([{ "value": "skyrim", "op": "EQUALS" }])
+        );
+        assert_eq!(
+            filter["adultContent"],
+            json!([{ "value": false, "op": "EQUALS" }])
+        );
+        assert_eq!(
+            filter["gameVersion"],
+            json!([{ "value": "1.6.0", "op": "EQUALS" }])
+        );
+        assert_eq!(
+            filter["tag"],
+            json!([{ "value": "Gameplay", "op": "EQUALS" }])
+        );
+    }
+
+    #[test]
+    fn has_extra_filters_detects_include_and_exclude() {
+        let mut opts = base_opts();
+        assert!(!has_extra_filters(&opts));
+        opts.tags_include = vec!["A".into()];
+        assert!(has_extra_filters(&opts));
+        opts.tags_include.clear();
+        opts.tags_exclude = vec!["B".into()];
+        assert!(has_extra_filters(&opts));
+    }
+
+    #[test]
+    fn page_size_defaults() {
+        assert_eq!(DEFAULT_MODS_PAGE_SIZE, 30);
+        assert_eq!(DEFAULT_COLLECTIONS_PAGE_SIZE, 25);
     }
 }

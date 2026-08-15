@@ -58,10 +58,12 @@ pub fn run() {
             commands::validate_user,
             commands::clear_api_key,
             commands::search_mods,
+            commands::get_game,
             commands::get_mod,
             commands::mod_files,
             commands::search_collections,
             commands::browse_meta,
+            commands::get_collection,
             commands::collection_files,
             commands::download_mod,
             commands::install_collection,
@@ -78,6 +80,8 @@ pub fn run() {
             commands::list_downloads,
             commands::cancel_download,
             commands::cancel_download_batch,
+            commands::pause_download,
+            commands::resume_download,
             assist::open_download_assist,
             assist::close_download_assist,
             assist::clear_assist_session,
@@ -85,6 +89,10 @@ pub fn run() {
             assist::set_assist_visible,
         ])
         .setup(|app| {
+            // Register nxm:// with the OS when supported (Windows installer / Linux desktop).
+            if let Err(e) = app.deep_link().register_all() {
+                log::warn!("deep-link register_all failed: {e}");
+            }
             let handle = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {

@@ -5,7 +5,6 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{bail, Context, Result};
@@ -135,60 +134,14 @@ fn looks_like_rar(archive: &Path) -> bool {
     magic[0..4] == *b"Rar!" && magic[4] == 0x1a && magic[5] == 0x07
 }
 
-fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(name);
-                candidate.is_file()
-            })
-        })
-        .unwrap_or(false)
-}
-
 fn extract_rar(archive: &Path, dest: &Path) -> Result<()> {
-    // unrar: trailing slash on dest puts members inside dest (not next to it).
-    if on_path("unrar") {
-        let dest_arg = format!("{}/", dest.display());
-        let output = Command::new("unrar")
-            .args(["x", "-o+", "-y"])
-            .arg(archive)
-            .arg(&dest_arg)
-            .output()
-            .context("failed to run unrar")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let detail = extract_cmd_detail(&output);
-        bail!("unrar extract failed: {detail}");
-    }
-
-    if on_path("unar") {
-        let output = Command::new("unar")
-            .args(["-force-overwrite", "-output-directory"])
-            .arg(dest)
-            .arg(archive)
-            .output()
-            .context("failed to run unar")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let detail = extract_cmd_detail(&output);
-        bail!("unar extract failed: {detail}");
-    }
-
-    bail!("RAR archives require `unrar` or `unar` on PATH (e.g. pacman -S unrar)");
-}
-
-fn extract_cmd_detail(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = stderr.trim();
-    if detail.is_empty() {
-        stdout.trim().to_string()
-    } else {
-        detail.to_string()
-    }
+    let archive = unrar_ng::Archive::new(archive)
+        .open_for_processing()
+        .map_err(|e| anyhow::anyhow!("rar open: {e}"))?;
+    archive
+        .extract_all(dest)
+        .map_err(|e| anyhow::anyhow!("rar extract: {e}"))?;
+    Ok(())
 }
 
 pub fn stage_mod(
@@ -285,7 +238,13 @@ pub fn remove_all_mods(paths: &Paths, game_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkKind {
+    HardlinkOrSymlink,
+    Copied,
+}
+
+fn link_or_copy(src: &Path, dest: &Path) -> Result<LinkKind> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -299,18 +258,41 @@ fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
     // Hardlink files; directories are created normally and children linked.
     if src.is_dir() {
         fs::create_dir_all(dest)?;
-        return Ok(());
+        return Ok(LinkKind::HardlinkOrSymlink);
     }
     match fs::hard_link(src, dest) {
-        Ok(()) => Ok(()),
-        Err(_) => match std::os::unix::fs::symlink(src, dest) {
-            Ok(()) => Ok(()),
-            Err(_) => {
+        Ok(()) => Ok(LinkKind::HardlinkOrSymlink),
+        Err(_) => match symlink_file(src, dest) {
+            Ok(()) => Ok(LinkKind::HardlinkOrSymlink),
+            Err(e) => {
+                log::debug!(
+                    "symlink failed for {} -> {} ({e}); copying instead",
+                    src.display(),
+                    dest.display()
+                );
                 fs::copy(src, dest)?;
-                Ok(())
+                Ok(LinkKind::Copied)
             }
         },
     }
+}
+
+#[cfg(unix)]
+fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dest)
+}
+
+#[cfg(windows)]
+fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(src, dest)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn symlink_file(_src: &Path, dest: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("symlink unsupported on this platform for {}", dest.display()),
+    ))
 }
 
 pub fn purge_deploy(paths: &Paths, game_id: &str) -> Result<()> {
@@ -354,6 +336,9 @@ pub fn deploy(
         );
     }
 
+    warnings.extend(plugin.prepare_deploy(install_path)?);
+    warnings.extend(plugin.preflight_warnings(install_path));
+
     purge_deploy(paths, game_id)?;
 
     let mut order = load_loadorder(paths, game_id)?;
@@ -361,8 +346,10 @@ pub fn deploy(
 
     let mut deployed = DeployManifest::default();
     let mut count = 0usize;
+    let mut copied_files = 0usize;
     let enabled: Vec<_> = order.mods.iter().filter(|m| m.enabled).cloned().collect();
     let enabled_mods = enabled.len();
+    let mut enabled_mod_folders = Vec::new();
 
     for staged in &enabled {
         let staging = PathBuf::from(&staged.staging_path);
@@ -377,11 +364,31 @@ pub fn deploy(
             continue;
         }
         let root = normalize_staging_root(&staging, plugin)?;
-        let files = deploy_tree(plugin, install_path, &root, &staged.name, &mut deployed)?;
+        warnings.extend(plugin.staging_deploy_warnings(&root, &staged.name));
+        let to_root = plugin.deploys_to_install_root(&root);
+        let wrap = !to_root
+            && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(&root));
+        if wrap {
+            let safe = sanitize_filename::sanitize(&staged.name);
+            if !safe.is_empty() {
+                enabled_mod_folders.push(safe);
+            }
+        }
+        let (files, copied) =
+            deploy_tree(plugin, install_path, &root, &staged.name, &mut deployed)?;
         if files == 0 {
             warnings.push(format!("No files deployed from {}", staged.name));
         }
+        if copied > 0 {
+            copied_files += copied;
+        }
         count += files;
+    }
+
+    if copied_files > 0 {
+        warnings.push(format!(
+            "{copied_files} file(s) were copied instead of hardlinked/symlinked (cross-volume or missing symlink privilege). On Windows, enable Developer Mode for symlink deploy."
+        ));
     }
 
     if enabled_mods == 0 {
@@ -389,6 +396,8 @@ pub fn deploy(
     } else if count == 0 {
         warnings.push("Deploy finished with 0 files linked.".into());
     }
+
+    warnings.extend(plugin.after_deploy(install_path, &enabled_mod_folders)?);
 
     crate::config::ensure_game_dirs(paths, game_id)?;
     fs::write(
@@ -408,9 +417,12 @@ fn deploy_tree(
     content_root: &Path,
     mod_name: &str,
     deployed: &mut DeployManifest,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let mut n = 0usize;
-    let wrap = plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root);
+    let mut copied = 0usize;
+    let to_root = plugin.deploys_to_install_root(content_root);
+    let wrap = !to_root
+        && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root));
     let safe_name = sanitize_filename::sanitize(mod_name);
 
     for entry in WalkDir::new(content_root)
@@ -428,8 +440,12 @@ fn deploy_tree(
         } else {
             rel
         };
+        let dest = if to_root {
+            install_path.join(&deploy_rel)
+        } else {
+            plugin.resolve_deploy_root(install_path, &deploy_rel)?
+        };
         if entry.file_type().is_dir() {
-            let dest = plugin.resolve_deploy_root(install_path, &deploy_rel)?;
             fs::create_dir_all(&dest)?;
             deployed.paths.push(dest.to_string_lossy().to_string());
             continue;
@@ -437,12 +453,13 @@ fn deploy_tree(
         if !entry.file_type().is_file() {
             continue;
         }
-        let dest = plugin.resolve_deploy_root(install_path, &deploy_rel)?;
-        link_or_copy(path, &dest)?;
+        if link_or_copy(path, &dest)? == LinkKind::Copied {
+            copied += 1;
+        }
         deployed.paths.push(dest.to_string_lossy().to_string());
         n += 1;
     }
-    Ok(n)
+    Ok((n, copied))
 }
 
 #[cfg(test)]
@@ -655,5 +672,285 @@ mod tests {
         let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("mods/MyRedMod/info.json").exists());
+    }
+
+    fn stage_stardew(
+        paths: &Paths,
+        game_id: &str,
+        id: &str,
+        name: &str,
+        staging: PathBuf,
+    ) {
+        save_loadorder(
+            paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: id.into(),
+                    name: name.into(),
+                    nexus_mod_id: 1,
+                    nexus_file_id: 1,
+                    version: None,
+                    domain: "stardewvalley".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deploy_stardew_wraps_manifest_mod() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sdv_wrap";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("smapi-internal")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("Cool_1_1");
+        let inner = staging.join("CoolMod");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("manifest.json"), r#"{"UniqueID":"A.Cool"}"#).unwrap();
+        std::fs::write(inner.join("Cool.dll"), b"dll").unwrap();
+        stage_stardew(&paths, game_id, "1_1", "Cool Mod", staging);
+
+        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        assert!(result.file_count >= 2, "{:?}", result.warnings);
+        assert!(install.path().join("Mods/Cool Mod/manifest.json").exists());
+        assert!(install.path().join("Mods/Cool Mod/Cool.dll").exists());
+        assert!(!result.warnings.iter().any(|w| w.contains("SMAPI not found")));
+    }
+
+    #[test]
+    fn deploy_stardew_mods_prefix_no_double_nest() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sdv_mods";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("smapi-internal")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("Pack_2_2");
+        std::fs::create_dir_all(staging.join("Mods").join("CoolMod")).unwrap();
+        std::fs::write(
+            staging.join("Mods").join("CoolMod").join("manifest.json"),
+            "{}",
+        )
+        .unwrap();
+        stage_stardew(&paths, game_id, "2_2", "Pack", staging);
+
+        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        assert_eq!(result.file_count, 1, "{:?}", result.warnings);
+        assert!(install.path().join("Mods/CoolMod/manifest.json").exists());
+        assert!(!install
+            .path()
+            .join("Mods/Pack/Mods/CoolMod/manifest.json")
+            .exists());
+    }
+
+    #[test]
+    fn deploy_stardew_multi_mod_siblings() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sdv_multi";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("smapi-internal")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("Bundle_3_3");
+        for name in ["ModA", "ModB"] {
+            let dir = staging.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        }
+        stage_stardew(&paths, game_id, "3_3", "Bundle", staging);
+
+        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        assert_eq!(result.file_count, 2, "{:?}", result.warnings);
+        assert!(install.path().join("Mods/ModA/manifest.json").exists());
+        assert!(install.path().join("Mods/ModB/manifest.json").exists());
+    }
+
+    #[test]
+    fn deploy_stardew_warns_without_smapi() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sdv_nosmapi";
+        let install = tempfile::tempdir().unwrap();
+
+        let staging = paths.mods_dir(game_id).join("M_4_4");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("manifest.json"), "{}").unwrap();
+        stage_stardew(&paths, game_id, "4_4", "M", staging);
+
+        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("SMAPI not found")));
+        assert!(install.path().join("Mods/M/manifest.json").exists());
+    }
+
+    #[test]
+    fn deploy_stardew_smapi_installer_to_root() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sdv_smapi";
+        let install = tempfile::tempdir().unwrap();
+
+        let staging = paths.mods_dir(game_id).join("SMAPI_5_5");
+        let inner = staging.join("SMAPI 4.0");
+        std::fs::create_dir_all(inner.join("smapi-internal")).unwrap();
+        std::fs::write(inner.join("StardewModdingAPI.exe"), b"exe").unwrap();
+        std::fs::write(inner.join("smapi-internal").join("config.json"), b"{}").unwrap();
+        stage_stardew(&paths, game_id, "5_5", "SMAPI", staging);
+
+        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        assert!(result.file_count >= 2, "{:?}", result.warnings);
+        assert!(install.path().join("StardewModdingAPI.exe").exists());
+        assert!(install.path().join("smapi-internal/config.json").exists());
+        assert!(!install
+            .path()
+            .join("Mods/SMAPI/StardewModdingAPI.exe")
+            .exists());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("SMAPI installer")));
+    }
+
+    #[test]
+    fn deploy_darktide_writes_load_order_and_skips_dmf() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "dt_test";
+        let install = tempfile::tempdir().unwrap();
+        // Already patched so we do not spawn dtkit-patch.
+        std::fs::create_dir_all(install.path().join("bundle")).unwrap();
+        std::fs::write(
+            install.path().join("bundle/bundle_database.data"),
+            b"xxxpatch_999yyy",
+        )
+        .unwrap();
+
+        let score_staging = paths.mods_dir(game_id).join("Scoreboard_1_1");
+        let score_inner = score_staging.join("scoreboard");
+        std::fs::create_dir_all(&score_inner).unwrap();
+        std::fs::write(score_inner.join("scoreboard.mod"), b"mod").unwrap();
+
+        let dmf_staging = paths.mods_dir(game_id).join("DMF_2_2");
+        std::fs::create_dir_all(dmf_staging.join("dmf")).unwrap();
+        std::fs::write(dmf_staging.join("dmf").join("dmf.lua"), b"lua").unwrap();
+
+        let health_staging = paths.mods_dir(game_id).join("Healthbars_3_3");
+        let health_inner = health_staging.join("healthbars");
+        std::fs::create_dir_all(&health_inner).unwrap();
+        std::fs::write(health_inner.join("healthbars.mod"), b"mod").unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    StagedMod {
+                        id: "1_1".into(),
+                        name: "Scoreboard".into(),
+                        nexus_mod_id: 1,
+                        nexus_file_id: 1,
+                        version: None,
+                        domain: "warhammer40kdarktide".into(),
+                        staging_path: score_staging.to_string_lossy().into(),
+                        enabled: true,
+                        order: 1,
+                    },
+                    StagedMod {
+                        id: "2_2".into(),
+                        name: "Darktide Mod Framework".into(),
+                        nexus_mod_id: 2,
+                        nexus_file_id: 2,
+                        version: None,
+                        domain: "warhammer40kdarktide".into(),
+                        staging_path: dmf_staging.to_string_lossy().into(),
+                        enabled: true,
+                        order: 2,
+                    },
+                    StagedMod {
+                        id: "3_3".into(),
+                        name: "Healthbars".into(),
+                        nexus_mod_id: 3,
+                        nexus_file_id: 3,
+                        version: None,
+                        domain: "warhammer40kdarktide".into(),
+                        staging_path: health_staging.to_string_lossy().into(),
+                        enabled: false,
+                        order: 3,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path()).unwrap();
+        assert!(result.file_count >= 2, "{:?}", result.warnings);
+        assert!(install
+            .path()
+            .join("mods/Scoreboard/scoreboard.mod")
+            .exists());
+        assert!(install.path().join("mods/dmf/dmf.lua").exists());
+        assert!(!install.path().join("mods/Healthbars").exists());
+
+        let order_txt =
+            std::fs::read_to_string(install.path().join("mods/mod_load_order.txt")).unwrap();
+        assert!(order_txt.contains("Scoreboard\n"));
+        assert!(!order_txt.lines().any(|l| l.trim() == "dmf"));
+        assert!(!order_txt.contains("Healthbars"));
+        assert!(!order_txt.contains("Darktide Mod Framework"));
+    }
+
+    #[test]
+    fn deploy_darktide_loader_root_layout() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "dt_loader";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("bundle")).unwrap();
+        std::fs::write(
+            install.path().join("bundle/bundle_database.data"),
+            b"xxxpatch_999yyy",
+        )
+        .unwrap();
+
+        let staging = paths.mods_dir(game_id).join("Loader_1_1");
+        std::fs::create_dir_all(staging.join("tools")).unwrap();
+        std::fs::create_dir_all(staging.join("binaries")).unwrap();
+        std::fs::create_dir_all(staging.join("mods")).unwrap();
+        std::fs::write(staging.join("tools/dtkit-patch.exe"), b"fake").unwrap();
+        std::fs::write(staging.join("binaries/mod_loader"), b"x").unwrap();
+        std::fs::write(staging.join("toggle_darktide_mods.bat"), b"bat").unwrap();
+        std::fs::write(staging.join("mods/mod_load_order.txt"), b"-- template\n").unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "1_1".into(),
+                    name: "Darktide Mod Loader".into(),
+                    nexus_mod_id: 19,
+                    nexus_file_id: 1,
+                    version: None,
+                    domain: "warhammer40kdarktide".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path()).unwrap();
+        assert!(result.file_count >= 3, "{:?}", result.warnings);
+        assert!(install.path().join("tools/dtkit-patch.exe").exists());
+        assert!(install.path().join("binaries/mod_loader").exists());
+        assert!(install.path().join("toggle_darktide_mods.bat").exists());
+        // Loader is not wrapped → not listed in load order (rewritten empty aside from header).
+        let order_txt =
+            std::fs::read_to_string(install.path().join("mods/mod_load_order.txt")).unwrap();
+        assert!(!order_txt
+            .lines()
+            .any(|l| !l.starts_with("--") && !l.trim().is_empty()));
     }
 }

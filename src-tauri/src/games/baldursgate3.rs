@@ -26,14 +26,15 @@ impl GamePlugin for BaldursGate3Plugin {
     }
 
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
-        // Prefer Public/ModLibrary/Mods when present (native), else Mods under install.
-        let candidates = [
+        let mut candidates = vec![
             install_path.join("Public").join("ModLibrary").join("Mods"),
             install_path.join("Mods"),
-            // Proton / AppData-style path inside prefix is handled by install_path pointing at game root;
-            // users managing BG3 often point at the game directory; drop packs into Mods.
+            // Proton / AppData-style path inside prefix is handled by install_path pointing at game root.
             dirs_fallback(install_path),
         ];
+        if let Some(appdata) = native_bg3_mods_dir() {
+            candidates.insert(0, appdata);
+        }
         let root = candidates
             .into_iter()
             .find(|p| p.parent().map(|p| p.exists()).unwrap_or(false))
@@ -44,4 +45,42 @@ impl GamePlugin for BaldursGate3Plugin {
 
 fn dirs_fallback(install_path: &Path) -> PathBuf {
     install_path.join("Data").join("Mods")
+}
+
+/// Native Windows BG3 mods folder under LocalAppData.
+fn native_bg3_mods_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+        let mods = local
+            .join("Larian Studios")
+            .join("Baldur's Gate 3")
+            .join("Mods");
+        if mods.parent().map(|p| p.exists()).unwrap_or(false) {
+            return Some(mods);
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_install_relative_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("bg3");
+        let mods = install.join("Mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let p = BaldursGate3Plugin;
+        let dest = p
+            .resolve_deploy_root(&install, Path::new("MyMod/pak"))
+            .unwrap();
+        assert!(dest.starts_with(&mods));
+    }
 }

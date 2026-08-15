@@ -52,6 +52,8 @@ function statusLabel(status: string): string {
       return "Downloading";
     case "extracting":
       return "Installing";
+    case "paused":
+      return "Paused";
     case "staged":
       return "Complete";
     case "failed":
@@ -63,7 +65,7 @@ function statusLabel(status: string): string {
   }
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
@@ -125,6 +127,8 @@ type DownloadsWorkspaceProps = {
   onCancel: () => void;
   onCancelRemaining: () => void;
   onCancelDownload: (id: string) => void;
+  onPauseDownload: (id: string) => void;
+  onResumeDownload: (id: string) => void;
   onAssistHost: (el: HTMLDivElement | null) => void;
 };
 
@@ -140,6 +144,8 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
     onCancel,
     onCancelRemaining,
     onCancelDownload,
+    onPauseDownload,
+    onResumeDownload,
     onAssistHost,
   } = props;
 
@@ -153,10 +159,11 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
   const current = queue && queue.head < queue.entries.length ? queue.entries[queue.head] : null;
   const pending = queue ? queue.entries.slice(queue.head + 1) : [];
   const activeDownloads = downloads.filter(
-    (d) => d.status === "downloading" || d.status === "extracting",
+    (d) => d.status === "downloading" || d.status === "extracting" || d.status === "paused",
   );
   const recentDownloads = downloads.filter(
-    (d) => d.status !== "downloading" && d.status !== "extracting",
+    (d) =>
+      d.status !== "downloading" && d.status !== "extracting" && d.status !== "paused",
   );
   const showCancelRemaining =
     !queue &&
@@ -234,13 +241,33 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                         />
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      className="danger downloads-cancel-one"
-                      onClick={() => onCancelDownload(d.id)}
-                    >
-                      Cancel
-                    </button>
+                    <div className="downloads-active-actions">
+                      {d.status === "downloading" ? (
+                        <button
+                          type="button"
+                          className="downloads-control-one"
+                          onClick={() => onPauseDownload(d.id)}
+                        >
+                          Pause
+                        </button>
+                      ) : null}
+                      {d.status === "paused" ? (
+                        <button
+                          type="button"
+                          className="downloads-control-one"
+                          onClick={() => onResumeDownload(d.id)}
+                        >
+                          Resume
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="danger downloads-cancel-one"
+                        onClick={() => onCancelDownload(d.id)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 </li>
               );

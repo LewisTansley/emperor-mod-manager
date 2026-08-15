@@ -7,11 +7,26 @@ use serde::Serialize;
 
 mod baldursgate3;
 mod cyberpunk2077;
+mod daysgone;
+mod fromsoftware;
+mod re_engine;
+mod stalker2heartofchornobyl;
 mod stardewvalley;
+mod warhammer40kdarktide;
 
 pub use baldursgate3::BaldursGate3Plugin;
 pub use cyberpunk2077::Cyberpunk2077Plugin;
+pub use daysgone::DaysGonePlugin;
+pub use fromsoftware::{
+    DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
+};
+pub use re_engine::{
+    ResidentEvil22019Plugin, ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
+    ResidentEvilRequiemPlugin, ResidentEvilVillagePlugin,
+};
+pub use stalker2heartofchornobyl::Stalker2HeartOfChornobylPlugin;
 pub use stardewvalley::StardewValleyPlugin;
+pub use warhammer40kdarktide::Warhammer40kDarktidePlugin;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct GamePluginInfo {
@@ -41,13 +56,60 @@ pub trait GamePlugin: Send + Sync {
     fn should_wrap_as_mod_folder(&self, _content_root: &Path) -> bool {
         false
     }
+
+    /// When true, link files at the game install root instead of via `resolve_deploy_root`
+    /// (e.g. SMAPI installer packages).
+    fn deploys_to_install_root(&self, _content_root: &Path) -> bool {
+        false
+    }
+
+    /// Install-level warnings shown before/during deploy (e.g. missing mod loader).
+    fn preflight_warnings(&self, _install_path: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Per-staging-pack warnings (e.g. SMAPI installer deployed as a mod).
+    fn staging_deploy_warnings(&self, _content_root: &Path, _mod_name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Optional install prep before purge/link (rename paks, etc.). Returns warnings.
+    fn prepare_deploy(&self, _install_path: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Called after files are linked. `enabled_mod_folders` are sanitized wrap names
+    /// for mods that should appear in a native load-order file (may be empty).
+    /// Returns optional warning strings (deploy succeeds even if warnings are returned).
+    fn after_deploy(
+        &self,
+        _install_path: &Path,
+        _enabled_mod_folders: &[String],
+    ) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
 }
 
 pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
+    // More specific match_names first (FromSoft + RE Engine remakes).
     vec![
         &StardewValleyPlugin,
         &BaldursGate3Plugin,
         &Cyberpunk2077Plugin,
+        &DaysGonePlugin,
+        &Warhammer40kDarktidePlugin,
+        &Stalker2HeartOfChornobylPlugin,
+        &EldenRingPlugin,
+        &DarkSouls3Plugin,
+        &DarkSouls2Plugin,
+        &DarkSoulsRemasteredPlugin,
+        &DarkSoulsPlugin,
+        &ResidentEvilRequiemPlugin,
+        &ResidentEvilVillagePlugin,
+        &ResidentEvil42023Plugin,
+        &ResidentEvil32020Plugin,
+        &ResidentEvil22019Plugin,
+        &ResidentEvil7Plugin,
     ]
 }
 
@@ -55,7 +117,7 @@ pub fn plugin_by_id(id: &str) -> Option<&'static dyn GamePlugin> {
     all_plugins().into_iter().find(|p| p.info().id == id)
 }
 
-pub fn match_plugin(title: &str, _install_path: Option<&str>) -> Option<GamePluginInfo> {
+pub fn match_plugin(title: &str, install_path: Option<&str>) -> Option<GamePluginInfo> {
     let lower = title.to_lowercase();
     for plugin in all_plugins() {
         let info = plugin.info();
@@ -65,6 +127,16 @@ pub fn match_plugin(title: &str, _install_path: Option<&str>) -> Option<GamePlug
             }
         }
     }
+
+    // Bare "Resident Evil 4" matches the 2023 remake only when the install looks like RE Engine.
+    if re_engine::is_ambiguous_re4_title(&lower) {
+        if let Some(path) = install_path {
+            if re_engine::is_re_engine_remake_install(Path::new(path)) {
+                return Some(ResidentEvil42023Plugin.info());
+            }
+        }
+    }
+
     None
 }
 
@@ -146,5 +218,81 @@ mod tests {
         std::fs::write(wrapper.join("manifest.json"), "{}").unwrap();
         let root = normalize_staging_root(staging.path(), &StardewValleyPlugin).unwrap();
         assert_eq!(root, wrapper);
+    }
+
+    #[test]
+    fn match_re_engine_titles() {
+        assert_eq!(
+            match_plugin("Resident Evil 7 Biohazard", None)
+                .unwrap()
+                .id,
+            "residentevil7"
+        );
+        assert_eq!(
+            match_plugin("Resident Evil Village", None).unwrap().id,
+            "residentevilvillage"
+        );
+        assert_eq!(
+            match_plugin("Resident Evil Requiem", None).unwrap().id,
+            "residentevilrequiem"
+        );
+        assert_eq!(
+            match_plugin("Resident Evil 2", None).unwrap().id,
+            "residentevil22019"
+        );
+        assert_eq!(
+            match_plugin("Resident Evil 3", None).unwrap().id,
+            "residentevil32020"
+        );
+        assert_eq!(
+            match_plugin("RESIDENT EVIL 4 BIOHAZARD RE4", None)
+                .unwrap()
+                .id,
+            "residentevil42023"
+        );
+
+        // Bare RE4 without remake install markers stays unsupported.
+        assert!(match_plugin("Resident Evil 4", None).is_none());
+        let remake = tempfile::tempdir().unwrap();
+        std::fs::write(remake.path().join("re4.exe"), b"x").unwrap();
+        assert_eq!(
+            match_plugin("Resident Evil 4", Some(remake.path().to_str().unwrap()))
+                .unwrap()
+                .id,
+            "residentevil42023"
+        );
+    }
+
+    #[test]
+    fn preserves_stardew_mods_root() {
+        let staging = tempfile::tempdir().unwrap();
+        let mods = staging.path().join("Mods");
+        std::fs::create_dir_all(mods.join("CoolMod")).unwrap();
+        std::fs::write(mods.join("CoolMod").join("manifest.json"), "{}").unwrap();
+        let root = normalize_staging_root(staging.path(), &StardewValleyPlugin).unwrap();
+        assert_eq!(root, staging.path());
+    }
+
+    #[test]
+    fn darktide_preserves_loader_and_dmf_roots() {
+        let loader = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(loader.path().join("tools")).unwrap();
+        std::fs::create_dir_all(loader.path().join("mods")).unwrap();
+        let kept = normalize_staging_root(loader.path(), &Warhammer40kDarktidePlugin).unwrap();
+        assert_eq!(kept, loader.path());
+
+        let dmf_only = tempfile::tempdir().unwrap();
+        let dmf = dmf_only.path().join("dmf");
+        std::fs::create_dir_all(&dmf).unwrap();
+        std::fs::write(dmf.join("dmf.lua"), b"x").unwrap();
+        let kept_dmf = normalize_staging_root(dmf_only.path(), &Warhammer40kDarktidePlugin).unwrap();
+        assert_eq!(kept_dmf, dmf_only.path());
+
+        let normal = tempfile::tempdir().unwrap();
+        let wrapper = normal.path().join("scoreboard");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(wrapper.join("scoreboard.mod"), b"x").unwrap();
+        let peeled = normalize_staging_root(normal.path(), &Warhammer40kDarktidePlugin).unwrap();
+        assert_eq!(peeled, wrapper);
     }
 }

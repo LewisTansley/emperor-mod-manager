@@ -1,7 +1,7 @@
 [package]
 name = "nexus-manager"
 version = "0.1.0"
-description = "Linux-native Nexus Mods manager"
+description = "Nexus Mods manager for Linux and Windows"
 authors = ["nexus-manager contributors"]
 edition = "2021"
 license = "AGPL-3.0-or-later"
@@ -22,8 +22,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-lib_game_detector = { version = "0.0.35", features = ["bundled_sqlite"] }
-keyring = { version = "3", features = ["linux-native", "sync-secret-service", "vendored"] }
 directories = "5"
 toml = "0.8"
 thiserror = "2"
@@ -31,6 +29,9 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 zip = "2"
+unrar-ng = "0.7"
+sevenz-rust = "0.6"
+sanitize-filename = "0.6"
 walkdir = "2"
 futures-util = "0.3"
 url = "2"
@@ -40,10 +41,19 @@ regex = "1"
 log = "0.4"
 env_logger = "0.11"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+lib_game_detector = { version = "0.0.35", features = ["bundled_sqlite"] }
+keyring = { version = "3", default-features = false, features = ["linux-native", "sync-secret-service", "vendored"] }
+
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = "0.18"
-sevenz-rust = "0.6"
-sanitize-filename = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+winreg = "0.56"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
 
 [dev-dependencies]
 tempfile = "3"

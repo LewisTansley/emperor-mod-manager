@@ -1,4 +1,4 @@
-//! Path helpers and persistent app configuration (XDG).
+//! Path helpers and persistent app configuration.
 
 use std::{fs, path::PathBuf};
 
@@ -69,7 +69,7 @@ pub struct Paths {
 impl Paths {
     pub fn resolve() -> Result<Self> {
         let dirs = ProjectDirs::from("dev", "nexusmanager", APP_NAME)
-            .context("failed to resolve XDG project directories")?;
+            .context("failed to resolve project directories")?;
         let paths = Self {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),

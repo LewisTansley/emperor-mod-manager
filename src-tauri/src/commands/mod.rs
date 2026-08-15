@@ -20,16 +20,39 @@ use crate::{
     games,
     mods::{self, StagedMod},
     nexus::{
-        self, CollectionHit, CollectionModFile, ModDetail, ModFileInfo, ModSearchHit, NexusClient,
-        NexusUser, TransferControl,
+        self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
+        ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
     },
 };
 
-const CANCELLED_MSG: &str = "CANCELLED";
+pub enum DownloadResumeSource {
+    Api {
+        game_id: String,
+        domain: String,
+        mod_id: u64,
+        file_id: u64,
+        label: String,
+        version: Option<String>,
+        nxm_key: Option<String>,
+        nxm_expires: Option<u64>,
+    },
+    Cdn {
+        url: String,
+        cookie_header: String,
+        game_id: String,
+        domain: String,
+        mod_id: u64,
+        file_id: u64,
+        label: String,
+    },
+}
 
 pub struct DownloadJob {
     pub cancel: Arc<AtomicBool>,
+    pub pause: Arc<AtomicBool>,
     pub batch_id: Option<String>,
+    pub dest: Option<PathBuf>,
+    pub source: Option<DownloadResumeSource>,
 }
 
 pub struct AppState {
@@ -54,6 +77,8 @@ pub struct AppState {
     pub assist_bounds: Mutex<AssistBounds>,
     /// Whether the assist webview should be shown (Downloads tab). Bounds/open must not force-show.
     pub assist_desired_visible: AtomicBool,
+    /// Cached Nexus game metadata (categories, counts) keyed by domain.
+    pub game_info_cache: Mutex<HashMap<String, GameInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,7 +128,27 @@ impl AppState {
             last_cdn_handled: Mutex::new(None),
             assist_bounds: Mutex::new(AssistBounds::default()),
             assist_desired_visible: AtomicBool::new(false),
+            game_info_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub async fn get_game_cached(&self, domain: &str) -> Result<GameInfo, String> {
+        if let Some(cached) = self
+            .game_info_cache
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(domain)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let client = self.client()?;
+        let info = client.get_game(domain).await.map_err(|e| e.to_string())?;
+        self.game_info_cache
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(domain.to_string(), info.clone());
+        Ok(info)
     }
 
     pub fn client(&self) -> Result<NexusClient, String> {
@@ -167,7 +212,11 @@ fn update_download(state: &AppState, id: &str, status: &str, error: Option<Strin
         if let Some(item) = q.iter_mut().find(|d| d.id == id) {
             item.status = status.to_string();
             item.error = error;
-            if status == "cancelled" || status == "staged" || status == "failed" {
+            if status == "cancelled"
+                || status == "staged"
+                || status == "failed"
+                || status == "paused"
+            {
                 item.speed_bps = 0;
             }
         }
@@ -178,22 +227,43 @@ fn ensure_download_job(
     state: &AppState,
     id: &str,
     batch_id: Option<String>,
-) -> Arc<AtomicBool> {
+) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     if let Ok(mut jobs) = state.download_jobs.lock() {
         if let Some(job) = jobs.get(id) {
-            return job.cancel.clone();
+            return (job.cancel.clone(), job.pause.clone());
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
         jobs.insert(
             id.to_string(),
             DownloadJob {
                 cancel: cancel.clone(),
+                pause: pause.clone(),
                 batch_id,
+                dest: None,
+                source: None,
             },
         );
-        return cancel;
+        return (cancel, pause);
     }
-    Arc::new(AtomicBool::new(false))
+    (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn set_download_resume(
+    state: &AppState,
+    id: &str,
+    dest: PathBuf,
+    source: DownloadResumeSource,
+) {
+    if let Ok(mut jobs) = state.download_jobs.lock() {
+        if let Some(job) = jobs.get_mut(id) {
+            job.dest = Some(dest);
+            job.source = Some(source);
+        }
+    }
 }
 
 fn clear_download_job(state: &AppState, id: &str) {
@@ -206,6 +276,36 @@ fn mark_cancelled(state: &AppState, id: &str) {
     update_download(state, id, "cancelled", Some("Cancelled".into()));
 }
 
+fn mark_paused(app: Option<&tauri::AppHandle>, state: &AppState, id: &str) {
+    let (bytes_downloaded, bytes_total) = if let Ok(mut q) = state.downloads.lock() {
+        if let Some(item) = q.iter_mut().find(|d| d.id == id) {
+            if item.status == "cancelled" {
+                return;
+            }
+            item.status = "paused".into();
+            item.error = None;
+            item.speed_bps = 0;
+            (item.bytes_downloaded, item.bytes_total)
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "download-progress",
+            serde_json::json!({
+                "id": id,
+                "bytes_downloaded": bytes_downloaded,
+                "bytes_total": bytes_total,
+                "speed_bps": 0,
+                "status": "paused",
+            }),
+        );
+    }
+}
+
 fn report_download_progress(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -216,7 +316,7 @@ fn report_download_progress(
 ) {
     let status = if let Ok(mut q) = state.downloads.lock() {
         if let Some(item) = q.iter_mut().find(|d| d.id == id) {
-            if item.status == "cancelled" {
+            if item.status == "cancelled" || item.status == "paused" {
                 return;
             }
             item.bytes_downloaded = bytes_downloaded;
@@ -245,13 +345,38 @@ fn is_cancel_err(msg: &str) -> bool {
     msg.contains(CANCELLED_MSG) || msg == "Cancelled"
 }
 
+fn is_pause_err(msg: &str) -> bool {
+    msg.contains(PAUSED_MSG) || msg == "Paused"
+}
+
 fn request_cancel_ids(state: &AppState, ids: &[String]) {
+    let paused_ids: Vec<String> = {
+        let downloads = state.downloads.lock().ok();
+        ids.iter()
+            .filter(|id| {
+                downloads
+                    .as_ref()
+                    .and_then(|q| q.iter().find(|d| d.id == **id))
+                    .map(|d| d.status == "paused")
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    };
+
     if let Ok(mut jobs) = state.download_jobs.lock() {
         for id in ids {
             if let Some(job) = jobs.get_mut(id) {
                 job.cancel.store(true, Ordering::SeqCst);
+                job.pause.store(false, Ordering::SeqCst);
+                if let Some(dest) = &job.dest {
+                    let _ = std::fs::remove_file(dest);
+                }
             }
             mark_cancelled(state, id);
+            if paused_ids.iter().any(|p| p == id) {
+                jobs.remove(id);
+            }
         }
     } else {
         for id in ids {
@@ -271,12 +396,17 @@ fn progress_callback(
     }))
 }
 
+fn file_offset(path: &PathBuf) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
 #[tauri::command]
 pub fn get_app_info() -> serde_json::Value {
     serde_json::json!({
         "name": APP_NAME,
         "version": env!("CARGO_PKG_VERSION"),
-        "linux_only": true,
+        "platform": std::env::consts::OS,
+        "linux_only": false,
     })
 }
 
@@ -437,9 +567,12 @@ pub async fn search_mods(
     query: String,
     sort: Option<String>,
     category: Option<String>,
-    tags: Option<Vec<String>>,
+    tags_include: Option<Vec<String>>,
+    tags_exclude: Option<Vec<String>>,
     game_version: Option<String>,
-) -> Result<Vec<ModSearchHit>, String> {
+    offset: Option<u32>,
+    count: Option<u32>,
+) -> Result<nexus::ModSearchPage, String> {
     let adult = state
         .config
         .lock()
@@ -449,13 +582,24 @@ pub async fn search_mods(
     let opts = nexus::BrowseSearchOpts {
         sort: sort.unwrap_or_else(|| "endorsements".into()),
         category,
-        tags: tags.unwrap_or_default(),
+        tags_include: tags_include.unwrap_or_default(),
+        tags_exclude: tags_exclude.unwrap_or_default(),
         game_version,
+        offset: offset.unwrap_or(0),
+        count: count.unwrap_or(0),
     };
     client
         .search_mods(&domain, &query, adult, &opts)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_game(
+    state: State<'_, AppState>,
+    domain: String,
+) -> Result<GameInfo, String> {
+    state.get_game_cached(&domain).await
 }
 
 #[tauri::command]
@@ -465,10 +609,22 @@ pub async fn get_mod(
     mod_id: u64,
 ) -> Result<ModDetail, String> {
     let client = state.client()?;
-    client
+    let mut detail = client
         .get_mod(&domain, mod_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if detail.category.is_none() {
+        if let Some(category_id) = detail.category_id {
+            if let Ok(game) = state.get_game_cached(&domain).await {
+                detail.category = game
+                    .categories
+                    .iter()
+                    .find(|c| c.category_id == category_id)
+                    .map(|c| c.name.clone());
+            }
+        }
+    }
+    Ok(detail)
 }
 
 #[tauri::command]
@@ -491,9 +647,12 @@ pub async fn search_collections(
     query: String,
     sort: Option<String>,
     category: Option<String>,
-    tags: Option<Vec<String>>,
+    tags_include: Option<Vec<String>>,
+    tags_exclude: Option<Vec<String>>,
     game_version: Option<String>,
-) -> Result<Vec<CollectionHit>, String> {
+    offset: Option<u32>,
+    count: Option<u32>,
+) -> Result<nexus::CollectionSearchPage, String> {
     let adult = state
         .config
         .lock()
@@ -503,8 +662,11 @@ pub async fn search_collections(
     let opts = nexus::BrowseSearchOpts {
         sort: sort.unwrap_or_else(|| "endorsements".into()),
         category,
-        tags: tags.unwrap_or_default(),
+        tags_include: tags_include.unwrap_or_default(),
+        tags_exclude: tags_exclude.unwrap_or_default(),
         game_version,
+        offset: offset.unwrap_or(0),
+        count: count.unwrap_or(0),
     };
     client
         .search_collections(&domain, &query, adult, &opts)
@@ -525,6 +687,24 @@ pub async fn browse_meta(
     let client = state.client()?;
     client
         .browse_meta(&domain, adult)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_collection(
+    state: State<'_, AppState>,
+    slug: String,
+    domain: Option<String>,
+) -> Result<CollectionDetail, String> {
+    let adult = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .adult_content;
+    let client = state.client()?;
+    client
+        .get_collection(&slug, domain.as_deref(), adult)
         .await
         .map_err(|e| e.to_string())
 }
@@ -584,20 +764,39 @@ async fn download_and_stage_inner(
         }
     }
 
-    let cancel = ensure_download_job(state, &dl_id, batch_id.clone());
+    let (cancel, pause) = ensure_download_job(state, &dl_id, batch_id.clone());
     if cancel.load(Ordering::SeqCst) {
         mark_cancelled(state, &dl_id);
         clear_download_job(state, &dl_id);
         return Err("Cancelled".into());
     }
+    pause.store(false, Ordering::SeqCst);
 
     let dest = state
         .paths
         .downloads_dir()
         .join(format!("{domain}_{mod_id}_{file_id}.bin"));
 
+    set_download_resume(
+        state,
+        &dl_id,
+        dest.clone(),
+        DownloadResumeSource::Api {
+            game_id: game_id.to_string(),
+            domain: domain.to_string(),
+            mod_id,
+            file_id,
+            label: label.to_string(),
+            version: version.clone(),
+            nxm_key: nxm_key.clone(),
+            nxm_expires,
+        },
+    );
+
+    let start_offset = file_offset(&dest);
     let control = TransferControl {
         cancel: cancel.clone(),
+        pause: pause.clone(),
     };
     let on_progress = progress_callback(app, dl_id.clone());
 
@@ -610,6 +809,7 @@ async fn download_and_stage_inner(
             is_premium,
             nxm_key.as_deref(),
             nxm_expires,
+            start_offset,
             Some(&control),
             on_progress.as_ref(),
         )
@@ -619,6 +819,10 @@ async fn download_and_stage_inner(
         Ok(()) => {}
         Err(e) => {
             let msg = e.to_string();
+            if is_pause_err(&msg) || pause.load(Ordering::SeqCst) {
+                mark_paused(app, state, &dl_id);
+                return Err("Paused".into());
+            }
             if is_cancel_err(&msg) || cancel.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&dest);
                 mark_cancelled(state, &dl_id);
@@ -636,6 +840,10 @@ async fn download_and_stage_inner(
         mark_cancelled(state, &dl_id);
         clear_download_job(state, &dl_id);
         return Err("Cancelled".into());
+    }
+    if pause.load(Ordering::SeqCst) {
+        mark_paused(app, state, &dl_id);
+        return Err("Paused".into());
     }
 
     update_download(state, &dl_id, "extracting", None);
@@ -791,7 +999,7 @@ pub async fn install_collection(
         .await
         {
             Ok(_) => installed += 1,
-            Err(e) if is_cancel_err(&e) => break,
+            Err(e) if is_cancel_err(&e) || is_pause_err(&e) => break,
             Err(e) => return Err(e),
         }
     }
@@ -935,7 +1143,9 @@ pub async fn handle_nxm(
                 );
             }
             Err(e) => {
-                if is_cancel_err(&e) {
+                if is_pause_err(&e) {
+                    log::info!("download paused: {label}");
+                } else if is_cancel_err(&e) {
                     log::info!("download cancelled: {label}");
                     let _ = app_bg.emit(
                         "download-cancelled",
@@ -1015,20 +1225,6 @@ pub fn import_mod_archive(
         &archive,
     )
     .map_err(|e| e.to_string())
-}
-
-fn filename_from_cdn_url(cdn_url: &str) -> String {
-    url::Url::parse(cdn_url)
-        .ok()
-        .and_then(|u| {
-            u.path()
-                .rsplit('/')
-                .find(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .map(|s| sanitize_filename::sanitize(s))
-        .unwrap_or_else(|| "nexus-download.zip".into())
 }
 
 /// Intercept a Nexus CDN URL from Download Assist, fetch with webview cookies, stage in background.
@@ -1152,7 +1348,9 @@ pub async fn start_assist_cdn_download(
                 );
             }
             Err(e) => {
-                if is_cancel_err(&e) {
+                if is_pause_err(&e) {
+                    log::info!("cdn download paused: {label}");
+                } else if is_cancel_err(&e) {
                     log::info!("cdn download cancelled: {label}");
                     let _ = app_bg.emit(
                         "download-cancelled",
@@ -1192,103 +1390,117 @@ async fn fetch_and_stage_cdn(
     dl_id: &str,
     batch_id: Option<String>,
 ) -> Result<StagedMod, String> {
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-
-    let cancel = ensure_download_job(state, dl_id, batch_id);
+    let (cancel, pause) = ensure_download_job(state, dl_id, batch_id.clone());
     if cancel.load(Ordering::SeqCst) {
         mark_cancelled(state, dl_id);
         clear_download_job(state, dl_id);
         return Err("Cancelled".into());
     }
+    pause.store(false, Ordering::SeqCst);
+
+    let existing_dest = state
+        .download_jobs
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(dl_id).and_then(|j| j.dest.clone()));
+
+    let dest = if let Some(path) = existing_dest {
+        path
+    } else {
+        // Prefer a stable path so pause/resume can reuse the same file.
+        let filename = sanitize_filename::sanitize(format!(
+            "{domain}_{mod_id}_{file_id}_{}.bin",
+            &dl_id[..8.min(dl_id.len())]
+        ));
+        let path = state.paths.downloads_dir().join(filename);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        path
+    };
+
+    set_download_resume(
+        state,
+        dl_id,
+        dest.clone(),
+        DownloadResumeSource::Cdn {
+            url: cdn_url.to_string(),
+            cookie_header: cookie_header.to_string(),
+            game_id: game_id.to_string(),
+            domain: domain.to_string(),
+            mod_id,
+            file_id,
+            label: label.to_string(),
+        },
+    );
 
     let client = reqwest::Client::builder()
         .user_agent(format!("{APP_NAME}/{APP_VERSION}"))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut req = client.get(cdn_url);
+    let mut headers = reqwest::header::HeaderMap::new();
     if !cookie_header.is_empty() {
-        req = req.header("Cookie", cookie_header);
-    }
-
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    log::info!("cdn download HTTP {status} for {cdn_url}");
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        update_download(
-            state,
-            dl_id,
-            "failed",
-            Some(format!("HTTP {status}: {body}")),
+        headers.insert(
+            reqwest::header::COOKIE,
+            reqwest::header::HeaderValue::from_str(cookie_header)
+                .map_err(|e| e.to_string())?,
         );
-        clear_download_job(state, dl_id);
-        return Err(format!("CDN download failed ({status})"));
     }
 
-    let total = resp.content_length();
-    let mut filename = resp
-        .headers()
-        .get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split("filename=")
-                .nth(1)
-                .map(|s| s.trim_matches('"').trim_matches('\''))
-        })
-        .map(sanitize_filename::sanitize)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| filename_from_cdn_url(cdn_url));
+    let start_offset = file_offset(&dest);
+    let control = TransferControl {
+        cancel: cancel.clone(),
+        pause: pause.clone(),
+    };
+    let on_progress = progress_callback(Some(app), dl_id.to_string());
 
-    let dest = state.paths.downloads_dir().join(&filename);
-    if dest.exists() {
-        let stem = dest
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "nexus-download".into());
-        let ext = dest
-            .extension()
-            .map(|s| format!(".{}", s.to_string_lossy()))
-            .unwrap_or_default();
-        filename = sanitize_filename::sanitize(format!("{stem}-{}", &dl_id[..8])) + &ext;
-    }
-    let dest = state.paths.downloads_dir().join(&filename);
+    log::info!(
+        "cdn download start offset={start_offset} for {cdn_url} -> {}",
+        dest.display()
+    );
 
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    let download_result = stream_url_to_file(
+        &client,
+        cdn_url,
+        &dest,
+        start_offset,
+        if headers.is_empty() {
+            None
+        } else {
+            Some(&headers)
+        },
+        Some(&control),
+        on_progress.as_ref(),
+    )
+    .await;
 
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let started = Instant::now();
-    let mut last_report = started;
-    while let Some(chunk) = stream.next().await {
-        if cancel.load(Ordering::SeqCst) {
-            drop(file);
-            let _ = tokio::fs::remove_file(&dest).await;
-            mark_cancelled(state, dl_id);
+    match download_result {
+        Ok(()) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if is_pause_err(&msg) || pause.load(Ordering::SeqCst) {
+                mark_paused(Some(app), state, dl_id);
+                return Err("Paused".into());
+            }
+            if is_cancel_err(&msg) || cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
+                mark_cancelled(state, dl_id);
+                clear_download_job(state, dl_id);
+                return Err("Cancelled".into());
+            }
+            let fail_msg = if msg.contains("link expired") {
+                format!(
+                    "{msg} Cancel and re-queue via Download Assist to get a fresh link."
+                )
+            } else {
+                msg.clone()
+            };
+            update_download(state, dl_id, "failed", Some(fail_msg.clone()));
             clear_download_job(state, dl_id);
-            return Err("Cancelled".into());
-        }
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        downloaded += chunk.len() as u64;
-        let now = Instant::now();
-        if now.duration_since(last_report).as_millis() >= 150
-            || downloaded == total.unwrap_or(u64::MAX)
-        {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let speed = (downloaded as f64 / elapsed) as u64;
-            report_download_progress(app, state, dl_id, downloaded, total, speed);
-            last_report = now;
+            return Err(fail_msg);
         }
     }
-    file.flush().await.map_err(|e| e.to_string())?;
-    log::info!("cdn download saved to {}", dest.display());
 
     if cancel.load(Ordering::SeqCst) {
         let _ = std::fs::remove_file(&dest);
@@ -1296,9 +1508,29 @@ async fn fetch_and_stage_cdn(
         clear_download_job(state, dl_id);
         return Err("Cancelled".into());
     }
+    if pause.load(Ordering::SeqCst) {
+        mark_paused(Some(app), state, dl_id);
+        return Err("Paused".into());
+    }
+
+    log::info!("cdn download saved to {}", dest.display());
+
+    let (bytes_downloaded, bytes_total) = state
+        .downloads
+        .lock()
+        .ok()
+        .and_then(|q| {
+            q.iter().find(|d| d.id == dl_id).map(|d| {
+                (
+                    d.bytes_downloaded,
+                    d.bytes_total.or(Some(d.bytes_downloaded)),
+                )
+            })
+        })
+        .unwrap_or_else(|| (file_offset(&dest), Some(file_offset(&dest))));
 
     update_download(state, dl_id, "extracting", None);
-    report_download_progress(app, state, dl_id, downloaded, total.or(Some(downloaded)), 0);
+    report_download_progress(app, state, dl_id, bytes_downloaded, bytes_total, 0);
     match mods::stage_mod(
         &state.paths,
         game_id,
@@ -1354,7 +1586,7 @@ pub fn import_assist_download(
             batch_id.clone(),
         ),
     );
-    let cancel = ensure_download_job(&state, &dl_id, batch_id);
+    let (cancel, _pause) = ensure_download_job(&state, &dl_id, batch_id);
     log::info!("slow download queued: {} id={dl_id}", ctx.label);
     if cancel.load(Ordering::SeqCst) {
         mark_cancelled(&state, &dl_id);
@@ -1495,7 +1727,11 @@ pub fn cancel_download(state: State<'_, AppState>, id: String) -> Result<(), Str
         .and_then(|q| {
             q.iter()
                 .find(|d| d.id == id)
-                .map(|d| d.status == "downloading" || d.status == "extracting")
+                .map(|d| {
+                    d.status == "downloading"
+                        || d.status == "extracting"
+                        || d.status == "paused"
+                })
         })
         .unwrap_or(false);
     if !active
@@ -1521,7 +1757,9 @@ pub fn cancel_download_batch(state: State<'_, AppState>, batch_id: String) -> Re
             .iter()
             .filter(|d| {
                 d.batch_id.as_deref() == Some(batch_id.as_str())
-                    && (d.status == "downloading" || d.status == "extracting")
+                    && (d.status == "downloading"
+                        || d.status == "extracting"
+                        || d.status == "paused")
             })
             .map(|d| d.id.clone())
             .collect();
@@ -1533,5 +1771,217 @@ pub fn cancel_download_batch(state: State<'_, AppState>, batch_id: String) -> Re
         ids
     };
     request_cancel_ids(&state, &ids);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn pause_download(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let status = state
+        .downloads
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.status.clone());
+    if status.as_deref() != Some("downloading") {
+        return Err("Only in-progress downloads can be paused".into());
+    }
+    if let Ok(mut jobs) = state.download_jobs.lock() {
+        if let Some(job) = jobs.get_mut(&id) {
+            job.pause.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+    }
+    Err("Download job not found".into())
+}
+
+#[tauri::command]
+pub fn resume_download(app: tauri::AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let status = state
+        .downloads
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.status.clone());
+    if status.as_deref() != Some("paused") {
+        return Err("Only paused downloads can be resumed".into());
+    }
+
+    let (source, dest, batch_id, cancel, pause) = {
+        let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
+        let job = jobs
+            .get_mut(&id)
+            .ok_or_else(|| "Download job not found".to_string())?;
+        let source = job
+            .source
+            .as_ref()
+            .ok_or_else(|| "Missing resume metadata for this download".to_string())?;
+        // Clone source fields without moving enum yet — we'll take ownership below.
+        let source = match source {
+            DownloadResumeSource::Api {
+                game_id,
+                domain,
+                mod_id,
+                file_id,
+                label,
+                version,
+                nxm_key,
+                nxm_expires,
+            } => DownloadResumeSource::Api {
+                game_id: game_id.clone(),
+                domain: domain.clone(),
+                mod_id: *mod_id,
+                file_id: *file_id,
+                label: label.clone(),
+                version: version.clone(),
+                nxm_key: nxm_key.clone(),
+                nxm_expires: *nxm_expires,
+            },
+            DownloadResumeSource::Cdn {
+                url,
+                cookie_header,
+                game_id,
+                domain,
+                mod_id,
+                file_id,
+                label,
+            } => DownloadResumeSource::Cdn {
+                url: url.clone(),
+                cookie_header: cookie_header.clone(),
+                game_id: game_id.clone(),
+                domain: domain.clone(),
+                mod_id: *mod_id,
+                file_id: *file_id,
+                label: label.clone(),
+            },
+        };
+        let dest = job
+            .dest
+            .clone()
+            .ok_or_else(|| "Missing download path for resume".to_string())?;
+        job.pause.store(false, Ordering::SeqCst);
+        job.cancel.store(false, Ordering::SeqCst);
+        (
+            source,
+            dest,
+            job.batch_id.clone(),
+            job.cancel.clone(),
+            job.pause.clone(),
+        )
+    };
+
+    if cancel.load(Ordering::SeqCst) {
+        return Err("Download was cancelled".into());
+    }
+    let _ = dest;
+    let _ = pause;
+
+    update_download(&state, &id, "downloading", None);
+
+    let app_bg = app.clone();
+    let queued_id = id.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let state = app_bg.state::<AppState>();
+        let result = match source {
+            DownloadResumeSource::Api {
+                game_id,
+                domain,
+                mod_id,
+                file_id,
+                label,
+                version,
+                nxm_key,
+                nxm_expires,
+            } => {
+                let label_clone = label.clone();
+                let game_id_clone = game_id.clone();
+                let res = download_and_stage_inner(
+                    Some(&app_bg),
+                    &*state,
+                    &game_id,
+                    &domain,
+                    mod_id,
+                    file_id,
+                    &label,
+                    version,
+                    nxm_key,
+                    nxm_expires,
+                    Some(queued_id.clone()),
+                    batch_id,
+                )
+                .await;
+                (res, label_clone, game_id_clone)
+            }
+            DownloadResumeSource::Cdn {
+                url,
+                cookie_header,
+                game_id,
+                domain,
+                mod_id,
+                file_id,
+                label,
+            } => {
+                let label_clone = label.clone();
+                let game_id_clone = game_id.clone();
+                let res = fetch_and_stage_cdn(
+                    &app_bg,
+                    &*state,
+                    &url,
+                    &cookie_header,
+                    &game_id,
+                    &label,
+                    &domain,
+                    mod_id,
+                    file_id,
+                    &queued_id,
+                    batch_id,
+                )
+                .await;
+                (res, label_clone, game_id_clone)
+            }
+        };
+
+        match result {
+            (Ok(staged), label, game_id) => {
+                log::info!("download finished after resume: {label}");
+                let _ = app_bg.emit(
+                    "download-finished",
+                    serde_json::json!({
+                        "id": queued_id,
+                        "label": label,
+                        "game_id": game_id,
+                        "mod_id": staged.id,
+                    }),
+                );
+            }
+            (Err(e), label, _) => {
+                if is_pause_err(&e) {
+                    log::info!("download paused: {label}");
+                } else if is_cancel_err(&e) {
+                    log::info!("download cancelled: {label}");
+                    let _ = app_bg.emit(
+                        "download-cancelled",
+                        serde_json::json!({
+                            "id": queued_id,
+                            "label": label,
+                        }),
+                    );
+                } else {
+                    log::error!("download failed after resume ({label}): {e}");
+                    let _ = app_bg.emit(
+                        "download-failed",
+                        serde_json::json!({
+                            "id": queued_id,
+                            "label": label,
+                            "error": e,
+                        }),
+                    );
+                }
+            }
+        }
+    });
+
     Ok(())
 }

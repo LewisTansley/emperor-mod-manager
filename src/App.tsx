@@ -1,26 +1,33 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./api";
 import {
   createQueueEntry,
   DownloadsWorkspace,
+  formatBytes,
   type ActiveDownloadBatch,
   type AssistQueueEntry,
   type AssistQueueState,
 } from "./downloads";
+import { RichText } from "./RichText";
 import type {
   BrowseMeta,
+  BrowseSearchOpts,
+  CollectionDetail,
   CollectionHit,
   CollectionModFile,
   DetectedGame,
   DownloadItem,
+  GameInfo,
   ManagedGame,
   ModDetail,
   ModFileInfo,
   ModSearchHit,
   Settings,
   StagedMod,
+  TagFilterState,
   ThemePreference,
 } from "./types";
 import "./App.css";
@@ -29,6 +36,7 @@ type Tab = "setup" | "library" | "browse" | "downloads" | "settings";
 type ViewMode = "list" | "grid";
 type DetailTab = "info" | "files";
 type GameDetailTab = "info" | "mods";
+type BrowseTagMap = Record<string, TagFilterState>;
 
 type StatusNotice = {
   kind: "ok" | "warn";
@@ -39,6 +47,34 @@ type BrowseDetail =
   | { kind: "mod"; hit: ModSearchHit; tab: DetailTab }
   | { kind: "collection"; hit: CollectionHit; tab: DetailTab };
 
+/** Cycle: unset → include → exclude → unset */
+function cycleTagState(current: TagFilterState | undefined): TagFilterState | undefined {
+  if (!current) return "include";
+  if (current === "include") return "exclude";
+  return undefined;
+}
+
+function tagListsFromMap(map: BrowseTagMap): {
+  tagsInclude: string[];
+  tagsExclude: string[];
+} {
+  const tagsInclude: string[] = [];
+  const tagsExclude: string[] = [];
+  for (const [tag, state] of Object.entries(map)) {
+    if (state === "include") tagsInclude.push(tag);
+    else if (state === "exclude") tagsExclude.push(tag);
+  }
+  return { tagsInclude, tagsExclude };
+}
+
+function setTagInMap(map: BrowseTagMap, tag: string): BrowseTagMap {
+  const next = { ...map };
+  const cycled = cycleTagState(map[tag]);
+  if (!cycled) delete next[tag];
+  else next[tag] = cycled;
+  return next;
+}
+
 type StatusSummary = {
   primary: string;
   secondary: string;
@@ -47,9 +83,9 @@ type StatusSummary = {
 function statusSummary(
   busy: string | null,
   assistQueue: AssistQueueState | null,
+  downloads: DownloadItem[],
+  activeBatch: ActiveDownloadBatch | null,
 ): StatusSummary | null {
-  if (!busy && !assistQueue) return null;
-
   if (assistQueue) {
     const total = assistQueue.entries.length;
     const progress = `${Math.min(assistQueue.head + 1, total)}/${total}`;
@@ -70,27 +106,44 @@ function statusSummary(
     return { primary: "Queue", secondary: `${progress} — opening next…` };
   }
 
-  if (!busy) return null;
+  if (busy) {
+    const patterns: [RegExp, string][] = [
+      [/^Downloading\s+(.+?)…?$/i, "Downloading"],
+      [/^Installing\s+(?:collection\s+)?(.+?)…?$/i, "Installing"],
+      [/^Loading\s+(?:collection\s+)?(.+?)…?$/i, "Loading"],
+      [/^Download Assist\s*[—\-]\s*(.+)$/i, "Download Assist"],
+    ];
+    for (const [re, primary] of patterns) {
+      const match = busy.match(re);
+      if (match?.[1]) return { primary, secondary: match[1] };
+    }
 
-  const patterns: [RegExp, string][] = [
-    [/^Downloading\s+(.+?)…?$/i, "Downloading"],
-    [/^Installing\s+(?:collection\s+)?(.+?)…?$/i, "Installing"],
-    [/^Loading\s+(?:collection\s+)?(.+?)…?$/i, "Loading"],
-    [/^Download Assist\s*[—\-]\s*(.+)$/i, "Download Assist"],
-  ];
-  for (const [re, primary] of patterns) {
-    const match = busy.match(re);
-    if (match?.[1]) return { primary, secondary: match[1] };
+    const space = busy.indexOf(" ");
+    if (space > 0) {
+      return {
+        primary: busy.slice(0, space).replace(/…$/, ""),
+        secondary: busy.slice(space + 1).replace(/…$/, ""),
+      };
+    }
+    return { primary: busy, secondary: "" };
   }
 
-  const space = busy.indexOf(" ");
-  if (space > 0) {
-    return {
-      primary: busy.slice(0, space).replace(/…$/, ""),
-      secondary: busy.slice(space + 1).replace(/…$/, ""),
-    };
+  const inFlight = downloads.filter(
+    (d) => d.status === "downloading" ||
+              d.status === "extracting" ||
+              d.status === "paused",
+  );
+  if (inFlight.length === 0) return null;
+
+  let secondary: string;
+  if (inFlight.length === 1) {
+    secondary = inFlight[0].label;
+  } else if (activeBatch?.label) {
+    secondary = activeBatch.label;
+  } else {
+    secondary = `${inFlight.length} remaining`;
   }
-  return { primary: busy, secondary: "" };
+  return { primary: "Downloading", secondary };
 }
 
 const MOD_SORTS = [
@@ -152,24 +205,31 @@ function PlaceholderIcon() {
   );
 }
 
-function stripHtml(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .trim();
+function openExternal(url: string) {
+  void (async () => {
+    try {
+      await openUrl(url);
+    } catch (e) {
+      console.error("Failed to open URL", e);
+    }
+  })();
 }
 
 function formatTimestamp(ts: number | null | undefined): string | null {
   if (ts == null || ts <= 0) return null;
   try {
     return new Date(ts * 1000).toLocaleDateString();
+  } catch {
+    return null;
+  }
+}
+
+function formatIsoDate(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toLocaleDateString();
   } catch {
     return null;
   }
@@ -301,18 +361,22 @@ function App() {
   const [browseSort, setBrowseSort] = useState("endorsements");
   const [browseCategory, setBrowseCategory] = useState("");
   const [browseVersion, setBrowseVersion] = useState("");
-  const [browseTags, setBrowseTags] = useState<string[]>([]);
+  const [browseTags, setBrowseTags] = useState<BrowseTagMap>({});
   const [tagQuery, setTagQuery] = useState("");
   const [tagsOpen, setTagsOpen] = useState(false);
+  const [browseTotalCount, setBrowseTotalCount] = useState(0);
+  const [browseHasMore, setBrowseHasMore] = useState(false);
   const [browseMeta, setBrowseMeta] = useState<BrowseMeta | null>(null);
   const [browseDetail, setBrowseDetail] = useState<BrowseDetail | null>(null);
   const [libraryDetail, setLibraryDetail] = useState<{
     game: ManagedGame;
     tab: GameDetailTab;
   } | null>(null);
+  const [gameInfo, setGameInfo] = useState<GameInfo | null>(null);
   const [modDetail, setModDetail] = useState<ModDetail | null>(null);
   const [modFiles, setModFiles] = useState<ModFileInfo[]>([]);
   const [collectionModFiles, setCollectionModFiles] = useState<CollectionModFile[]>([]);
+  const [collectionDetail, setCollectionDetail] = useState<CollectionDetail | null>(null);
   const [includeOptional, setIncludeOptional] = useState(false);
   const [assistQueue, setAssistQueue] = useState<AssistQueueState | null>(null);
   const [activeBatch, setActiveBatch] = useState<ActiveDownloadBatch | null>(null);
@@ -328,6 +392,24 @@ function App() {
   const downloadStartedAtRef = useRef<number>(0);
   const tagPickerRef = useRef<HTMLDivElement | null>(null);
   const tagSearchRef = useRef<HTMLInputElement | null>(null);
+  const mainScrollRef = useRef<HTMLElement | null>(null);
+  const browseSentinelRef = useRef<HTMLDivElement | null>(null);
+  const browseLoadingMoreRef = useRef(false);
+  const browseRequestIdRef = useRef(0);
+  const browseModeRef = useRef(browseMode);
+  browseModeRef.current = browseMode;
+  const searchQueryRef = useRef(searchQuery);
+  searchQueryRef.current = searchQuery;
+  const browseHasMoreRef = useRef(browseHasMore);
+  browseHasMoreRef.current = browseHasMore;
+  const browseOptsRef = useRef<BrowseSearchOpts>({
+    sort: browseSort,
+    category: browseCategory || null,
+    tagsInclude: [],
+    tagsExclude: [],
+    gameVersion: browseVersion || null,
+    offset: 0,
+  });
 
   const activeGame = useMemo(
     () => managed.find((g) => g.id === activeId) ?? managed[0] ?? null,
@@ -400,6 +482,7 @@ function App() {
       setModDetail(null);
       setModFiles([]);
       setCollectionModFiles([]);
+      setCollectionDetail(null);
     }
   }, [activeGame, refreshMods]);
 
@@ -452,6 +535,31 @@ function App() {
       window.clearTimeout(id);
     };
   }, [tagsOpen]);
+
+  useEffect(() => {
+    if (tab !== "browse" || !browseHasMore) return;
+    const sentinel = browseSentinelRef.current;
+    const root = mainScrollRef.current;
+    if (!sentinel || !root) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((e) => e.isIntersecting)) return;
+        if (browseLoadingMoreRef.current || !browseHasMoreRef.current) return;
+        void runSearch(
+          browseModeRef.current,
+          searchQueryRef.current,
+          browseOptsRef.current,
+          true,
+        );
+      },
+      { root, rootMargin: "240px", threshold: 0 },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+    // Re-bind when result list size / mode / view changes so the sentinel stays observed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runSearch reads latest via refs
+  }, [tab, browseMode, browseView, browseHasMore, modHits.length, collectionHits.length]);
 
   const isPremium = settings?.user?.is_premium ?? false;
 
@@ -580,7 +688,9 @@ function App() {
       const stillActive = list.some(
         (d) =>
           d.batch_id === q.batchId &&
-          (d.status === "downloading" || d.status === "extracting"),
+          (d.status === "downloading" ||
+              d.status === "extracting" ||
+              d.status === "paused"),
       );
       if (stillActive) {
         setActiveBatch({ id: q.batchId, label: q.label });
@@ -770,6 +880,30 @@ function App() {
     [refreshDownloads],
   );
 
+  const pauseOneDownload = useCallback(
+    async (id: string) => {
+      try {
+        await api.pauseDownload(id);
+      } catch (e) {
+        setError(String(e));
+      }
+      await refreshDownloads();
+    },
+    [refreshDownloads],
+  );
+
+  const resumeOneDownload = useCallback(
+    async (id: string) => {
+      try {
+        await api.resumeDownload(id);
+      } catch (e) {
+        setError(String(e));
+      }
+      await refreshDownloads();
+    },
+    [refreshDownloads],
+  );
+
   const handleAssistHost = useCallback(
     (el: HTMLDivElement | null) => {
       assistHostRef.current = el;
@@ -917,7 +1051,9 @@ function App() {
           const still = list.some(
             (d) =>
               d.batch_id === batch.id &&
-              (d.status === "downloading" || d.status === "extracting"),
+              (d.status === "downloading" ||
+              d.status === "extracting" ||
+              d.status === "paused"),
           );
           if (!still) setActiveBatch(null);
         }
@@ -941,7 +1077,9 @@ function App() {
           const still = list.some(
             (d) =>
               d.batch_id === batch.id &&
-              (d.status === "downloading" || d.status === "extracting"),
+              (d.status === "downloading" ||
+              d.status === "extracting" ||
+              d.status === "paused"),
           );
           if (!still) setActiveBatch(null);
         }
@@ -960,7 +1098,9 @@ function App() {
           const still = list.some(
             (d) =>
               d.batch_id === batch.id &&
-              (d.status === "downloading" || d.status === "extracting"),
+              (d.status === "downloading" ||
+              d.status === "extracting" ||
+              d.status === "paused"),
           );
           if (!still) setActiveBatch(null);
         }
@@ -1072,71 +1212,180 @@ function App() {
     });
   }
 
-  const browseOpts = useMemo(
-    () => ({
+  const browseOpts = useMemo((): BrowseSearchOpts => {
+    const { tagsInclude, tagsExclude } = tagListsFromMap(browseTags);
+    return {
       sort: browseSort,
       category: browseCategory || null,
-      tags: browseTags,
+      tagsInclude,
+      tagsExclude,
       gameVersion: browseVersion || null,
-    }),
-    [browseSort, browseCategory, browseTags, browseVersion],
+      offset: 0,
+    };
+  }, [browseSort, browseCategory, browseTags, browseVersion]);
+
+  browseOptsRef.current = browseOpts;
+
+  const activeTagCount = useMemo(
+    () => Object.keys(browseTags).length,
+    [browseTags],
   );
 
   const orderedTags = useMemo(() => {
-    const all = browseMeta?.tags ?? [];
+    const all =
+      browseMode === "mods"
+        ? (browseMeta?.mod_tags ?? [])
+        : (browseMeta?.collection_tags ?? []);
     const q = tagQuery.trim().toLowerCase();
     const filtered = q ? all.filter((t) => t.toLowerCase().includes(q)) : all;
     return [...filtered].sort((a, b) => {
-      const ac = browseTags.includes(a) ? 0 : 1;
-      const bc = browseTags.includes(b) ? 0 : 1;
-      if (ac !== bc) return ac - bc;
+      const rank = (t: string) =>
+        browseTags[t] === "include" ? 0 : browseTags[t] === "exclude" ? 1 : 2;
+      const ar = rank(a);
+      const br = rank(b);
+      if (ar !== br) return ar - br;
       return a.localeCompare(b, undefined, { sensitivity: "base" });
     });
-  }, [browseMeta?.tags, browseTags, tagQuery]);
+  }, [browseMeta?.mod_tags, browseMeta?.collection_tags, browseMode, browseTags, tagQuery]);
 
   async function runSearch(
     mode: "mods" | "collections" = browseMode,
     query = searchQuery,
-    opts = browseOpts,
+    opts: BrowseSearchOpts = browseOpts,
+    append = false,
   ) {
     if (!activeGame) {
       setError("Manage a game first.");
       return;
     }
-    await withBusy("Searching Nexus…", async () => {
-      if (mode === "mods") {
-        setModHits(await api.searchMods(activeGame.nexus_domain, query, opts));
-      } else {
-        setCollectionHits(
-          await api.searchCollections(activeGame.nexus_domain, query, opts),
+    if (append) {
+      if (browseLoadingMoreRef.current || !browseHasMore) return;
+      browseLoadingMoreRef.current = true;
+    }
+
+    const requestId = ++browseRequestIdRef.current;
+    const offset = append
+      ? mode === "mods"
+        ? modHits.length
+        : collectionHits.length
+      : 0;
+    const requestOpts: BrowseSearchOpts = { ...opts, offset };
+
+    try {
+      if (!append) {
+        await withBusy("Searching Nexus…", async () => {
+          if (mode === "mods") {
+            const page = await api.searchMods(
+              activeGame.nexus_domain,
+              query,
+              requestOpts,
+            );
+            if (requestId !== browseRequestIdRef.current) return;
+            setModHits(page.items);
+            setBrowseTotalCount(page.total_count);
+            setBrowseHasMore(
+              page.items.length > 0 &&
+                page.items.length + offset < page.total_count,
+            );
+          } else {
+            const page = await api.searchCollections(
+              activeGame.nexus_domain,
+              query,
+              requestOpts,
+            );
+            if (requestId !== browseRequestIdRef.current) return;
+            setCollectionHits(page.items);
+            setBrowseTotalCount(page.total_count);
+            setBrowseHasMore(
+              page.items.length > 0 &&
+                page.items.length + offset < page.total_count,
+            );
+          }
+        });
+      } else if (mode === "mods") {
+        const page = await api.searchMods(
+          activeGame.nexus_domain,
+          query,
+          requestOpts,
         );
+        if (requestId !== browseRequestIdRef.current) return;
+        setModHits((prev) => {
+          const seen = new Set(prev.map((m) => m.mod_id));
+          const merged = [...prev];
+          for (const item of page.items) {
+            if (!seen.has(item.mod_id)) {
+              seen.add(item.mod_id);
+              merged.push(item);
+            }
+          }
+          setBrowseHasMore(
+            page.items.length > 0 && merged.length < page.total_count,
+          );
+          return merged;
+        });
+        setBrowseTotalCount(page.total_count);
+      } else {
+        const page = await api.searchCollections(
+          activeGame.nexus_domain,
+          query,
+          requestOpts,
+        );
+        if (requestId !== browseRequestIdRef.current) return;
+        setCollectionHits((prev) => {
+          const seen = new Set(prev.map((c) => c.slug));
+          const merged = [...prev];
+          for (const item of page.items) {
+            if (!seen.has(item.slug)) {
+              seen.add(item.slug);
+              merged.push(item);
+            }
+          }
+          setBrowseHasMore(
+            page.items.length > 0 && merged.length < page.total_count,
+          );
+          return merged;
+        });
+        setBrowseTotalCount(page.total_count);
       }
-    });
+    } catch (e) {
+      if (requestId === browseRequestIdRef.current) {
+        setError(String(e));
+        if (!append) setBrowseHasMore(false);
+      }
+    } finally {
+      if (append) browseLoadingMoreRef.current = false;
+    }
   }
 
   async function search() {
     await runSearch();
   }
 
-  function toggleBrowseTag(tag: string) {
-    const tags = browseTags.includes(tag)
-      ? browseTags.filter((t) => t !== tag)
-      : [...browseTags, tag];
+  function cycleBrowseTag(tag: string) {
+    const tags = setTagInMap(browseTags, tag);
     setBrowseTags(tags);
-    runSearch(browseMode, searchQuery, { ...browseOpts, tags });
+    const { tagsInclude, tagsExclude } = tagListsFromMap(tags);
+    runSearch(browseMode, searchQuery, {
+      ...browseOpts,
+      tagsInclude,
+      tagsExclude,
+      offset: 0,
+    });
   }
 
   function clearBrowseFilters() {
     setBrowseCategory("");
     setBrowseVersion("");
-    setBrowseTags([]);
+    setBrowseTags({});
     setTagQuery("");
     setTagsOpen(false);
     runSearch(browseMode, searchQuery, {
       ...browseOpts,
       category: null,
       gameVersion: null,
-      tags: [],
+      tagsInclude: [],
+      tagsExclude: [],
+      offset: 0,
     });
   }
 
@@ -1145,6 +1394,7 @@ function App() {
     setBrowseDetail({ kind: "mod", hit, tab: detailTab });
     setModDetail(null);
     setCollectionModFiles([]);
+    setCollectionDetail(null);
     if (detailTab === "files") {
       setModFiles([]);
       await withBusy("Loading files…", async () => {
@@ -1162,19 +1412,22 @@ function App() {
     setBrowseDetail({ kind: "collection", hit, tab: detailTab });
     setModDetail(null);
     setModFiles([]);
-    if (detailTab === "files") {
-      setCollectionModFiles([]);
-      await withBusy("Loading collection mods…", async () => {
-        setCollectionModFiles(
-          await api.collectionFiles({
-            slug: hit.slug,
-            revision: hit.revision_number,
-          }),
-        );
-      });
-    } else {
-      setCollectionModFiles([]);
-    }
+    setCollectionModFiles([]);
+    setCollectionDetail(null);
+    const domain = hit.domain_name || activeGame.nexus_domain;
+    await withBusy(
+      detailTab === "files" ? "Loading collection mods…" : "Loading collection…",
+      async () => {
+        const detailPromise = api.getCollection({ slug: hit.slug, domain });
+        const filesPromise = api.collectionFiles({
+          slug: hit.slug,
+          revision: hit.revision_number,
+        });
+        const [detail, files] = await Promise.all([detailPromise, filesPromise]);
+        setCollectionDetail(detail);
+        setCollectionModFiles(files);
+      },
+    );
   }
 
   async function setDetailTab(detailTab: DetailTab) {
@@ -1211,6 +1464,15 @@ function App() {
           }),
         );
       });
+    } else if (detailTab === "info" && !collectionDetail) {
+      await withBusy("Loading collection…", async () => {
+        setCollectionDetail(
+          await api.getCollection({
+            slug: next.hit.slug,
+            domain: next.hit.domain_name || activeGame.nexus_domain,
+          }),
+        );
+      });
     }
   }
 
@@ -1219,6 +1481,7 @@ function App() {
     setModDetail(null);
     setModFiles([]);
     setCollectionModFiles([]);
+    setCollectionDetail(null);
   }
 
   async function openGame(game: ManagedGame, detailTab: GameDetailTab = "info") {
@@ -1226,6 +1489,12 @@ function App() {
     setActiveId(game.id);
     setLibraryDetail({ game, tab: detailTab });
     setTab("library");
+    setGameInfo(null);
+    try {
+      setGameInfo(await api.getGame(game.nexus_domain));
+    } catch {
+      /* Nexus metadata is optional for local game info */
+    }
   }
 
   function setGameDetailTab(detailTab: GameDetailTab) {
@@ -1234,6 +1503,7 @@ function App() {
 
   function closeLibraryDetail() {
     setLibraryDetail(null);
+    setGameInfo(null);
   }
 
   async function installFile(file: ModFileInfo) {
@@ -1257,7 +1527,11 @@ function App() {
         await refreshMods(activeGame.id);
         await refreshDownloads();
       } catch (e) {
-        setError(String(e));
+        const msg = String(e);
+        if (!msg.includes("Paused")) {
+          setError(msg);
+        }
+        await refreshDownloads();
       } finally {
         setBusy(null);
       }
@@ -1411,7 +1685,7 @@ function App() {
   }
 
   const sortOptions = browseMode === "mods" ? MOD_SORTS : COLLECTION_SORTS;
-  const downloadStatus = statusSummary(busy, assistQueue);
+  const downloadStatus = statusSummary(busy, assistQueue, downloads, activeBatch);
 
   function openDownloadsTab() {
     setTab("downloads");
@@ -1425,7 +1699,7 @@ function App() {
           <span className="brand-mark">N</span>
           <div>
             <strong>Nexus Manager</strong>
-            <small>Linux · MVP+</small>
+            <small>MVP+</small>
           </div>
         </div>
         <nav>
@@ -1486,7 +1760,7 @@ function App() {
         )}
       </aside>
 
-      <main className="main">
+      <main className="main" ref={mainScrollRef}>
         {error && (
           <div className="banner error">
             <span>{error}</span>
@@ -1613,25 +1887,58 @@ function App() {
                   <div className="detail-meta">
                     <p className="detail-author">
                       {shortLauncher(libraryDetail.game.launcher)}
+                      {gameInfo?.genre ? ` · ${gameInfo.genre}` : ""}
                     </p>
                     <div className="detail-stats">
+                      <span>
+                        {mods.length} mod{mods.length === 1 ? "" : "s"}
+                      </span>
+                      <span>
+                        {mods.filter((m) => m.enabled).length} enabled
+                      </span>
+                      {gameInfo?.mods != null && (
+                        <span>{gameInfo.mods.toLocaleString()} on Nexus</span>
+                      )}
+                      {gameInfo?.downloads != null && (
+                        <span>{gameInfo.downloads.toLocaleString()} downloads</span>
+                      )}
                       <span>{libraryDetail.game.nexus_domain}</span>
-                      <span>{libraryDetail.game.plugin_id}</span>
                     </div>
-                    {libraryDetail.tab === "mods" && (
-                      <div className="detail-mod-actions">
-                        <button onClick={importArchive}>Import archive</button>
-                        <button onClick={deploy}>Deploy</button>
-                        <button onClick={purge}>Purge</button>
+                    <div className="detail-mod-actions">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          openExternal(
+                            gameInfo?.nexusmods_url ||
+                              `https://www.nexusmods.com/${libraryDetail.game.nexus_domain}`,
+                          )
+                        }
+                      >
+                        Open on Nexus
+                      </button>
+                      {gameInfo?.forum_url && (
                         <button
-                          className="danger"
-                          onClick={removeAllMods}
-                          disabled={mods.length === 0}
+                          type="button"
+                          onClick={() => openExternal(gameInfo.forum_url!)}
                         >
-                          Remove all mods
+                          Forum
                         </button>
-                      </div>
-                    )}
+                      )}
+                      {libraryDetail.tab === "mods" && (
+                        <>
+                          <button onClick={importArchive}>Import archive</button>
+                          <button onClick={deploy}>Deploy</button>
+                          <button onClick={purge}>Purge</button>
+                          <button
+                            className="danger"
+                            onClick={removeAllMods}
+                            disabled={mods.length === 0}
+                          >
+                            Remove all mods
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -1647,6 +1954,30 @@ function App() {
                       <dd>{libraryDetail.game.install_path}</dd>
                       <dt>Plugin</dt>
                       <dd>{libraryDetail.game.plugin_id}</dd>
+                      {gameInfo?.genre && (
+                        <>
+                          <dt>Genre</dt>
+                          <dd>{gameInfo.genre}</dd>
+                        </>
+                      )}
+                      {gameInfo?.mods != null && (
+                        <>
+                          <dt>Nexus mods</dt>
+                          <dd>{gameInfo.mods.toLocaleString()}</dd>
+                        </>
+                      )}
+                      {gameInfo?.file_count != null && (
+                        <>
+                          <dt>Nexus files</dt>
+                          <dd>{gameInfo.file_count.toLocaleString()}</dd>
+                        </>
+                      )}
+                      {gameInfo?.downloads != null && (
+                        <>
+                          <dt>Downloads</dt>
+                          <dd>{gameInfo.downloads.toLocaleString()}</dd>
+                        </>
+                      )}
                     </dl>
                   </div>
                 ) : (
@@ -1724,7 +2055,10 @@ function App() {
                 </div>
                 <p>
                   Supported plugins: Stardew Valley, Baldur&apos;s Gate 3, Cyberpunk
-                  2077. Other detected games appear as unsupported.
+                  2077, Days Gone, S.T.A.L.K.E.R. 2: Heart of Chornobyl, Warhammer
+                  40,000: Darktide, Dark Souls, Dark Souls Remastered, Dark Souls 2,
+                  Dark Souls 3, Elden Ring, Resident Evil 7, Village, Requiem, 2/3/4
+                  Remake. Other detected games appear as unsupported.
                 </p>
                 {managed.length > 0 && (
                   <>
@@ -1872,6 +2206,14 @@ function App() {
                       <div className="detail-meta">
                         <p className="detail-author">
                           {modDetail?.author ?? browseDetail.hit.author ?? "Unknown author"}
+                          {modDetail?.uploaded_by &&
+                            modDetail.uploaded_by !==
+                              (modDetail.author ?? browseDetail.hit.author) && (
+                              <span className="detail-author-secondary">
+                                {" "}
+                                · uploaded by {modDetail.uploaded_by}
+                              </span>
+                            )}
                         </p>
                         <div className="detail-stats">
                           {(modDetail?.endorsements ?? browseDetail.hit.endorsements) !=
@@ -1895,6 +2237,14 @@ function App() {
                           {(modDetail?.category ?? browseDetail.hit.category) && (
                             <span>{modDetail?.category ?? browseDetail.hit.category}</span>
                           )}
+                          {modDetail?.contains_adult_content && (
+                            <span className="detail-badge-adult">Adult</span>
+                          )}
+                          {modDetail?.status &&
+                            modDetail.status.toLowerCase() !== "published" &&
+                            modDetail.status.toLowerCase() !== "normal" && (
+                              <span className="detail-badge-status">{modDetail.status}</span>
+                            )}
                         </div>
                         {browseDetail.hit.tags && browseDetail.hit.tags.length > 0 && (
                           <div className="media-card-tags">
@@ -1919,19 +2269,46 @@ function App() {
                             </>
                           )}
                         </dl>
+                        <div className="detail-mod-actions">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openExternal(
+                                `https://www.nexusmods.com/${
+                                  modDetail?.domain_name ||
+                                  browseDetail.hit.domain_name ||
+                                  activeGame?.nexus_domain
+                                }/mods/${browseDetail.hit.mod_id}`,
+                              )
+                            }
+                          >
+                            Open on Nexus
+                          </button>
+                          {modDetail?.uploaded_users_profile_url && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                openExternal(modDetail.uploaded_users_profile_url!)
+                              }
+                            >
+                              Author profile
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
 
                     {browseDetail.tab === "info" ? (
                       <div className="detail-body">
                         <h2>About</h2>
-                        <p className="detail-description">
-                          {modDetail?.description
-                            ? stripHtml(modDetail.description)
-                            : modDetail?.summary ??
-                              browseDetail.hit.summary ??
-                              "No description available."}
-                        </p>
+                        <RichText
+                          className="detail-description detail-description-html"
+                          text={
+                            modDetail?.description ??
+                            modDetail?.summary ??
+                            browseDetail.hit.summary
+                          }
+                        />
                       </div>
                     ) : (
                       <div className="detail-body">
@@ -1976,7 +2353,9 @@ function App() {
                         )}
                       </div>
                       <div className="detail-meta">
-                        <p className="detail-author">Collection</p>
+                        <p className="detail-author">
+                          {browseDetail.hit.author ?? "Collection"}
+                        </p>
                         <div className="detail-stats">
                           {browseDetail.hit.endorsements != null && (
                             <span>
@@ -1988,13 +2367,52 @@ function App() {
                               {browseDetail.hit.total_downloads.toLocaleString()} downloads
                             </span>
                           )}
+                          {browseDetail.hit.mod_count != null && (
+                            <span>
+                              {browseDetail.hit.mod_count.toLocaleString()} mods
+                            </span>
+                          )}
+                          {collectionModFiles.length > 0 && (
+                            <span>
+                              {collectionModFiles.length.toLocaleString()} files
+                            </span>
+                          )}
+                          {browseDetail.hit.file_size != null &&
+                            browseDetail.hit.file_size > 0 && (
+                              <span>{formatBytes(browseDetail.hit.file_size)}</span>
+                            )}
+                          {browseDetail.hit.overall_rating != null && (
+                            <span>
+                              {browseDetail.hit.overall_rating.toFixed(1)}
+                              {browseDetail.hit.overall_rating_count != null
+                                ? ` · ${browseDetail.hit.overall_rating_count.toLocaleString()} ratings`
+                                : ""}
+                            </span>
+                          )}
                           {browseDetail.hit.revision_number != null && (
                             <span>rev {browseDetail.hit.revision_number}</span>
+                          )}
+                          {browseDetail.hit.category && (
+                            <span>{browseDetail.hit.category}</span>
                           )}
                           {browseDetail.hit.domain_name && (
                             <span>{browseDetail.hit.domain_name}</span>
                           )}
                         </div>
+                        <dl className="meta detail-dates">
+                          {formatIsoDate(browseDetail.hit.created_at) && (
+                            <>
+                              <dt>Created</dt>
+                              <dd>{formatIsoDate(browseDetail.hit.created_at)}</dd>
+                            </>
+                          )}
+                          {formatIsoDate(browseDetail.hit.updated_at) && (
+                            <>
+                              <dt>Updated</dt>
+                              <dd>{formatIsoDate(browseDetail.hit.updated_at)}</dd>
+                            </>
+                          )}
+                        </dl>
                         <div className="actions">
                           <button onClick={() => installCollection(browseDetail.hit)}>
                             {isPremium ? "Install" : "Download Assist"}
@@ -2014,56 +2432,74 @@ function App() {
                     {browseDetail.tab === "info" ? (
                       <div className="detail-body">
                         <h2>About</h2>
-                        <p className="detail-description">
-                          {browseDetail.hit.summary ?? "No description available."}
-                        </p>
+                        <RichText
+                          className="detail-description detail-description-html"
+                          text={
+                            collectionDetail?.description ??
+                            collectionDetail?.summary ??
+                            browseDetail.hit.summary
+                          }
+                        />
                       </div>
                     ) : (
                       <div className="detail-body">
-                        <h2>Included mods</h2>
-                        <ul className="list">
-                          {groupCollectionMods(collectionModFiles).map((group) => {
-                            const primary = group.files[0];
-                            const extras =
-                              group.files.length > 1
-                                ? ` · ${group.files.length} files`
-                                : "";
-                            return (
-                              <li
-                                key={group.mod_id}
-                                className="list-row-clickable"
-                                onClick={() =>
-                                  openMod(
-                                    {
-                                      mod_id: group.mod_id,
-                                      name: group.mod_name,
-                                      summary: null,
-                                      picture_url: null,
-                                      downloads: null,
-                                      endorsements: null,
-                                      author: null,
-                                      domain_name: group.domain_name,
-                                    },
-                                    "info",
-                                  )
-                                }
-                              >
-                                <div>
-                                  <strong>{group.mod_name}</strong>
-                                  <small>
-                                    {primary.file_name}
-                                    {primary.version ? ` · v${primary.version}` : ""}
-                                    {primary.optional ? " · optional" : ""}
-                                    {extras}
-                                  </small>
-                                </div>
-                              </li>
-                            );
-                          })}
-                          {collectionModFiles.length === 0 && (
-                            <li className="empty">No mods found in this collection.</li>
-                          )}
-                        </ul>
+                        {(() => {
+                          const groups = groupCollectionMods(collectionModFiles);
+                          return (
+                            <>
+                              <h2>
+                                Included mods ({groups.length})
+                                {collectionModFiles.length > 0 &&
+                                collectionModFiles.length !== groups.length
+                                  ? ` · ${collectionModFiles.length} files`
+                                  : ""}
+                              </h2>
+                              <ul className="list">
+                                {groups.map((group) => {
+                                  const primary = group.files[0];
+                                  const extras =
+                                    group.files.length > 1
+                                      ? ` · ${group.files.length} files`
+                                      : "";
+                                  return (
+                                    <li
+                                      key={group.mod_id}
+                                      className="list-row-clickable"
+                                      onClick={() =>
+                                        openMod(
+                                          {
+                                            mod_id: group.mod_id,
+                                            name: group.mod_name,
+                                            summary: null,
+                                            picture_url: null,
+                                            downloads: null,
+                                            endorsements: null,
+                                            author: null,
+                                            domain_name: group.domain_name,
+                                          },
+                                          "info",
+                                        )
+                                      }
+                                    >
+                                      <div>
+                                        <strong>{group.mod_name}</strong>
+                                        <small>
+                                          {primary.file_name}
+                                          {primary.version ? ` · v${primary.version}` : ""}
+                                          {primary.optional ? " · optional" : ""}
+                                          {extras}
+                                        </small>
+                                      </div>
+                                    </li>
+                                  );
+                                })}
+                                {collectionModFiles.length === 0 && (
+                                  <li className="empty">No mods found in this collection.</li>
+                                )}
+                              </ul>
+                            </>
+                          );
+                        })()}
                       </div>
                     )}
                   </>
@@ -2080,6 +2516,15 @@ function App() {
                         onClick={() => {
                           setBrowseMode("mods");
                           setBrowseSort("endorsements");
+                          setBrowseTags({});
+                          setBrowseDetail(null);
+                          runSearch("mods", searchQuery, {
+                            ...browseOpts,
+                            sort: "endorsements",
+                            tagsInclude: [],
+                            tagsExclude: [],
+                            offset: 0,
+                          });
                         }}
                       >
                         Mods
@@ -2089,6 +2534,15 @@ function App() {
                         onClick={() => {
                           setBrowseMode("collections");
                           setBrowseSort("endorsements");
+                          setBrowseTags({});
+                          setBrowseDetail(null);
+                          runSearch("collections", searchQuery, {
+                            ...browseOpts,
+                            sort: "endorsements",
+                            tagsInclude: [],
+                            tagsExclude: [],
+                            offset: 0,
+                          });
                         }}
                       >
                         Collections
@@ -2165,27 +2619,29 @@ function App() {
                           ))}
                         </select>
                       </label>
-                      <label>
-                        Game version
-                        <select
-                          value={browseVersion}
-                          onChange={(e) => {
-                            const gameVersion = e.target.value;
-                            setBrowseVersion(gameVersion);
-                            runSearch(browseMode, searchQuery, {
-                              ...browseOpts,
-                              gameVersion: gameVersion || null,
-                            });
-                          }}
-                        >
-                          <option value="">Any</option>
-                          {(browseMeta?.game_versions ?? []).map((v) => (
-                            <option key={v} value={v}>
-                              {v}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
+                      {browseMode === "collections" && (
+                        <label>
+                          Game version
+                          <select
+                            value={browseVersion}
+                            onChange={(e) => {
+                              const gameVersion = e.target.value;
+                              setBrowseVersion(gameVersion);
+                              runSearch(browseMode, searchQuery, {
+                                ...browseOpts,
+                                gameVersion: gameVersion || null,
+                              });
+                            }}
+                          >
+                            <option value="">Any</option>
+                            {(browseMeta?.game_versions ?? []).map((v) => (
+                              <option key={v} value={v}>
+                                {v}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
                       <div className="tag-picker" ref={tagPickerRef}>
                         <span className="tag-picker-label" id="browse-tags-label">
                           Tags
@@ -2198,11 +2654,11 @@ function App() {
                           aria-labelledby="browse-tags-label"
                           onClick={() => setTagsOpen((open) => !open)}
                         >
-                          {browseTags.length === 0
+                          {activeTagCount === 0
                             ? "Any"
-                            : browseTags.length === 1
-                              ? browseTags[0]
-                              : `${browseTags.length} tags`}
+                            : activeTagCount === 1
+                              ? Object.keys(browseTags)[0]
+                              : `${activeTagCount} tags`}
                         </button>
                         {tagsOpen && (
                           <div
@@ -2225,20 +2681,41 @@ function App() {
                                 }
                               }}
                             />
+                            <p className="tag-picker-hint">
+                              Click: include → exclude → clear
+                            </p>
                             <div className="tag-picker-list">
                               {orderedTags.length === 0 ? (
                                 <div className="tag-picker-empty">No tags</div>
                               ) : (
-                                orderedTags.map((t) => (
-                                  <label key={t} className="tag-picker-item">
-                                    <input
-                                      type="checkbox"
-                                      checked={browseTags.includes(t)}
-                                      onChange={() => toggleBrowseTag(t)}
-                                    />
-                                    <span>{t}</span>
-                                  </label>
-                                ))
+                                orderedTags.map((t) => {
+                                  const state = browseTags[t];
+                                  return (
+                                    <button
+                                      key={t}
+                                      type="button"
+                                      role="option"
+                                      aria-selected={Boolean(state)}
+                                      className={`tag-picker-item${
+                                        state === "include"
+                                          ? " include"
+                                          : state === "exclude"
+                                            ? " exclude"
+                                            : ""
+                                      }`}
+                                      onClick={() => cycleBrowseTag(t)}
+                                    >
+                                      <span className="tag-picker-state" aria-hidden="true">
+                                        {state === "include"
+                                          ? "+"
+                                          : state === "exclude"
+                                            ? "−"
+                                            : ""}
+                                      </span>
+                                      <span>{t}</span>
+                                    </button>
+                                  );
+                                })
                               )}
                             </div>
                           </div>
@@ -2334,6 +2811,12 @@ function App() {
                       <div className="media-grid">
                         {collectionHits.map((c) => {
                           const tags = [
+                            ...(c.mod_count != null
+                              ? [`${c.mod_count.toLocaleString()} mods`]
+                              : []),
+                            ...(c.file_size != null && c.file_size > 0
+                              ? [formatBytes(c.file_size)]
+                              : []),
                             ...(c.revision_number != null
                               ? [`rev ${c.revision_number}`]
                               : []),
@@ -2388,13 +2871,40 @@ function App() {
                               tabIndex={0}
                             >
                               <strong>{c.name}</strong>
-                              <small>{c.slug}</small>
+                              <small>
+                                {c.author ?? c.slug}
+                                {c.mod_count != null
+                                  ? ` · ${c.mod_count.toLocaleString()} mods`
+                                  : ""}
+                                {c.file_size != null && c.file_size > 0
+                                  ? ` · ${formatBytes(c.file_size)}`
+                                  : ""}
+                              </small>
                               {c.summary && <p className="summary">{c.summary}</p>}
                             </div>
                             <button onClick={() => installCollection(c)}>Install</button>
                           </li>
                         ))}
                       </ul>
+                    )}
+                    <div
+                      ref={browseSentinelRef}
+                      className="browse-scroll-sentinel"
+                      aria-hidden="true"
+                    />
+                    {(modHits.length > 0 || collectionHits.length > 0) && (
+                      <p className="browse-page-status note">
+                        {browseMode === "mods"
+                          ? `Showing ${modHits.length}${
+                              browseTotalCount > 0 ? ` of ${browseTotalCount}` : ""
+                            } mods`
+                          : `Showing ${collectionHits.length}${
+                              browseTotalCount > 0
+                                ? ` of ${browseTotalCount}`
+                                : ""
+                            } collections`}
+                        {browseHasMore ? " · scroll for more" : ""}
+                      </p>
                     )}
                   </>
                 )}
@@ -2415,6 +2925,8 @@ function App() {
             onCancel={() => cancelAssistQueue()}
             onCancelRemaining={() => cancelRemainingBatch()}
             onCancelDownload={(id) => cancelOneDownload(id)}
+            onPauseDownload={(id) => pauseOneDownload(id)}
+            onResumeDownload={(id) => resumeOneDownload(id)}
             onAssistHost={handleAssistHost}
           />
         )}

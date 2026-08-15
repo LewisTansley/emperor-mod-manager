@@ -2,15 +2,17 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BrowseMeta,
   BrowseSearchOpts,
-  CollectionHit,
+  CollectionDetail,
   CollectionModFile,
+  CollectionSearchPage,
   DeployResult,
   DetectedGame,
   DownloadItem,
+  GameInfo,
   ManagedGame,
   ModDetail,
   ModFileInfo,
-  ModSearchHit,
+  ModSearchPage,
   NexusUser,
   Settings,
   StagedMod,
@@ -41,16 +43,20 @@ export const api = {
   unmanageGame: (id: string) => invoke<void>("unmanage_game", { id }),
   setActiveGame: (id: string) => invoke<void>("set_active_game", { id }),
   searchMods: (domain: string, query: string, opts: BrowseSearchOpts = {}) =>
-    invoke<ModSearchHit[]>("search_mods", {
+    invoke<ModSearchPage>("search_mods", {
       domain,
       query,
       sort: opts.sort ?? null,
       category: opts.category ?? null,
-      tags: opts.tags ?? null,
+      tagsInclude: opts.tagsInclude ?? null,
+      tagsExclude: opts.tagsExclude ?? null,
       gameVersion: opts.gameVersion ?? null,
+      offset: opts.offset ?? null,
+      count: opts.count ?? null,
     }),
   getMod: (domain: string, modId: number) =>
     invoke<ModDetail>("get_mod", { domain, modId }),
+  getGame: (domain: string) => invoke<GameInfo>("get_game", { domain }),
   modFiles: (domain: string, modId: number) =>
     invoke<ModFileInfo[]>("mod_files", { domain, modId }),
   searchCollections: (
@@ -58,15 +64,23 @@ export const api = {
     query: string,
     opts: BrowseSearchOpts = {},
   ) =>
-    invoke<CollectionHit[]>("search_collections", {
+    invoke<CollectionSearchPage>("search_collections", {
       domain,
       query,
       sort: opts.sort ?? null,
       category: opts.category ?? null,
-      tags: opts.tags ?? null,
+      tagsInclude: opts.tagsInclude ?? null,
+      tagsExclude: opts.tagsExclude ?? null,
       gameVersion: opts.gameVersion ?? null,
+      offset: opts.offset ?? null,
+      count: opts.count ?? null,
     }),
   browseMeta: (domain: string) => invoke<BrowseMeta>("browse_meta", { domain }),
+  getCollection: (args: { slug: string; domain?: string | null }) =>
+    invoke<CollectionDetail>("get_collection", {
+      slug: args.slug,
+      domain: args.domain ?? null,
+    }),
   downloadMod: (args: {
     gameId: string;
     domain: string;
@@ -91,8 +105,12 @@ export const api = {
       name: args.name,
       batchId: args.batchId ?? null,
     }),
-  setAssistBounds: (bounds: { x: number; y: number; width: number; height: number }) =>
-    invoke<void>("set_assist_bounds", bounds),
+  setAssistBounds: (bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }) => invoke<void>("set_assist_bounds", bounds),
   setAssistVisible: (visible: boolean) =>
     invoke<void>("set_assist_visible", { visible }),
   closeDownloadAssist: () => invoke<void>("close_download_assist"),
@@ -134,4 +152,6 @@ export const api = {
   cancelDownload: (id: string) => invoke<void>("cancel_download", { id }),
   cancelDownloadBatch: (batchId: string) =>
     invoke<void>("cancel_download_batch", { batchId }),
+  pauseDownload: (id: string) => invoke<void>("pause_download", { id }),
+  resumeDownload: (id: string) => invoke<void>("resume_download", { id }),
 };

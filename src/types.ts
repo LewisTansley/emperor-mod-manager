@@ -21,6 +21,24 @@ export type ManagedGame = {
   cover_path?: string | null;
 };
 
+export type GameCategory = {
+  category_id: number;
+  name: string;
+};
+
+export type GameInfo = {
+  id: number;
+  name: string;
+  domain_name: string;
+  genre: string | null;
+  forum_url: string | null;
+  nexusmods_url: string | null;
+  mods: number | null;
+  file_count: number | null;
+  downloads: number | null;
+  categories: GameCategory[];
+};
+
 export type NexusUser = {
   user_id: number;
   key: string;
@@ -55,7 +73,12 @@ export type ModDetail = {
   created_timestamp: number | null;
   updated_timestamp: number | null;
   domain_name: string;
+  category_id?: number | null;
   category?: string | null;
+  uploaded_by?: string | null;
+  status?: string | null;
+  contains_adult_content?: boolean;
+  uploaded_users_profile_url?: string | null;
 };
 
 export type ModFileInfo = {
@@ -77,6 +100,26 @@ export type CollectionHit = {
   domain_name: string | null;
   revision_number: number | null;
   tile_image_url?: string | null;
+  author: string | null;
+  category: string | null;
+  overall_rating: number | null;
+  overall_rating_count: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+  mod_count: number | null;
+  file_size: number | null;
+};
+
+export type CollectionDetail = {
+  slug: string;
+  name: string;
+  summary: string | null;
+  description: string | null;
+  endorsements: number | null;
+  total_downloads: number | null;
+  domain_name: string | null;
+  revision_number: number | null;
+  tile_image_url?: string | null;
 };
 
 export type CollectionModFile = {
@@ -91,15 +134,33 @@ export type CollectionModFile = {
 
 export type BrowseMeta = {
   categories: string[];
-  tags: string[];
+  mod_tags: string[];
+  collection_tags: string[];
   game_versions: string[];
 };
+
+export type TagFilterState = "include" | "exclude";
 
 export type BrowseSearchOpts = {
   sort?: string;
   category?: string | null;
-  tags?: string[];
+  tagsInclude?: string[];
+  tagsExclude?: string[];
   gameVersion?: string | null;
+  offset?: number;
+  count?: number;
+};
+
+export type ModSearchPage = {
+  items: ModSearchHit[];
+  nodes_count: number;
+  total_count: number;
+};
+
+export type CollectionSearchPage = {
+  items: CollectionHit[];
+  nodes_count: number;
+  total_count: number;
 };
 
 export type StagedMod = {

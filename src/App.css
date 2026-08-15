@@ -388,15 +388,31 @@ button.tag-picker-trigger[aria-expanded="true"] {
   gap: 0.45rem;
   min-width: 0;
   min-height: unset;
+  width: 100%;
   padding: 0.28rem 0.4rem;
+  border: none;
   border-radius: 0.3rem;
+  background: transparent;
+  font: inherit;
   font-size: 0.82rem;
   color: var(--ink);
+  text-align: left;
   cursor: pointer;
 }
 
 .filters .tag-picker-item:hover {
   background: color-mix(in srgb, var(--ink) 6%, transparent);
+  filter: none;
+}
+
+.filters .tag-picker-item.include {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--ink);
+}
+
+.filters .tag-picker-item.exclude {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
 }
 
 .filters .tag-picker-item span {
@@ -405,15 +421,34 @@ button.tag-picker-trigger[aria-expanded="true"] {
   white-space: nowrap;
 }
 
-.filters .tag-picker-item input {
+.tag-picker-state {
   flex-shrink: 0;
+  width: 0.85rem;
+  text-align: center;
+  font-weight: 700;
+}
+
+.tag-picker-hint {
   margin: 0;
+  padding: 0 0.35rem 0.25rem;
+  font-size: 0.72rem;
+  color: var(--muted);
 }
 
 .tag-picker-empty {
   padding: 0.55rem 0.45rem;
   font-size: 0.8rem;
   color: var(--muted);
+}
+
+.browse-scroll-sentinel {
+  height: 1px;
+  width: 100%;
+  pointer-events: none;
+}
+
+.browse-page-status {
+  margin-top: 0.75rem;
 }
 
 .filters-clear {
@@ -658,13 +693,15 @@ button.danger {
 
 .detail-hero {
   display: grid;
-  grid-template-columns: 140px 1fr;
+  grid-template-columns: 140px minmax(0, 1fr);
   gap: 1.25rem;
   margin: 0.75rem 0 1.25rem;
   align-items: stretch;
 }
 
 .detail-cover {
+  width: 100%;
+  min-width: 0;
   aspect-ratio: 2 / 3;
   border-radius: 0.65rem;
   overflow: hidden;
@@ -725,6 +762,105 @@ button.danger {
   color: var(--ink);
 }
 
+.detail-description-html {
+  white-space: normal;
+}
+
+.detail-description-html p {
+  margin: 0 0 0.75rem;
+}
+
+.detail-description-html p:last-child {
+  margin-bottom: 0;
+}
+
+.detail-description-html ul,
+.detail-description-html ol {
+  margin: 0 0 0.75rem;
+  padding-left: 1.35rem;
+}
+
+.detail-description-html li {
+  margin: 0.2rem 0;
+}
+
+.detail-description-html a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.detail-description-html img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.4rem;
+  margin: 0.5rem 0;
+}
+
+.detail-description-html h1,
+.detail-description-html h2,
+.detail-description-html h3,
+.detail-description-html h4,
+.detail-description-html h5,
+.detail-description-html h6 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.detail-description-html span[style*="font-size"] {
+  line-height: 1.35;
+}
+
+.detail-description-html blockquote {
+  margin: 0.75rem 0;
+  padding-left: 0.85rem;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+
+.detail-description-html pre,
+.detail-description-html code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+
+.detail-description-html pre {
+  overflow-x: auto;
+  padding: 0.65rem 0.75rem;
+  border-radius: 0.4rem;
+  background: var(--cover-placeholder);
+  border: 1px solid var(--line);
+}
+
+.detail-description-html details {
+  margin: 0.65rem 0;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: var(--cover-placeholder);
+}
+
+.detail-description-html summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.detail-author-secondary {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.detail-badge-adult,
+.detail-badge-status {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.detail-badge-adult {
+  color: #c45c5c;
+}
+
 .list-row-clickable {
   cursor: pointer;
 }
@@ -765,14 +901,14 @@ button.danger {
 
 @media (max-width: 640px) {
   .detail-hero {
-    grid-template-columns: 100px 1fr;
+    grid-template-columns: 100px minmax(0, 1fr);
     gap: 0.85rem;
   }
 }
 
 .meta {
   display: grid;
-  grid-template-columns: 5rem 1fr;
+  grid-template-columns: 6.5rem 1fr;
   gap: 0.35rem 0.75rem;
   margin: 1rem 0;
 }
@@ -1088,6 +1224,15 @@ button.danger {
   display: block;
 }
 
+.downloads-active-actions {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+
+.downloads-control-one,
 .downloads-cancel-one {
   flex: none;
   padding: 0.3rem 0.55rem;
