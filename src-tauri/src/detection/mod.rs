@@ -8,7 +8,8 @@ use crate::games::{match_plugin, GamePluginInfo};
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "windows")]
+// Compile under `test` on non-Windows so pure Steam path/cover helpers are covered in CI.
+#[cfg(any(target_os = "windows", test))]
 mod windows;
 
 #[derive(Debug, Clone, Serialize)]

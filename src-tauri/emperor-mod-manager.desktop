@@ -3,6 +3,7 @@ Version=1.0
 Type=Application
 Name=Emperor Mod Manager
 Comment=Linux-native mod manager
+# TMPDIR fallback (full /tmp → user cache) is applied in-process before GTK init.
 Exec=emperor-mod-manager %u
 Icon=emperor-mod-manager
 Terminal=false

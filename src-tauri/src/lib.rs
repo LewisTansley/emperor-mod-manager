@@ -11,6 +11,8 @@ mod games;
     target_os = "openbsd"
 ))]
 mod linux_embed;
+#[cfg(target_os = "linux")]
+mod linux_startup;
 mod migration;
 mod mods;
 mod modio_api;
@@ -22,6 +24,12 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Must run before GTK/Tauri: a full /tmp (quota) makes icon load assert-abort.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = linux_startup::ensure_writable_tmpdir();
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let state = match AppState::new() {

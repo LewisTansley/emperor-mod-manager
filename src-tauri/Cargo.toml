@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.2.1"
+version = "0.2.2"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -58,3 +58,13 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [dev-dependencies]
 tempfile = "3"
+
+# Pull tao ≥ 0.36 (Wayland decoration/size fixes) before the next crates.io Tauri release.
+[patch.crates-io]
+tauri = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }
+tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }
+tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }
+tauri-macros = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }
+tauri-runtime = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }
+tauri-runtime-wry = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }
+tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "2f1cd75b0f3fb72e6870d719bbfeadedcf8ca884" }

@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -11,16 +11,15 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     assist::{AssistBounds, AssistContext},
     config::{self, AppConfig, ManagedGame, Paths, APP_NAME, APP_VERSION},
     detection::{self, DetectedGame},
-    games,
-    migration,
-    mods::{self, StagedMod},
+    games, migration,
     modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
+    mods::{self, StagedMod},
     nexus::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
         ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
@@ -286,12 +285,7 @@ fn ensure_download_job(
     )
 }
 
-fn set_download_resume(
-    state: &AppState,
-    id: &str,
-    dest: PathBuf,
-    source: DownloadResumeSource,
-) {
+fn set_download_resume(state: &AppState, id: &str, dest: PathBuf, source: DownloadResumeSource) {
     if let Ok(mut jobs) = state.download_jobs.lock() {
         if let Some(job) = jobs.get_mut(id) {
             job.dest = Some(dest);
@@ -445,8 +439,19 @@ pub fn get_app_info() -> serde_json::Value {
 }
 
 #[tauri::command]
-pub fn scan_games() -> Result<Vec<DetectedGame>, String> {
-    Ok(detection::scan_games())
+pub fn scan_games(app: AppHandle) -> Result<Vec<DetectedGame>, String> {
+    let games = detection::scan_games();
+    // Steam covers typically live under Program Files, outside the default $HOME
+    // assetProtocol scope. Allow only the exact cover files we resolved.
+    let scope = app.asset_protocol_scope();
+    for game in &games {
+        if let Some(cover) = game.cover_path.as_deref() {
+            if let Err(e) = scope.allow_file(Path::new(cover)) {
+                log::debug!("asset scope allow_file({cover}): {e}");
+            }
+        }
+    }
+    Ok(games)
 }
 
 #[tauri::command]
@@ -490,9 +495,7 @@ pub fn manage_game(
                 Some(t)
             }
         })
-        .or_else(|| {
-            games::thunderstore_community_for_plugin(&plugin_id).map(|s| s.to_string())
-        });
+        .or_else(|| games::thunderstore_community_for_plugin(&plugin_id).map(|s| s.to_string()));
     let modio_id = modio_game_id
         .filter(|&id| id > 0)
         .or_else(|| modio_api::seed_modio_game_id(&plugin_id));
@@ -583,8 +586,7 @@ pub fn update_managed_game(
         && game.modio_game_id.is_none()
     {
         return Err(
-            "Game needs a Nexus Mods domain, Thunderstore community, and/or mod.io game ID."
-                .into(),
+            "Game needs a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.".into(),
         );
     }
     let managed = game.clone();
@@ -664,9 +666,7 @@ fn match_catalog_lists(
     suggestion
 }
 
-async fn load_nexus_games_cached(
-    state: &AppState,
-) -> Result<Vec<nexus::NexusGameEntry>, String> {
+async fn load_nexus_games_cached(state: &AppState) -> Result<Vec<nexus::NexusGameEntry>, String> {
     let cached = state
         .nexus_games_cache
         .lock()
@@ -742,12 +742,9 @@ async fn enrich_modio_suggestion(
     match ModioClient::new(&key) {
         Ok(client) => match client.search_games(title, 25).await {
             Ok(games) => {
-                if let Some(hit) = best_catalog_match(
-                    title,
-                    &games,
-                    |g| g.name.as_str(),
-                    |g| g.name_id.as_str(),
-                ) {
+                if let Some(hit) =
+                    best_catalog_match(title, &games, |g| g.name.as_str(), |g| g.name_id.as_str())
+                {
                     suggestion.modio_game_id = Some(hit.id);
                     suggestion.modio_name = Some(hit.name.clone());
                 }
@@ -816,8 +813,13 @@ fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) ->
         || (!id_compact.is_empty()
             && (id_compact.contains(&q_compact) || q_compact.contains(&id_compact)))
     {
-        let shorter = q_compact.len().min(name_compact.len().max(id_compact.len()));
-        let longer = q_compact.len().max(name_compact.len()).max(id_compact.len());
+        let shorter = q_compact
+            .len()
+            .min(name_compact.len().max(id_compact.len()));
+        let longer = q_compact
+            .len()
+            .max(name_compact.len())
+            .max(id_compact.len());
         if longer > 0 && shorter * 100 / longer >= 60 {
             return 70;
         }
@@ -827,10 +829,7 @@ fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) ->
         return 0;
     }
     let cand = format!("{name} {id_norm}");
-    let hit = q_tokens
-        .iter()
-        .filter(|t| cand.contains(*t))
-        .count();
+    let hit = q_tokens.iter().filter(|t| cand.contains(*t)).count();
     if hit * 100 / q_tokens.len() >= 70 {
         return 55;
     }
@@ -1034,10 +1033,7 @@ pub fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn set_modio_api_key(
-    state: State<'_, AppState>,
-    key: String,
-) -> Result<(), String> {
+pub async fn set_modio_api_key(state: State<'_, AppState>, key: String) -> Result<(), String> {
     let key = key.trim().to_string();
     if key.is_empty() {
         return Err("mod.io API key cannot be empty".into());
@@ -1221,7 +1217,10 @@ fn catalog_from_modio(hit: modio_api::ModioModHit) -> CatalogHit {
 }
 
 fn interleave_catalog_many(sources: Vec<Vec<CatalogHit>>) -> Vec<CatalogHit> {
-    let mut iters: Vec<_> = sources.into_iter().map(|v| v.into_iter().peekable()).collect();
+    let mut iters: Vec<_> = sources
+        .into_iter()
+        .map(|v| v.into_iter().peekable())
+        .collect();
     let mut out = Vec::new();
     loop {
         let mut progressed = false;
@@ -1271,9 +1270,7 @@ pub async fn search_catalog(
         )
     };
 
-    let filter = source_filter
-        .unwrap_or_else(|| "all".into())
-        .to_lowercase();
+    let filter = source_filter.unwrap_or_else(|| "all".into()).to_lowercase();
     let want_nexus = (filter == "all" || filter == "nexus") && nexus_domain.is_some();
     let want_ts = (filter == "all" || filter == "thunderstore") && ts_community.is_some();
     let want_modio = (filter == "all" || filter == "modio") && modio_game_id.is_some();
@@ -1395,8 +1392,7 @@ pub async fn search_catalog(
                             {
                                 Ok((hits, total)) => {
                                     modio_total = total;
-                                    modio_hits =
-                                        hits.into_iter().map(catalog_from_modio).collect();
+                                    modio_hits = hits.into_iter().map(catalog_from_modio).collect();
                                 }
                                 Err(e) => log::warn!("mod.io catalog search failed: {e}"),
                             }
@@ -1455,7 +1451,11 @@ fn filter_ts_packages(
     offset: usize,
     count: usize,
 ) -> (Vec<TsPackageDetail>, usize) {
-    let mut packages: Vec<_> = packages.iter().filter(|p| !p.is_deprecated).cloned().collect();
+    let mut packages: Vec<_> = packages
+        .iter()
+        .filter(|p| !p.is_deprecated)
+        .cloned()
+        .collect();
     if !include_nsfw {
         packages.retain(|p| !p.has_nsfw_content);
     }
@@ -1553,10 +1553,11 @@ pub async fn download_thunderstore_mod(
             .ok_or_else(|| format!("No versions for {}", pkg.full_name))?;
         let label = format!("{}-{}", pkg.full_name, ver.version_number);
         let dl_id = uuid::Uuid::new_v4().to_string();
-        let dest = state
-            .paths
-            .downloads_dir()
-            .join(format!("ts_{}_{}.zip", dl_id, sanitize_filename::sanitize(&pkg_name)));
+        let dest = state.paths.downloads_dir().join(format!(
+            "ts_{}_{}.zip",
+            dl_id,
+            sanitize_filename::sanitize(&pkg_name)
+        ));
 
         {
             let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
@@ -1733,9 +1734,9 @@ pub async fn download_modio_mod(
             .get_mod(modio_game_id, mid)
             .await
             .map_err(|e| e.to_string())?;
-        let resolved_file = fid.or(detail.primary_file_id).ok_or_else(|| {
-            format!("No downloadable file for mod.io mod {mid}")
-        })?;
+        let resolved_file = fid
+            .or(detail.primary_file_id)
+            .ok_or_else(|| format!("No downloadable file for mod.io mod {mid}"))?;
         let dl_id = uuid::Uuid::new_v4().to_string();
         let dest = state.paths.downloads_dir().join(format!(
             "modio_{}_{}_{}.zip",
@@ -1794,10 +1795,7 @@ pub async fn download_modio_mod(
 }
 
 #[tauri::command]
-pub async fn get_game(
-    state: State<'_, AppState>,
-    domain: String,
-) -> Result<GameInfo, String> {
+pub async fn get_game(state: State<'_, AppState>, domain: String) -> Result<GameInfo, String> {
     state.get_game_cached(&domain).await
 }
 
@@ -1950,7 +1948,12 @@ async fn download_and_stage_inner(
     if is_new {
         push_download(
             state,
-            DownloadItem::new(dl_id.clone(), label.to_string(), "downloading", batch_id.clone()),
+            DownloadItem::new(
+                dl_id.clone(),
+                label.to_string(),
+                "downloading",
+                batch_id.clone(),
+            ),
         );
     } else {
         update_download(state, &dl_id, "downloading", None);
@@ -2273,12 +2276,7 @@ pub async fn handle_nxm(
     let _ = crate::assist::close_assist_intentionally(&app, &state);
 
     let dl_id = uuid::Uuid::new_v4().to_string();
-    let item = DownloadItem::new(
-        dl_id.clone(),
-        name.clone(),
-        "downloading",
-        batch_id.clone(),
-    );
+    let item = DownloadItem::new(dl_id.clone(), name.clone(), "downloading", batch_id.clone());
     push_download(&state, item.clone());
     let _ = ensure_download_job(&state, &dl_id, batch_id.clone());
     log::info!(
@@ -2642,8 +2640,7 @@ async fn fetch_and_stage_cdn(
     if !cookie_header.is_empty() {
         headers.insert(
             reqwest::header::COOKIE,
-            reqwest::header::HeaderValue::from_str(cookie_header)
-                .map_err(|e| e.to_string())?,
+            reqwest::header::HeaderValue::from_str(cookie_header).map_err(|e| e.to_string())?,
         );
     }
 
@@ -2689,9 +2686,7 @@ async fn fetch_and_stage_cdn(
                 return Err("Cancelled".into());
             }
             let fail_msg = if msg.contains("link expired") {
-                format!(
-                    "{msg} Cancel and re-queue via Download Assist to get a fresh link."
-                )
+                format!("{msg} Cancel and re-queue via Download Assist to get a fresh link.")
             } else {
                 msg.clone()
             };
@@ -2925,13 +2920,9 @@ pub fn cancel_download(state: State<'_, AppState>, id: String) -> Result<(), Str
         .lock()
         .ok()
         .and_then(|q| {
-            q.iter()
-                .find(|d| d.id == id)
-                .map(|d| {
-                    d.status == "downloading"
-                        || d.status == "extracting"
-                        || d.status == "paused"
-                })
+            q.iter().find(|d| d.id == id).map(|d| {
+                d.status == "downloading" || d.status == "extracting" || d.status == "paused"
+            })
         })
         .unwrap_or(false);
     if !active
@@ -2996,7 +2987,11 @@ pub fn pause_download(state: State<'_, AppState>, id: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub fn resume_download(app: tauri::AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn resume_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let status = state
         .downloads
         .lock()
