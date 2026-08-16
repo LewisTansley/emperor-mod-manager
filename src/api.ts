@@ -4,6 +4,7 @@ import type {
   BrowseSearchOpts,
   CatalogSearchPage,
   CatalogSuggestion,
+  CatalogSuggestRequest,
   CollectionDetail,
   CollectionModFile,
   CollectionSearchPage,
@@ -18,9 +19,12 @@ import type {
   ModioModDetail,
   ModSearchPage,
   NexusUser,
+  OrphanScan,
+  RecoveryReport,
   Settings,
   StagedMod,
   ThemePreference,
+  InstallClickBehavior,
   TsPackageDetail,
   UeLayoutInfo,
 } from "./types";
@@ -37,6 +41,11 @@ export const api = {
   setAutoclickFreeDownload: (enabled: boolean) =>
     invoke<void>("set_autoclick_free_download", { enabled }),
   setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
+  setInstallClickBehavior: (behavior: InstallClickBehavior) =>
+    invoke<void>("set_install_click_behavior", { behavior }),
+  scanModOrphans: () => invoke<OrphanScan>("scan_mod_orphans"),
+  recoverLegacyModData: () =>
+    invoke<RecoveryReport>("recover_legacy_mod_data"),
   scanGames: () => invoke<DetectedGame[]>("scan_games"),
   listManaged: () => invoke<ManagedGame[]>("list_managed"),
   manageGame: (game: {
@@ -65,6 +74,10 @@ export const api = {
     }),
   suggestCatalogIds: (title: string) =>
     invoke<CatalogSuggestion>("suggest_catalog_ids", { title }),
+  suggestCatalogIdsBatch: (requests: CatalogSuggestRequest[]) =>
+    invoke<Record<string, CatalogSuggestion>>("suggest_catalog_ids_batch", {
+      requests,
+    }),
   unmanageGame: (id: string) => invoke<void>("unmanage_game", { id }),
   setActiveGame: (id: string) => invoke<void>("set_active_game", { id }),
   searchMods: (domain: string, query: string, opts: BrowseSearchOpts = {}) =>

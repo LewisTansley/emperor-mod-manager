@@ -30,9 +30,11 @@ import type {
   StagedMod,
   TagFilterState,
   ThemePreference,
+  InstallClickBehavior,
   TsPackageDetail,
   ModioModDetail,
   ModioFileInfo,
+  OrphanScan,
 } from "./types";
 import "./App.css";
 
@@ -47,6 +49,35 @@ type StatusNotice = {
   kind: "ok" | "warn";
   message: string;
 };
+
+function catalogHasHit(s: CatalogSuggestion | null | undefined): boolean {
+  return Boolean(
+    s?.nexus_domain ||
+      s?.thunderstore_community ||
+      (s?.modio_game_id != null && s.modio_game_id > 0),
+  );
+}
+
+function catalogHintTags(s: CatalogSuggestion | null | undefined): string[] {
+  if (!s) {
+    return [];
+  }
+  const tags: string[] = [];
+  if (s.nexus_name || s.nexus_domain) {
+    tags.push(`Nexus: ${s.nexus_name ?? s.nexus_domain}`);
+  }
+  if (s.thunderstore_name || s.thunderstore_community) {
+    tags.push(`TS: ${s.thunderstore_name ?? s.thunderstore_community}`);
+  }
+  if (s.modio_name || (s.modio_game_id != null && s.modio_game_id > 0)) {
+    tags.push(`mod.io: ${s.modio_name ?? String(s.modio_game_id)}`);
+  }
+  return tags;
+}
+
+function catalogHintLine(s: CatalogSuggestion | null | undefined): string {
+  return catalogHintTags(s).join(" · ");
+}
 
 type BrowseDetail =
   | { kind: "mod"; hit: CatalogHit; tab: DetailTab }
@@ -168,6 +199,101 @@ const COLLECTION_SORTS = [
   { value: "relevance", label: "Best match" },
   { value: "rating", label: "Highest rated" },
 ] as const;
+
+type ModsStatusFilter = "all" | "enabled" | "disabled";
+type ModsSort = "loadOrder" | "nameAsc" | "nameDesc";
+
+const STAGED_MOD_SORTS = [
+  { value: "loadOrder", label: "Load order" },
+  { value: "nameAsc", label: "Name A–Z" },
+  { value: "nameDesc", label: "Name Z–A" },
+] as const;
+
+function stagedModSource(m: StagedMod): "nexus" | "thunderstore" | "modio" {
+  return m.source ?? "nexus";
+}
+
+function stagedModSearchText(m: StagedMod): string {
+  return [
+    m.name,
+    m.version ?? "",
+    stagedModSource(m),
+    String(m.nexus_mod_id),
+    String(m.nexus_file_id),
+    m.ts_namespace ?? "",
+    m.ts_name ?? "",
+    m.modio_mod_id != null ? String(m.modio_mod_id) : "",
+    m.modio_file_id != null ? String(m.modio_file_id) : "",
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+function filterAndSortStagedMods(
+  list: StagedMod[],
+  opts: {
+    query: string;
+    status: ModsStatusFilter;
+    source: CatalogSourceFilter;
+    sort: ModsSort;
+  },
+): StagedMod[] {
+  const q = opts.query.trim().toLowerCase();
+  let filtered = list;
+  if (q) {
+    filtered = filtered.filter((m) => stagedModSearchText(m).includes(q));
+  }
+  if (opts.status === "enabled") {
+    filtered = filtered.filter((m) => m.enabled);
+  } else if (opts.status === "disabled") {
+    filtered = filtered.filter((m) => !m.enabled);
+  }
+  if (opts.source !== "all") {
+    filtered = filtered.filter((m) => stagedModSource(m) === opts.source);
+  }
+
+  const sortPartition = (partition: StagedMod[]) => {
+    const next = [...partition];
+    if (opts.sort === "nameAsc") {
+      next.sort(
+        (a, b) =>
+          a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) ||
+          a.order - b.order,
+      );
+    } else if (opts.sort === "nameDesc") {
+      next.sort(
+        (a, b) =>
+          b.name.localeCompare(a.name, undefined, { sensitivity: "base" }) ||
+          a.order - b.order,
+      );
+    } else {
+      next.sort((a, b) => a.order - b.order);
+    }
+    return next;
+  };
+
+  if (opts.status === "enabled" || opts.status === "disabled") {
+    return sortPartition(filtered);
+  }
+  return [
+    ...sortPartition(filtered.filter((m) => m.enabled)),
+    ...sortPartition(filtered.filter((m) => !m.enabled)),
+  ];
+}
+
+function sameEnabledNeighborIndex(
+  list: StagedMod[],
+  index: number,
+  dir: -1 | 1,
+): number {
+  const enabled = list[index]?.enabled;
+  if (enabled === undefined) return -1;
+  let j = index + dir;
+  while (j >= 0 && j < list.length && list[j].enabled !== enabled) {
+    j += dir;
+  }
+  return j >= 0 && j < list.length ? j : -1;
+}
 
 function resolveTheme(pref: ThemePreference): "light" | "dark" {
   if (pref === "light" || pref === "dark") return pref;
@@ -356,6 +482,13 @@ function App() {
   const [managed, setManaged] = useState<ManagedGame[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [mods, setMods] = useState<StagedMod[]>([]);
+  const [modsQuery, setModsQuery] = useState("");
+  const [modsStatusFilter, setModsStatusFilter] =
+    useState<ModsStatusFilter>("all");
+  const [modsSourceFilter, setModsSourceFilter] =
+    useState<CatalogSourceFilter>("all");
+  const [modsSort, setModsSort] = useState<ModsSort>("loadOrder");
+  const [orphanScan, setOrphanScan] = useState<OrphanScan | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [modHits, setModHits] = useState<CatalogHit[]>([]);
@@ -407,7 +540,12 @@ function App() {
   const [catalogHints, setCatalogHints] = useState<CatalogSuggestion | null>(
     null,
   );
+  const [catalogSuggestions, setCatalogSuggestions] = useState<
+    Record<string, CatalogSuggestion>
+  >({});
+  const [catalogLookupBusy, setCatalogLookupBusy] = useState(false);
   const catalogSuggestGen = useRef(0);
+  const catalogEnrichGen = useRef(0);
   const [ueProjectEdit, setUeProjectEdit] = useState("");
   const [ueDomainEdit, setUeDomainEdit] = useState("");
   const [tsCommunityEdit, setTsCommunityEdit] = useState("");
@@ -454,6 +592,64 @@ function App() {
     return detected.filter((g) => !managedIds.has(g.id));
   }, [detected, managed]);
 
+  const visibleMods = useMemo(
+    () =>
+      filterAndSortStagedMods(mods, {
+        query: modsQuery,
+        status: modsStatusFilter,
+        source: modsSourceFilter,
+        sort: modsSort,
+      }),
+    [mods, modsQuery, modsStatusFilter, modsSourceFilter, modsSort],
+  );
+
+  const modsFiltersActive =
+    Boolean(modsQuery.trim()) ||
+    modsStatusFilter !== "all" ||
+    modsSourceFilter !== "all" ||
+    modsSort !== "loadOrder";
+
+  const canReorderMods =
+    modsSort === "loadOrder" &&
+    !modsQuery.trim() &&
+    modsStatusFilter === "all" &&
+    modsSourceFilter === "all";
+
+  const modIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    mods.forEach((m, i) => map.set(m.id, i));
+    return map;
+  }, [mods]);
+
+  useEffect(() => {
+    if (unmanaged.length === 0) {
+      setCatalogSuggestions({});
+      setCatalogLookupBusy(false);
+      return;
+    }
+    const requests = unmanaged.map((g) => ({ id: g.id, title: g.title }));
+    const gen = ++catalogEnrichGen.current;
+    setCatalogLookupBusy(true);
+    void (async () => {
+      try {
+        const map = await api.suggestCatalogIdsBatch(requests);
+        if (catalogEnrichGen.current !== gen) {
+          return;
+        }
+        setCatalogSuggestions(map);
+      } catch {
+        if (catalogEnrichGen.current !== gen) {
+          return;
+        }
+        setCatalogSuggestions({});
+      } finally {
+        if (catalogEnrichGen.current === gen) {
+          setCatalogLookupBusy(false);
+        }
+      }
+    })();
+  }, [unmanaged]);
+
   const themePref: ThemePreference = settings?.theme ?? "system";
 
   const refreshSettings = useCallback(async () => {
@@ -473,6 +669,12 @@ function App() {
   const refreshMods = useCallback(async (gameId: string) => {
     const list = await api.listMods(gameId);
     setMods(list);
+  }, []);
+
+  const refreshOrphanScan = useCallback(async () => {
+    const scan = await api.scanModOrphans();
+    setOrphanScan(scan);
+    return scan;
   }, []);
 
   const refreshDownloads = useCallback(async () => {
@@ -497,6 +699,7 @@ function App() {
       try {
         const s = await refreshSettings();
         await refreshManaged();
+        await refreshOrphanScan();
         await scan();
         if (s.has_api_key) {
           try {
@@ -511,7 +714,7 @@ function App() {
         setError(String(e));
       }
     })();
-  }, [refreshManaged, refreshSettings, scan]);
+  }, [refreshManaged, refreshOrphanScan, refreshSettings, scan]);
 
   useEffect(() => {
     if (themePref !== "system") {
@@ -535,6 +738,13 @@ function App() {
       setCollectionDetail(null);
     }
   }, [activeGame, refreshMods]);
+
+  useEffect(() => {
+    setModsQuery("");
+    setModsStatusFilter("all");
+    setModsSourceFilter("all");
+    setModsSort("loadOrder");
+  }, [libraryDetail?.game.id]);
 
   useEffect(() => {
     setLibraryDetail((prev) => {
@@ -1292,6 +1502,34 @@ function App() {
     });
   }
 
+  function applySuggestionToUnrealForm(s: CatalogSuggestion) {
+    if (s.nexus_domain) {
+      setUnrealDomain(s.nexus_domain);
+    }
+    if (s.thunderstore_community) {
+      setUnrealCommunity(s.thunderstore_community);
+    }
+    if (s.modio_game_id != null) {
+      setUnrealModioId(String(s.modio_game_id));
+    }
+    setCatalogHints(s);
+  }
+
+  function applySuggestionToBepinexForm(s: CatalogSuggestion, game: DetectedGame) {
+    if (s.nexus_domain) {
+      setBepinexDomain(s.nexus_domain);
+    } else if (!game.nexus_domain) {
+      setBepinexDomain("");
+    }
+    if (s.thunderstore_community) {
+      setBepinexCommunity(s.thunderstore_community);
+    }
+    if (s.modio_game_id != null) {
+      setBepinexModioId(String(s.modio_game_id));
+    }
+    setCatalogHints(s);
+  }
+
   function beginUnrealManage(game: DetectedGame) {
     if (!game.install_path) {
       setError("Install path is required to manage this Unreal game.");
@@ -1305,6 +1543,10 @@ function App() {
     setUnrealModioId("");
     setUnrealProject("");
     setCatalogHints(null);
+    const cached = catalogSuggestions[game.id];
+    if (cached) {
+      applySuggestionToUnrealForm(cached);
+    }
     void api.detectUeLayout(game.install_path).then((layout) => {
       if (layout?.project_name) {
         setUnrealProject(layout.project_name);
@@ -1317,16 +1559,7 @@ function App() {
         if (catalogSuggestGen.current !== gen) {
           return;
         }
-        if (s.nexus_domain) {
-          setUnrealDomain(s.nexus_domain);
-        }
-        if (s.thunderstore_community) {
-          setUnrealCommunity(s.thunderstore_community);
-        }
-        if (s.modio_game_id != null) {
-          setUnrealModioId(String(s.modio_game_id));
-        }
-        setCatalogHints(s);
+        applySuggestionToUnrealForm(s);
       } catch {
         // Leave fields empty for manual entry.
       }
@@ -1345,6 +1578,10 @@ function App() {
     setBepinexCommunity("");
     setBepinexModioId("");
     setCatalogHints(null);
+    const cached = catalogSuggestions[game.id];
+    if (cached) {
+      applySuggestionToBepinexForm(cached, game);
+    }
     const gen = ++catalogSuggestGen.current;
     void withBusy("Looking up catalogs…", async () => {
       try {
@@ -1352,20 +1589,81 @@ function App() {
         if (catalogSuggestGen.current !== gen) {
           return;
         }
-        if (s.nexus_domain) {
-          setBepinexDomain(s.nexus_domain);
-        } else if (!game.nexus_domain) {
-          setBepinexDomain("");
-        }
-        if (s.thunderstore_community) {
-          setBepinexCommunity(s.thunderstore_community);
-        }
-        if (s.modio_game_id != null) {
-          setBepinexModioId(String(s.modio_game_id));
-        }
-        setCatalogHints(s);
+        applySuggestionToBepinexForm(s, game);
       } catch {
         // Leave fields empty for manual entry.
+      }
+    });
+  }
+
+  async function manageUnrealQuick(game: DetectedGame) {
+    const suggestion = catalogSuggestions[game.id];
+    if (!suggestion || !catalogHasHit(suggestion)) {
+      beginUnrealManage(game);
+      return;
+    }
+    if (!game.install_path) {
+      setError("Install path is required to manage this Unreal game.");
+      return;
+    }
+    await withBusy(`Managing ${game.title}…`, async () => {
+      let projectName: string | null = null;
+      try {
+        const layout = await api.detectUeLayout(game.install_path!);
+        projectName = layout?.project_name ?? null;
+      } catch {
+        /* project name optional when layout detectable later */
+      }
+      await api.manageGame({
+        id: game.id,
+        title: game.title,
+        nexusDomain: suggestion.nexus_domain ?? "",
+        installPath: game.install_path!,
+        launcher: game.launcher,
+        pluginId: "unreal",
+        coverPath: game.cover_path,
+        projectName,
+        thunderstoreCommunity: suggestion.thunderstore_community ?? null,
+        modioGameId: suggestion.modio_game_id ?? null,
+      });
+      const list = await refreshManaged();
+      const managedGame = list.find((g) => g.id === game.id);
+      if (managedGame) {
+        await openGame(managedGame, "mods");
+      } else {
+        setActiveId(game.id);
+      }
+    });
+  }
+
+  async function manageBepinexQuick(game: DetectedGame) {
+    const suggestion = catalogSuggestions[game.id];
+    if (!suggestion || !catalogHasHit(suggestion)) {
+      beginBepinexManage(game);
+      return;
+    }
+    if (!game.install_path) {
+      setError("Install path is required to manage this Unity game.");
+      return;
+    }
+    await withBusy(`Managing ${game.title}…`, async () => {
+      await api.manageGame({
+        id: game.id,
+        title: game.title,
+        nexusDomain: suggestion.nexus_domain ?? "",
+        installPath: game.install_path!,
+        launcher: game.launcher,
+        pluginId: "bepinex",
+        coverPath: game.cover_path,
+        thunderstoreCommunity: suggestion.thunderstore_community ?? null,
+        modioGameId: suggestion.modio_game_id ?? null,
+      });
+      const list = await refreshManaged();
+      const managedGame = list.find((g) => g.id === game.id);
+      if (managedGame) {
+        await openGame(managedGame, "mods");
+      } else {
+        setActiveId(game.id);
       }
     });
   }
@@ -1943,7 +2241,7 @@ function App() {
     if (hit.source !== "thunderstore" || !hit.community || !hit.namespace || !hit.package_name) {
       return;
     }
-    setTab("downloads");
+    goToDownloadsOnInstall();
     setBusy(`Installing ${hit.name}…`);
     setError(null);
     try {
@@ -1980,7 +2278,7 @@ function App() {
     if (hit.source !== "modio" || hit.modio_game_id == null || hit.modio_mod_id == null) {
       return;
     }
-    setTab("downloads");
+    goToDownloadsOnInstall();
     setBusy(`Installing ${hit.name}…`);
     setError(null);
     try {
@@ -2011,8 +2309,8 @@ function App() {
     if (selectedMod.source !== "nexus" || selectedMod.mod_id == null) return;
     const domain = selectedMod.domain_name || activeGame.nexus_domain;
     const name = selectedMod.name;
-    setTab("downloads");
     if (isPremium) {
+      goToDownloadsOnInstall();
       setBusy(`Downloading ${file.name}…`);
       setError(null);
       try {
@@ -2059,8 +2357,8 @@ function App() {
 
   async function installCollection(c: CollectionHit) {
     if (!activeGame) return;
-    setTab("downloads");
     if (isPremium) {
+      goToDownloadsOnInstall();
       setBusy(`Installing collection ${c.name}…`);
       setError(null);
       try {
@@ -2129,12 +2427,14 @@ function App() {
     await refreshMods(activeGame.id);
   }
 
-  async function moveMod(index: number, dir: -1 | 1) {
-    if (!activeGame) return;
+  async function moveMod(modId: string, dir: -1 | 1) {
+    if (!activeGame || !canReorderMods) return;
     const next = [...mods];
-    const j = index + dir;
-    if (j < 0 || j >= next.length) return;
-    [next[index], next[j]] = [next[j], next[index]];
+    const i = next.findIndex((m) => m.id === modId);
+    if (i < 0) return;
+    const j = sameEnabledNeighborIndex(next, i, dir);
+    if (j < 0) return;
+    [next[i], next[j]] = [next[j], next[i]];
     await api.setLoadOrder(
       activeGame.id,
       next.map((m) => m.id),
@@ -2181,6 +2481,38 @@ function App() {
     withBusy("Saving theme…", async () => {
       await api.setTheme(theme);
       await refreshSettings();
+    });
+  }
+
+  function setInstallClickBehavior(behavior: InstallClickBehavior) {
+    withBusy("Saving…", async () => {
+      await api.setInstallClickBehavior(behavior);
+      await refreshSettings();
+    });
+  }
+
+  function goToDownloadsOnInstall() {
+    if (settings?.install_click_behavior !== "stay") {
+      setTab("downloads");
+    }
+  }
+
+  async function recoverLegacyMods() {
+    await withBusy("Recovering legacy staged mods…", async () => {
+      const result = await api.recoverLegacyModData();
+      await refreshManaged();
+      await refreshOrphanScan();
+      if (activeGameRef.current) {
+        await refreshMods(activeGameRef.current.id);
+      }
+      const copied = result.games_copied.length;
+      setNotice({
+        kind: result.warnings.length ? "warn" : "ok",
+        message:
+          copied > 0 || result.mods_rewritten > 0
+            ? `Recovered ${copied} game data folder${copied === 1 ? "" : "s"} and updated ${result.mods_rewritten} staged mod path${result.mods_rewritten === 1 ? "" : "s"}. Deploy each recovered game before removing nexus-manager data.`
+            : "No recoverable legacy staging data was found.",
+      });
     });
   }
 
@@ -2592,54 +2924,164 @@ function App() {
                   </div>
                 ) : (
                   <div className="detail-body">
+                    <div className="mods-toolbar">
+                      <div className="row">
+                        <input
+                          placeholder="Search staged mods…"
+                          value={modsQuery}
+                          onChange={(e) => setModsQuery(e.target.value)}
+                          aria-label="Search staged mods"
+                        />
+                      </div>
+                      <div className="filters">
+                        <label>
+                          Status
+                          <select
+                            value={modsStatusFilter}
+                            onChange={(e) =>
+                              setModsStatusFilter(e.target.value as ModsStatusFilter)
+                            }
+                          >
+                            <option value="all">All</option>
+                            <option value="enabled">Enabled</option>
+                            <option value="disabled">Disabled</option>
+                          </select>
+                        </label>
+                        <label>
+                          Sort
+                          <select
+                            value={modsSort}
+                            onChange={(e) => setModsSort(e.target.value as ModsSort)}
+                          >
+                            {STAGED_MOD_SORTS.map((o) => (
+                              <option key={o.value} value={o.value}>
+                                {o.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="segment source-filter">
+                          {(
+                            [
+                              ["all", "All"] as const,
+                              ["nexus", "Nexus"] as const,
+                              ["thunderstore", "Thunderstore"] as const,
+                              ["modio", "mod.io"] as const,
+                            ] as const
+                          ).map(([id, label]) => (
+                            <button
+                              key={id}
+                              type="button"
+                              className={modsSourceFilter === id ? "active" : ""}
+                              onClick={() => setModsSourceFilter(id)}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                        {modsFiltersActive && (
+                          <button
+                            type="button"
+                            className="filters-clear"
+                            onClick={() => {
+                              setModsQuery("");
+                              setModsStatusFilter("all");
+                              setModsSourceFilter("all");
+                              setModsSort("loadOrder");
+                            }}
+                          >
+                            Clear filters
+                          </button>
+                        )}
+                      </div>
+                      {!canReorderMods && mods.length > 0 && (
+                        <p className="note mods-reorder-hint">
+                          Clear filters and use Load order to reorder with ↑↓.
+                        </p>
+                      )}
+                      {modsFiltersActive && mods.length > 0 && (
+                        <p className="note">
+                          Showing {visibleMods.length} of {mods.length}
+                        </p>
+                      )}
+                    </div>
                     <ul className="list mods">
-                      {mods.map((m, i) => (
-                        <li key={m.id}>
-                          <label className="check">
-                            <input
-                              type="checkbox"
-                              checked={m.enabled}
-                              onChange={() => toggleMod(m)}
-                            />
-                            <div>
-                              <strong>{m.name}</strong>
-                              <small>
-                                {m.source === "thunderstore"
-                                  ? `Thunderstore · ${m.ts_namespace ?? "?"}-${m.ts_name ?? "?"}`
-                                  : m.source === "modio"
-                                    ? `mod.io · game ${m.modio_game_id ?? "?"} · mod ${m.modio_mod_id ?? "?"} · file ${m.modio_file_id ?? "?"}`
-                                    : `#${m.nexus_mod_id} · file ${m.nexus_file_id}`}
-                                {m.version ? ` · v${m.version}` : ""}
-                              </small>
+                      {visibleMods.map((m) => {
+                        const idx = modIndexById.get(m.id) ?? -1;
+                        const canMoveUp =
+                          canReorderMods &&
+                          idx >= 0 &&
+                          sameEnabledNeighborIndex(mods, idx, -1) >= 0;
+                        const canMoveDown =
+                          canReorderMods &&
+                          idx >= 0 &&
+                          sameEnabledNeighborIndex(mods, idx, 1) >= 0;
+                        return (
+                          <li key={m.id} className={m.enabled ? undefined : "mod-disabled"}>
+                            <label className="check">
+                              <input
+                                type="checkbox"
+                                checked={m.enabled}
+                                onChange={() => toggleMod(m)}
+                              />
+                              <div>
+                                <strong>{m.name}</strong>
+                                <small>
+                                  {m.source === "thunderstore"
+                                    ? `Thunderstore · ${m.ts_namespace ?? "?"}-${m.ts_name ?? "?"}`
+                                    : m.source === "modio"
+                                      ? `mod.io · game ${m.modio_game_id ?? "?"} · mod ${m.modio_mod_id ?? "?"} · file ${m.modio_file_id ?? "?"}`
+                                      : `#${m.nexus_mod_id} · file ${m.nexus_file_id}`}
+                                  {m.version ? ` · v${m.version}` : ""}
+                                </small>
+                              </div>
+                            </label>
+                            <div className="actions">
+                              <button
+                                type="button"
+                                onClick={() => moveMod(m.id, -1)}
+                                disabled={!canMoveUp}
+                                title={
+                                  canReorderMods
+                                    ? "Move up in load order"
+                                    : "Clear filters and use Load order to reorder"
+                                }
+                              >
+                                ↑
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => moveMod(m.id, 1)}
+                                disabled={!canMoveDown}
+                                title={
+                                  canReorderMods
+                                    ? "Move down in load order"
+                                    : "Clear filters and use Load order to reorder"
+                                }
+                              >
+                                ↓
+                              </button>
+                              <button
+                                className="danger"
+                                onClick={() =>
+                                  withBusy("Removing mod…", async () => {
+                                    if (!activeGame) return;
+                                    await api.removeMod(activeGame.id, m.id);
+                                    await refreshMods(activeGame.id);
+                                  })
+                                }
+                              >
+                                Remove
+                              </button>
                             </div>
-                          </label>
-                          <div className="actions">
-                            <button onClick={() => moveMod(i, -1)} disabled={i === 0}>
-                              ↑
-                            </button>
-                            <button
-                              onClick={() => moveMod(i, 1)}
-                              disabled={i === mods.length - 1}
-                            >
-                              ↓
-                            </button>
-                            <button
-                              className="danger"
-                              onClick={() =>
-                                withBusy("Removing mod…", async () => {
-                                  if (!activeGame) return;
-                                  await api.removeMod(activeGame.id, m.id);
-                                  await refreshMods(activeGame.id);
-                                })
-                              }
-                            >
-                              Remove
-                            </button>
-                          </div>
-                        </li>
-                      ))}
+                          </li>
+                        );
+                      })}
                       {mods.length === 0 && (
                         <li className="empty">No staged mods. Browse mods to install some.</li>
+                      )}
+                      {mods.length > 0 && visibleMods.length === 0 && (
+                        <li className="empty">No mods match your search/filters.</li>
                       )}
                     </ul>
                   </div>
@@ -2859,43 +3301,89 @@ function App() {
                   </>
                 )}
                 <h2>Unmanaged</h2>
+                {catalogLookupBusy && unmanaged.length > 0 && (
+                  <p className="note">Looking up Nexus / Thunderstore / mod.io…</p>
+                )}
                 {libraryView === "grid" ? (
                   <div className="media-grid">
-                    {unmanaged.map((g) =>
-                      g.supported ? (
+                    {unmanaged.map((g) => {
+                      const suggestion = catalogSuggestions[g.id];
+                      const hints = catalogHintTags(suggestion);
+                      if (g.supported) {
+                        return (
+                          <MediaCard
+                            key={g.id}
+                            title={g.title}
+                            imageSrc={mediaSrc(g.cover_path)}
+                            tags={hints}
+                            hoverLabel="Manage"
+                            onClick={() => manage(g)}
+                          />
+                        );
+                      }
+                      if (g.engine_hint === "unreal" && g.install_path) {
+                        const quick = catalogHasHit(suggestion);
+                        return (
+                          <MediaCard
+                            key={g.id}
+                            title={g.title}
+                            imageSrc={mediaSrc(g.cover_path)}
+                            tags={hints}
+                            hoverLabel={quick ? "Manage" : "Add as Unreal"}
+                            onClick={() =>
+                              quick ? manageUnrealQuick(g) : beginUnrealManage(g)
+                            }
+                            actions={
+                              quick ? (
+                                <button
+                                  type="button"
+                                  onClick={() => beginUnrealManage(g)}
+                                >
+                                  Edit catalogs
+                                </button>
+                              ) : undefined
+                            }
+                          />
+                        );
+                      }
+                      if (g.engine_hint === "bepinex" && g.install_path) {
+                        const quick = catalogHasHit(suggestion);
+                        return (
+                          <MediaCard
+                            key={g.id}
+                            title={g.title}
+                            imageSrc={mediaSrc(g.cover_path)}
+                            tags={hints}
+                            hoverLabel={quick ? "Manage" : "Add as BepInEx"}
+                            onClick={() =>
+                              quick
+                                ? manageBepinexQuick(g)
+                                : beginBepinexManage(g)
+                            }
+                            actions={
+                              quick ? (
+                                <button
+                                  type="button"
+                                  onClick={() => beginBepinexManage(g)}
+                                >
+                                  Edit catalogs
+                                </button>
+                              ) : undefined
+                            }
+                          />
+                        );
+                      }
+                      return (
                         <MediaCard
                           key={g.id}
                           title={g.title}
                           imageSrc={mediaSrc(g.cover_path)}
-                          hoverLabel="Manage"
-                          onClick={() => manage(g)}
-                        />
-                      ) : g.engine_hint === "unreal" && g.install_path ? (
-                        <MediaCard
-                          key={g.id}
-                          title={g.title}
-                          imageSrc={mediaSrc(g.cover_path)}
-                          hoverLabel="Add as Unreal"
-                          onClick={() => beginUnrealManage(g)}
-                        />
-                      ) : g.engine_hint === "bepinex" && g.install_path ? (
-                        <MediaCard
-                          key={g.id}
-                          title={g.title}
-                          imageSrc={mediaSrc(g.cover_path)}
-                          hoverLabel="Add as BepInEx"
-                          onClick={() => beginBepinexManage(g)}
-                        />
-                      ) : (
-                        <MediaCard
-                          key={g.id}
-                          title={g.title}
-                          imageSrc={mediaSrc(g.cover_path)}
+                          tags={hints}
                           coverLabel="Unsupported"
                           unsupported
                         />
-                      ),
-                    )}
+                      );
+                    })}
                     {unmanaged.length === 0 && (
                       <p className="note">
                         No unmanaged games found. Scan again if you installed something
@@ -2905,39 +3393,86 @@ function App() {
                   </div>
                 ) : (
                   <ul className="list">
-                    {unmanaged.map((g) => (
-                      <li key={g.id}>
-                        <div>
-                          <strong>{g.title}</strong>
-                          <small>
-                            {g.launcher}
-                            {g.install_path ? ` · ${g.install_path}` : ""}
-                            {!g.supported &&
-                            g.engine_hint !== "unreal" &&
-                            g.engine_hint !== "bepinex"
-                              ? " · unsupported"
-                              : ""}
-                            {g.engine_hint === "unreal" && !g.supported
-                              ? " · Unreal Engine"
-                              : ""}
-                            {g.engine_hint === "bepinex" && !g.supported
-                              ? " · Unity / BepInEx"
-                              : ""}
-                          </small>
-                        </div>
-                        {g.supported ? (
-                          <button onClick={() => manage(g)}>Manage</button>
-                        ) : g.engine_hint === "unreal" && g.install_path ? (
-                          <button onClick={() => beginUnrealManage(g)}>
-                            Add as Unreal
-                          </button>
-                        ) : g.engine_hint === "bepinex" && g.install_path ? (
-                          <button onClick={() => beginBepinexManage(g)}>
-                            Add as BepInEx
-                          </button>
-                        ) : null}
-                      </li>
-                    ))}
+                    {unmanaged.map((g) => {
+                      const suggestion = catalogSuggestions[g.id];
+                      const hintLine = catalogHintLine(suggestion);
+                      return (
+                        <li key={g.id}>
+                          <div>
+                            <strong>{g.title}</strong>
+                            <small>
+                              {g.launcher}
+                              {g.install_path ? ` · ${g.install_path}` : ""}
+                              {!g.supported &&
+                              g.engine_hint !== "unreal" &&
+                              g.engine_hint !== "bepinex"
+                                ? " · unsupported"
+                                : ""}
+                              {g.engine_hint === "unreal" && !g.supported
+                                ? " · Unreal Engine"
+                                : ""}
+                              {g.engine_hint === "bepinex" && !g.supported
+                                ? " · Unity / BepInEx"
+                                : ""}
+                              {hintLine ? ` · ${hintLine}` : ""}
+                            </small>
+                          </div>
+                          <div className="actions">
+                            {g.supported ? (
+                              <button type="button" onClick={() => manage(g)}>
+                                Manage
+                              </button>
+                            ) : g.engine_hint === "unreal" && g.install_path ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    catalogHasHit(suggestion)
+                                      ? manageUnrealQuick(g)
+                                      : beginUnrealManage(g)
+                                  }
+                                >
+                                  {catalogHasHit(suggestion)
+                                    ? "Manage"
+                                    : "Add as Unreal"}
+                                </button>
+                                {catalogHasHit(suggestion) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => beginUnrealManage(g)}
+                                  >
+                                    Edit catalogs
+                                  </button>
+                                )}
+                              </>
+                            ) : g.engine_hint === "bepinex" && g.install_path ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    catalogHasHit(suggestion)
+                                      ? manageBepinexQuick(g)
+                                      : beginBepinexManage(g)
+                                  }
+                                >
+                                  {catalogHasHit(suggestion)
+                                    ? "Manage"
+                                    : "Add as BepInEx"}
+                                </button>
+                                {catalogHasHit(suggestion) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => beginBepinexManage(g)}
+                                  >
+                                    Edit catalogs
+                                  </button>
+                                )}
+                              </>
+                            ) : null}
+                          </div>
+                        </li>
+                      );
+                    })}
                     {unmanaged.length === 0 && (
                       <li className="empty">
                         No unmanaged games found. Scan again if you installed something
@@ -3994,6 +4529,29 @@ function App() {
                 ))}
               </div>
             </div>
+            <div className="setting-block">
+              <span>After Install</span>
+              <div className="segment">
+                {(
+                  [
+                    ["stay", "Stay here"],
+                    ["downloads", "Go to Downloads"],
+                  ] as const
+                ).map(([value, label]) => (
+                  <button
+                    key={value}
+                    className={
+                      (settings?.install_click_behavior ?? "downloads") === value
+                        ? "active"
+                        : ""
+                    }
+                    onClick={() => setInstallClickBehavior(value)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <label className="inline">
               <input
                 type="checkbox"
@@ -4031,6 +4589,36 @@ function App() {
             >
               Clear Nexus website session
             </button>
+            <div className="setting-block">
+              <span>Mod recovery</span>
+              <p className="note">
+                Scan staging data left behind by older versions or recover data from
+                nexus-manager. Recovery copies data first, so deployed symlinks remain
+                safe until you deploy again.
+              </p>
+              {orphanScan &&
+                (orphanScan.legacy_game_ids.length > 0 ||
+                  orphanScan.missing_staging.length > 0 ||
+                  orphanScan.untracked_staging.length > 0 ||
+                  orphanScan.deploy_without_loadorder.length > 0) && (
+                  <p className="note">
+                    Found {orphanScan.legacy_game_ids.length} legacy game data folder
+                    {orphanScan.legacy_game_ids.length === 1 ? "" : "s"}, {" "}
+                    {orphanScan.missing_staging.length} missing staging path
+                    {orphanScan.missing_staging.length === 1 ? "" : "s"}, and {" "}
+                    {orphanScan.untracked_staging.length} untracked staging folder
+                    {orphanScan.untracked_staging.length === 1 ? "" : "s"}.
+                  </p>
+                )}
+              <div className="actions">
+                <button type="button" onClick={() => void refreshOrphanScan()}>
+                  Scan staged mods
+                </button>
+                <button type="button" onClick={() => void recoverLegacyMods()}>
+                  Recover from nexus-manager
+                </button>
+              </div>
+            </div>
             {settings && (
               <dl className="meta">
                 <dt>Config</dt>

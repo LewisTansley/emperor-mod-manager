@@ -1,4 +1,5 @@
 export type ThemePreference = "light" | "dark" | "system";
+export type InstallClickBehavior = "stay" | "downloads";
 
 export type DetectedGame = {
   id: string;
@@ -39,6 +40,11 @@ export type CatalogSuggestion = {
   thunderstore_name: string | null;
   modio_game_id: number | null;
   modio_name: string | null;
+};
+
+export type CatalogSuggestRequest = {
+  id: string;
+  title: string;
 };
 
 export type CatalogSource = "nexus" | "thunderstore" | "modio";
@@ -305,6 +311,19 @@ export type DeployResult = {
   warnings: string[];
 };
 
+export type RecoveryReport = {
+  games_copied: string[];
+  mods_rewritten: number;
+  warnings: string[];
+};
+
+export type OrphanScan = {
+  legacy_game_ids: string[];
+  missing_staging: string[];
+  untracked_staging: string[];
+  deploy_without_loadorder: string[];
+};
+
 export type DownloadItem = {
   id: string;
   label: string;
@@ -321,6 +340,7 @@ export type Settings = {
   autoclick_free_download: boolean;
   last_active_game_id: string | null;
   theme?: ThemePreference;
+  install_click_behavior?: InstallClickBehavior;
   has_api_key: boolean;
   has_modio_api_key?: boolean;
   user: NexusUser | null;

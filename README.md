@@ -87,6 +87,14 @@ Paths use the OS conventions via the `directories` crate:
 
 Exact folder names follow `ProjectDirs` (`dev` / `emperormodmanager` / `emperor-mod-manager`).
 
+### Recovering data from Nexus Manager
+
+Emperor copies staged game data from the legacy `nexus-manager` app-data location at startup
+when its matching game folder is empty, then rewrites the saved staging paths. The legacy data
+is never deleted automatically because an existing game deployment may still symlink to it.
+Use **Settings → Mod recovery** to scan or rerun recovery, deploy each recovered game, and only
+then remove the old data directory manually.
+
 ## License
 
 AGPL-3.0-or-later (required by `lib_game_detector` on Linux).

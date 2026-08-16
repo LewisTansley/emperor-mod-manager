@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
     config::{self, AppConfig, ManagedGame, Paths, APP_NAME, APP_VERSION},
     detection::{self, DetectedGame},
     games,
+    migration,
     mods::{self, StagedMod},
     modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
     nexus::{
@@ -120,7 +121,18 @@ impl DownloadItem {
 impl AppState {
     pub fn new() -> anyhow::Result<Self> {
         let paths = Paths::resolve()?;
-        let config = config::load_config(&paths)?;
+        let mut config = config::load_config(&paths)?;
+        let recovery = migration::recover_legacy_data(&paths, &mut config)?;
+        if !recovery.games_copied.is_empty() || recovery.mods_rewritten > 0 {
+            log::info!(
+                "Recovered legacy nexus-manager data: {} game(s), {} staging path(s) rewritten",
+                recovery.games_copied.len(),
+                recovery.mods_rewritten
+            );
+        }
+        for warning in &recovery.warnings {
+            log::warn!("{warning}");
+        }
         let api_key = load_key_with_fallback(&paths)?;
         let modio_api_key = load_modio_key_with_fallback(&paths)?;
         Ok(Self {
@@ -592,7 +604,7 @@ pub fn detect_ue_layout(
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSuggestion {
     pub nexus_domain: Option<String>,
     pub nexus_name: Option<String>,
@@ -602,7 +614,153 @@ pub struct CatalogSuggestion {
     pub modio_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogSuggestRequest {
+    pub id: String,
+    pub title: String,
+}
+
 const CATALOG_MATCH_MIN_SCORE: u32 = 50;
+
+fn empty_catalog_suggestion() -> CatalogSuggestion {
+    CatalogSuggestion {
+        nexus_domain: None,
+        nexus_name: None,
+        thunderstore_community: None,
+        thunderstore_name: None,
+        modio_game_id: None,
+        modio_name: None,
+    }
+}
+
+fn match_catalog_lists(
+    title: &str,
+    nexus_games: &[nexus::NexusGameEntry],
+    ts_communities: &[thunderstore::TsCommunity],
+) -> CatalogSuggestion {
+    let mut suggestion = empty_catalog_suggestion();
+    let title = title.trim();
+    if title.is_empty() {
+        return suggestion;
+    }
+    if let Some(hit) = best_catalog_match(
+        title,
+        nexus_games,
+        |g| g.name.as_str(),
+        |g| g.domain_name.as_str(),
+    ) {
+        suggestion.nexus_domain = Some(hit.domain_name.clone());
+        suggestion.nexus_name = Some(hit.name.clone());
+    }
+    if let Some(hit) = best_catalog_match(
+        title,
+        ts_communities,
+        |c| c.name.as_str(),
+        |c| c.identifier.as_str(),
+    ) {
+        suggestion.thunderstore_community = Some(hit.identifier.clone());
+        suggestion.thunderstore_name = Some(hit.name.clone());
+    }
+    suggestion
+}
+
+async fn load_nexus_games_cached(
+    state: &AppState,
+) -> Result<Vec<nexus::NexusGameEntry>, String> {
+    let cached = state
+        .nexus_games_cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    if let Some(list) = cached {
+        return Ok(list);
+    }
+    let Ok(client) = state.client() else {
+        return Ok(Vec::new());
+    };
+    match client.list_games().await {
+        Ok(list) => {
+            if let Ok(mut lock) = state.nexus_games_cache.lock() {
+                *lock = Some(list.clone());
+            }
+            Ok(list)
+        }
+        Err(e) => {
+            log::warn!("suggest_catalog_ids: Nexus list_games failed: {e:#}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+async fn load_ts_communities_cached(
+    state: &AppState,
+) -> Result<Vec<thunderstore::TsCommunity>, String> {
+    let cached = state
+        .ts_communities_cache
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    if let Some(list) = cached {
+        return Ok(list);
+    }
+    match ThunderstoreClient::new() {
+        Ok(client) => match client.list_communities().await {
+            Ok(list) => {
+                if let Ok(mut lock) = state.ts_communities_cache.lock() {
+                    *lock = Some(list.clone());
+                }
+                Ok(list)
+            }
+            Err(e) => {
+                log::warn!("suggest_catalog_ids: Thunderstore communities failed: {e:#}");
+                Ok(Vec::new())
+            }
+        },
+        Err(e) => {
+            log::warn!("suggest_catalog_ids: Thunderstore client: {e:#}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+async fn enrich_modio_suggestion(
+    state: &AppState,
+    title: &str,
+    suggestion: &mut CatalogSuggestion,
+) {
+    let title = title.trim();
+    if title.is_empty() {
+        return;
+    }
+    let modio_key = match state.modio_api_key.lock() {
+        Ok(lock) => lock.clone(),
+        Err(_) => return,
+    };
+    let Some(key) = modio_key else {
+        return;
+    };
+    match ModioClient::new(&key) {
+        Ok(client) => match client.search_games(title, 25).await {
+            Ok(games) => {
+                if let Some(hit) = best_catalog_match(
+                    title,
+                    &games,
+                    |g| g.name.as_str(),
+                    |g| g.name_id.as_str(),
+                ) {
+                    suggestion.modio_game_id = Some(hit.id);
+                    suggestion.modio_name = Some(hit.name.clone());
+                }
+            }
+            Err(e) => {
+                log::warn!("suggest_catalog_ids: mod.io search_games failed: {e:#}");
+            }
+        },
+        Err(e) => {
+            log::warn!("suggest_catalog_ids: mod.io client: {e:#}");
+        }
+    }
+}
 
 fn normalize_catalog_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -704,127 +862,45 @@ pub async fn suggest_catalog_ids(
     title: String,
 ) -> Result<CatalogSuggestion, String> {
     let title = title.trim().to_string();
-    let mut suggestion = CatalogSuggestion {
-        nexus_domain: None,
-        nexus_name: None,
-        thunderstore_community: None,
-        thunderstore_name: None,
-        modio_game_id: None,
-        modio_name: None,
-    };
     if title.is_empty() {
-        return Ok(suggestion);
+        return Ok(empty_catalog_suggestion());
     }
+    let nexus_games = load_nexus_games_cached(&state).await?;
+    let ts_communities = load_ts_communities_cached(&state).await?;
+    let mut suggestion = match_catalog_lists(&title, &nexus_games, &ts_communities);
+    enrich_modio_suggestion(&state, &title, &mut suggestion).await;
+    Ok(suggestion)
+}
 
-    // Nexus games list (session-cached).
-    if let Ok(client) = state.client() {
-        let games = {
-            let cached = state
-                .nexus_games_cache
-                .lock()
-                .map_err(|e| e.to_string())?
-                .clone();
-            if let Some(list) = cached {
-                list
-            } else {
-                match client.list_games().await {
-                    Ok(list) => {
-                        if let Ok(mut lock) = state.nexus_games_cache.lock() {
-                            *lock = Some(list.clone());
-                        }
-                        list
-                    }
-                    Err(e) => {
-                        log::warn!("suggest_catalog_ids: Nexus list_games failed: {e:#}");
-                        Vec::new()
-                    }
-                }
-            }
-        };
-        if let Some(hit) = best_catalog_match(
-            &title,
-            &games,
-            |g| g.name.as_str(),
-            |g| g.domain_name.as_str(),
-        ) {
-            suggestion.nexus_domain = Some(hit.domain_name.clone());
-            suggestion.nexus_name = Some(hit.name.clone());
-        }
+#[tauri::command]
+pub async fn suggest_catalog_ids_batch(
+    state: State<'_, AppState>,
+    requests: Vec<CatalogSuggestRequest>,
+) -> Result<HashMap<String, CatalogSuggestion>, String> {
+    let mut out = HashMap::new();
+    if requests.is_empty() {
+        return Ok(out);
     }
-
-    // Thunderstore communities (session-cached).
-    {
-        let communities = {
-            let cached = state
-                .ts_communities_cache
-                .lock()
-                .map_err(|e| e.to_string())?
-                .clone();
-            if let Some(list) = cached {
-                list
-            } else {
-                match ThunderstoreClient::new() {
-                    Ok(client) => match client.list_communities().await {
-                        Ok(list) => {
-                            if let Ok(mut lock) = state.ts_communities_cache.lock() {
-                                *lock = Some(list.clone());
-                            }
-                            list
-                        }
-                        Err(e) => {
-                            log::warn!("suggest_catalog_ids: Thunderstore communities failed: {e:#}");
-                            Vec::new()
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!("suggest_catalog_ids: Thunderstore client: {e:#}");
-                        Vec::new()
-                    }
-                }
-            }
-        };
-        if let Some(hit) = best_catalog_match(
-            &title,
-            &communities,
-            |c| c.name.as_str(),
-            |c| c.identifier.as_str(),
-        ) {
-            suggestion.thunderstore_community = Some(hit.identifier.clone());
-            suggestion.thunderstore_name = Some(hit.name.clone());
-        }
-    }
-
-    // mod.io (only when API key is configured).
-    let modio_key = state
+    let nexus_games = load_nexus_games_cached(&state).await?;
+    let ts_communities = load_ts_communities_cached(&state).await?;
+    let has_modio = state
         .modio_api_key
         .lock()
         .map_err(|e| e.to_string())?
-        .clone();
-    if let Some(key) = modio_key {
-        match ModioClient::new(&key) {
-            Ok(client) => match client.search_games(&title, 25).await {
-                Ok(games) => {
-                    if let Some(hit) = best_catalog_match(
-                        &title,
-                        &games,
-                        |g| g.name.as_str(),
-                        |g| g.name_id.as_str(),
-                    ) {
-                        suggestion.modio_game_id = Some(hit.id);
-                        suggestion.modio_name = Some(hit.name.clone());
-                    }
-                }
-                Err(e) => {
-                    log::warn!("suggest_catalog_ids: mod.io search_games failed: {e:#}");
-                }
-            },
-            Err(e) => {
-                log::warn!("suggest_catalog_ids: mod.io client: {e:#}");
-            }
-        }
-    }
+        .is_some();
 
-    Ok(suggestion)
+    for req in requests {
+        let id = req.id.trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let mut suggestion = match_catalog_lists(&req.title, &nexus_games, &ts_communities);
+        if has_modio {
+            enrich_modio_suggestion(&state, &req.title, &mut suggestion).await;
+        }
+        out.insert(id, suggestion);
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -853,6 +929,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "autoclick_free_download": cfg.autoclick_free_download,
         "last_active_game_id": cfg.last_active_game_id,
         "theme": cfg.theme,
+        "install_click_behavior": cfg.install_click_behavior,
         "has_api_key": has_key,
         "has_modio_api_key": has_modio_api_key,
         "user": user,
@@ -860,6 +937,20 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "data_dir": state.paths.data_dir,
         "cache_dir": state.paths.cache_dir,
     }))
+}
+
+#[tauri::command]
+pub fn scan_mod_orphans(state: State<'_, AppState>) -> Result<migration::OrphanScan, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(migration::scan_orphans(&state.paths, &cfg))
+}
+
+#[tauri::command]
+pub fn recover_legacy_mod_data(
+    state: State<'_, AppState>,
+) -> Result<migration::RecoveryReport, String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    migration::recover_legacy_data(&state.paths, &mut cfg).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -883,6 +974,16 @@ pub fn set_autoclick_free_download(
 ) -> Result<(), String> {
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.autoclick_free_download = enabled;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_install_click_behavior(
+    state: State<'_, AppState>,
+    behavior: config::InstallClickBehavior,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.install_click_behavior = behavior;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 

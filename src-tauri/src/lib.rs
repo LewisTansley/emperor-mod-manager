@@ -11,6 +11,7 @@ mod games;
     target_os = "openbsd"
 ))]
 mod linux_embed;
+mod migration;
 mod mods;
 mod modio_api;
 mod nexus;
@@ -53,11 +54,13 @@ pub fn run() {
             commands::update_managed_game,
             commands::detect_ue_layout,
             commands::suggest_catalog_ids,
+            commands::suggest_catalog_ids_batch,
             commands::unmanage_game,
             commands::get_settings,
             commands::set_adult_content,
             commands::set_theme,
             commands::set_autoclick_free_download,
+            commands::set_install_click_behavior,
             commands::set_active_game,
             commands::set_api_key,
             commands::validate_user,
@@ -83,6 +86,8 @@ pub fn run() {
             commands::handle_nxm,
             commands::import_mod_archive,
             commands::import_assist_download,
+            commands::scan_mod_orphans,
+            commands::recover_legacy_mod_data,
             commands::list_mods,
             commands::set_mod_enabled,
             commands::set_load_order,

@@ -25,6 +25,19 @@ impl Default for ThemePreference {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallClickBehavior {
+    Stay,
+    Downloads,
+}
+
+impl Default for InstallClickBehavior {
+    fn default() -> Self {
+        Self::Downloads
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -34,6 +47,8 @@ pub struct AppConfig {
     /// When true, the free-download WebView auto-clicks Mod Manager / Slow Download once ready.
     pub autoclick_free_download: bool,
     pub theme: ThemePreference,
+    /// Whether Install switches to the Downloads tab or keeps the current tab.
+    pub install_click_behavior: InstallClickBehavior,
 }
 
 impl Default for AppConfig {
@@ -44,6 +59,7 @@ impl Default for AppConfig {
             last_active_game_id: None,
             autoclick_free_download: true,
             theme: ThemePreference::System,
+            install_click_behavior: InstallClickBehavior::Downloads,
         }
     }
 }

@@ -511,6 +511,35 @@ button.tag-picker-trigger[aria-expanded="true"] {
   margin-bottom: 0;
 }
 
+.mods-toolbar {
+  margin-bottom: 0.85rem;
+}
+
+.mods-toolbar .row {
+  margin-bottom: 0.55rem;
+}
+
+.mods-toolbar .filters {
+  margin-bottom: 0.35rem;
+}
+
+.mods-toolbar .source-filter {
+  margin-left: 0;
+  align-self: flex-end;
+}
+
+.mods-reorder-hint {
+  margin: 0.35rem 0 0;
+}
+
+.list.mods li.mod-disabled {
+  opacity: 0.72;
+}
+
+.list.mods li.mod-disabled strong {
+  color: var(--muted);
+}
+
 @media (max-width: 860px) {
   .tag-picker {
     flex: 1 1 11rem;

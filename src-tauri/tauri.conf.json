@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://*.nexusmods.com https://staticdelivery.nexusmods.com data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost https://*.nexusmods.com https://staticdelivery.nexusmods.com https://gcdn.thunderstore.io data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
       "assetProtocol": {
         "enable": true,
         "scope": {
