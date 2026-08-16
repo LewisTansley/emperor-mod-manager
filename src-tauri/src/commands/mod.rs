@@ -19,10 +19,12 @@ use crate::{
     detection::{self, DetectedGame},
     games,
     mods::{self, StagedMod},
+    modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
     nexus::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
         ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
     },
+    thunderstore::{self, ThunderstoreClient, TsPackageDetail},
 };
 
 pub enum DownloadResumeSource {
@@ -59,6 +61,7 @@ pub struct AppState {
     pub paths: Paths,
     pub config: Mutex<AppConfig>,
     pub api_key: Mutex<Option<String>>,
+    pub modio_api_key: Mutex<Option<String>>,
     pub user: Mutex<Option<NexusUser>>,
     pub downloads: Mutex<Vec<DownloadItem>>,
     pub download_jobs: Mutex<HashMap<String, DownloadJob>>,
@@ -79,6 +82,12 @@ pub struct AppState {
     pub assist_desired_visible: AtomicBool,
     /// Cached Nexus game metadata (categories, counts) keyed by domain.
     pub game_info_cache: Mutex<HashMap<String, GameInfo>>,
+    /// Cached Thunderstore community package lists.
+    pub ts_package_cache: Mutex<HashMap<String, (Instant, Vec<thunderstore::TsPackage>)>>,
+    /// Session cache of Nexus games list for catalog matching.
+    pub nexus_games_cache: Mutex<Option<Vec<nexus::NexusGameEntry>>>,
+    /// Session cache of Thunderstore communities for catalog matching.
+    pub ts_communities_cache: Mutex<Option<Vec<thunderstore::TsCommunity>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,10 +122,12 @@ impl AppState {
         let paths = Paths::resolve()?;
         let config = config::load_config(&paths)?;
         let api_key = load_key_with_fallback(&paths)?;
+        let modio_api_key = load_modio_key_with_fallback(&paths)?;
         Ok(Self {
             paths,
             config: Mutex::new(config),
             api_key: Mutex::new(api_key),
+            modio_api_key: Mutex::new(modio_api_key),
             user: Mutex::new(None),
             downloads: Mutex::new(Vec::new()),
             download_jobs: Mutex::new(HashMap::new()),
@@ -129,6 +140,9 @@ impl AppState {
             assist_bounds: Mutex::new(AssistBounds::default()),
             assist_desired_visible: AtomicBool::new(false),
             game_info_cache: Mutex::new(HashMap::new()),
+            ts_package_cache: Mutex::new(HashMap::new()),
+            nexus_games_cache: Mutex::new(None),
+            ts_communities_cache: Mutex::new(None),
         })
     }
 
@@ -196,6 +210,14 @@ fn load_key_with_fallback(paths: &Paths) -> anyhow::Result<Option<String>> {
     }
     let file = paths.config_dir.join("nexus_api_key");
     nexus::load_api_key_file(&file)
+}
+
+fn load_modio_key_with_fallback(paths: &Paths) -> anyhow::Result<Option<String>> {
+    if let Ok(Some(k)) = modio_api::load_api_key() {
+        return Ok(Some(k));
+    }
+    let file = paths.config_dir.join("modio_api_key");
+    modio_api::load_api_key_file(&file)
 }
 
 fn push_download(state: &AppState, item: DownloadItem) {
@@ -436,6 +458,9 @@ pub fn manage_game(
     launcher: String,
     plugin_id: String,
     cover_path: Option<String>,
+    project_name: Option<String>,
+    thunderstore_community: Option<String>,
+    modio_game_id: Option<u32>,
 ) -> Result<ManagedGame, String> {
     if install_path.is_empty() {
         return Err("Install path is required".into());
@@ -443,15 +468,66 @@ pub fn manage_game(
     if games::plugin_by_id(&plugin_id).is_none() {
         return Err(format!("Unknown plugin: {plugin_id}"));
     }
+    let domain = nexus_domain.trim().to_string();
+    let ts_community = thunderstore_community
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        })
+        .or_else(|| {
+            games::thunderstore_community_for_plugin(&plugin_id).map(|s| s.to_string())
+        });
+    let modio_id = modio_game_id
+        .filter(|&id| id > 0)
+        .or_else(|| modio_api::seed_modio_game_id(&plugin_id));
+    if domain.is_empty() && ts_community.is_none() && modio_id.is_none() {
+        return Err(
+            "Enter a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.".into(),
+        );
+    }
+    if plugin_id == "unreal" {
+        let preferred = project_name.as_deref().filter(|s| !s.is_empty());
+        if games::detect_ue_layout(std::path::Path::new(&install_path)).is_none()
+            && preferred.is_none()
+        {
+            return Err(
+                "Could not detect an Unreal project folder. Enter the project name (e.g. Pal, Phoenix)."
+                    .into(),
+            );
+        }
+    }
+    if plugin_id == "bepinex"
+        && !games::looks_like_unity_install(std::path::Path::new(&install_path))
+    {
+        return Err(
+            "Install does not look like a Unity / BepInEx game (missing UnityPlayer, *_Data, or BepInEx)."
+                .into(),
+        );
+    }
     config::ensure_game_dirs(&state.paths, &id).map_err(|e| e.to_string())?;
+    let project_name = project_name.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
     let managed = ManagedGame {
         id: id.clone(),
         title,
-        nexus_domain,
+        nexus_domain: domain,
         install_path,
         launcher,
         plugin_id,
         cover_path,
+        project_name,
+        thunderstore_community: ts_community,
+        modio_game_id: modio_id,
     };
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.managed_games.retain(|g| g.id != id);
@@ -459,6 +535,296 @@ pub fn manage_game(
     cfg.last_active_game_id = Some(id);
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     Ok(managed)
+}
+
+#[tauri::command]
+pub fn update_managed_game(
+    state: State<'_, AppState>,
+    id: String,
+    nexus_domain: Option<String>,
+    project_name: Option<String>,
+    thunderstore_community: Option<String>,
+    modio_game_id: Option<u32>,
+) -> Result<ManagedGame, String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    if let Some(domain) = nexus_domain {
+        game.nexus_domain = domain.trim().to_string();
+    }
+    if let Some(project) = project_name {
+        let t = project.trim().to_string();
+        game.project_name = if t.is_empty() { None } else { Some(t) };
+    }
+    if let Some(community) = thunderstore_community {
+        let t = community.trim().to_string();
+        game.thunderstore_community = if t.is_empty() { None } else { Some(t) };
+    }
+    if let Some(mid) = modio_game_id {
+        game.modio_game_id = if mid == 0 { None } else { Some(mid) };
+    }
+    if game.nexus_domain.is_empty()
+        && game.thunderstore_community.is_none()
+        && game.modio_game_id.is_none()
+    {
+        return Err(
+            "Game needs a Nexus Mods domain, Thunderstore community, and/or mod.io game ID."
+                .into(),
+        );
+    }
+    let managed = game.clone();
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    Ok(managed)
+}
+
+#[tauri::command]
+pub fn detect_ue_layout(
+    install_path: String,
+    project_name: Option<String>,
+) -> Result<Option<games::UeLayoutInfo>, String> {
+    let preferred = project_name.as_deref().filter(|s| !s.is_empty());
+    match games::layout_info(std::path::Path::new(&install_path), preferred) {
+        Ok(info) => Ok(Some(info)),
+        Err(_) => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogSuggestion {
+    pub nexus_domain: Option<String>,
+    pub nexus_name: Option<String>,
+    pub thunderstore_community: Option<String>,
+    pub thunderstore_name: Option<String>,
+    pub modio_game_id: Option<u32>,
+    pub modio_name: Option<String>,
+}
+
+const CATALOG_MATCH_MIN_SCORE: u32 = 50;
+
+fn normalize_catalog_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            prev_space = false;
+        } else if !prev_space && !out.is_empty() {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn slug_compact(normalized: &str) -> String {
+    normalized.chars().filter(|c| *c != ' ').collect()
+}
+
+fn slug_hyphen(normalized: &str) -> String {
+    normalized
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn catalog_match_score(query: &str, candidate_name: &str, candidate_id: &str) -> u32 {
+    let q = normalize_catalog_text(query);
+    if q.is_empty() {
+        return 0;
+    }
+    let name = normalize_catalog_text(candidate_name);
+    let id_norm = normalize_catalog_text(candidate_id);
+    let q_compact = slug_compact(&q);
+    let q_hyphen = slug_hyphen(&q);
+    let name_compact = slug_compact(&name);
+    let id_compact = slug_compact(&id_norm);
+    let id_hyphen = slug_hyphen(&id_norm);
+
+    if !name.is_empty() && name == q {
+        return 100;
+    }
+    if !id_norm.is_empty() && (id_norm == q || id_compact == q_compact || id_hyphen == q_hyphen) {
+        return 95;
+    }
+    if !name_compact.is_empty() && name_compact == q_compact {
+        return 90;
+    }
+    if (!name.is_empty() && (name.contains(&q) || q.contains(&name)))
+        || (!id_compact.is_empty()
+            && (id_compact.contains(&q_compact) || q_compact.contains(&id_compact)))
+    {
+        let shorter = q_compact.len().min(name_compact.len().max(id_compact.len()));
+        let longer = q_compact.len().max(name_compact.len()).max(id_compact.len());
+        if longer > 0 && shorter * 100 / longer >= 60 {
+            return 70;
+        }
+    }
+    let q_tokens: Vec<&str> = q.split_whitespace().filter(|t| t.len() > 1).collect();
+    if q_tokens.is_empty() {
+        return 0;
+    }
+    let cand = format!("{name} {id_norm}");
+    let hit = q_tokens
+        .iter()
+        .filter(|t| cand.contains(*t))
+        .count();
+    if hit * 100 / q_tokens.len() >= 70 {
+        return 55;
+    }
+    0
+}
+
+fn best_catalog_match<'a, T>(
+    title: &str,
+    items: &'a [T],
+    name_fn: impl Fn(&T) -> &str,
+    id_fn: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    let mut best: Option<(&T, u32)> = None;
+    for item in items {
+        let score = catalog_match_score(title, name_fn(item), id_fn(item));
+        if score < CATALOG_MATCH_MIN_SCORE {
+            continue;
+        }
+        if best.map(|(_, s)| score > s).unwrap_or(true) {
+            best = Some((item, score));
+        }
+    }
+    best.map(|(item, _)| item)
+}
+
+#[tauri::command]
+pub async fn suggest_catalog_ids(
+    state: State<'_, AppState>,
+    title: String,
+) -> Result<CatalogSuggestion, String> {
+    let title = title.trim().to_string();
+    let mut suggestion = CatalogSuggestion {
+        nexus_domain: None,
+        nexus_name: None,
+        thunderstore_community: None,
+        thunderstore_name: None,
+        modio_game_id: None,
+        modio_name: None,
+    };
+    if title.is_empty() {
+        return Ok(suggestion);
+    }
+
+    // Nexus games list (session-cached).
+    if let Ok(client) = state.client() {
+        let games = {
+            let cached = state
+                .nexus_games_cache
+                .lock()
+                .map_err(|e| e.to_string())?
+                .clone();
+            if let Some(list) = cached {
+                list
+            } else {
+                match client.list_games().await {
+                    Ok(list) => {
+                        if let Ok(mut lock) = state.nexus_games_cache.lock() {
+                            *lock = Some(list.clone());
+                        }
+                        list
+                    }
+                    Err(e) => {
+                        log::warn!("suggest_catalog_ids: Nexus list_games failed: {e:#}");
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        if let Some(hit) = best_catalog_match(
+            &title,
+            &games,
+            |g| g.name.as_str(),
+            |g| g.domain_name.as_str(),
+        ) {
+            suggestion.nexus_domain = Some(hit.domain_name.clone());
+            suggestion.nexus_name = Some(hit.name.clone());
+        }
+    }
+
+    // Thunderstore communities (session-cached).
+    {
+        let communities = {
+            let cached = state
+                .ts_communities_cache
+                .lock()
+                .map_err(|e| e.to_string())?
+                .clone();
+            if let Some(list) = cached {
+                list
+            } else {
+                match ThunderstoreClient::new() {
+                    Ok(client) => match client.list_communities().await {
+                        Ok(list) => {
+                            if let Ok(mut lock) = state.ts_communities_cache.lock() {
+                                *lock = Some(list.clone());
+                            }
+                            list
+                        }
+                        Err(e) => {
+                            log::warn!("suggest_catalog_ids: Thunderstore communities failed: {e:#}");
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("suggest_catalog_ids: Thunderstore client: {e:#}");
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        if let Some(hit) = best_catalog_match(
+            &title,
+            &communities,
+            |c| c.name.as_str(),
+            |c| c.identifier.as_str(),
+        ) {
+            suggestion.thunderstore_community = Some(hit.identifier.clone());
+            suggestion.thunderstore_name = Some(hit.name.clone());
+        }
+    }
+
+    // mod.io (only when API key is configured).
+    let modio_key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    if let Some(key) = modio_key {
+        match ModioClient::new(&key) {
+            Ok(client) => match client.search_games(&title, 25).await {
+                Ok(games) => {
+                    if let Some(hit) = best_catalog_match(
+                        &title,
+                        &games,
+                        |g| g.name.as_str(),
+                        |g| g.name_id.as_str(),
+                    ) {
+                        suggestion.modio_game_id = Some(hit.id);
+                        suggestion.modio_name = Some(hit.name.clone());
+                    }
+                }
+                Err(e) => {
+                    log::warn!("suggest_catalog_ids: mod.io search_games failed: {e:#}");
+                }
+            },
+            Err(e) => {
+                log::warn!("suggest_catalog_ids: mod.io client: {e:#}");
+            }
+        }
+    }
+
+    Ok(suggestion)
 }
 
 #[tauri::command]
@@ -476,6 +842,11 @@ pub fn unmanage_game(state: State<'_, AppState>, id: String) -> Result<(), Strin
 pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
     let has_key = state.api_key.lock().map_err(|e| e.to_string())?.is_some();
+    let has_modio_api_key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_some();
     let user = state.user.lock().map_err(|e| e.to_string())?.clone();
     Ok(serde_json::json!({
         "adult_content": cfg.adult_content,
@@ -483,6 +854,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "last_active_game_id": cfg.last_active_game_id,
         "theme": cfg.theme,
         "has_api_key": has_key,
+        "has_modio_api_key": has_modio_api_key,
         "user": user,
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
@@ -561,6 +933,35 @@ pub fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn set_modio_api_key(
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<(), String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("mod.io API key cannot be empty".into());
+    }
+    let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
+    client.validate().await.map_err(|e| e.to_string())?;
+    if let Err(e) = modio_api::store_api_key(&key) {
+        log::warn!("mod.io keyring store failed: {e}");
+        let file = state.paths.config_dir.join("modio_api_key");
+        modio_api::store_api_key_file(&file, &key).map_err(|e| e.to_string())?;
+    }
+    *state.modio_api_key.lock().map_err(|e| e.to_string())? = Some(key);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_modio_api_key(state: State<'_, AppState>) -> Result<(), String> {
+    let _ = modio_api::clear_api_key();
+    let file = state.paths.config_dir.join("modio_api_key");
+    let _ = std::fs::remove_file(file);
+    *state.modio_api_key.lock().map_err(|e| e.to_string())? = None;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn search_mods(
     state: State<'_, AppState>,
     domain: String,
@@ -592,6 +993,703 @@ pub async fn search_mods(
         .search_mods(&domain, &query, adult, &opts)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogHit {
+    pub source: String,
+    pub id: String,
+    pub name: String,
+    pub summary: Option<String>,
+    pub picture_url: Option<String>,
+    pub author: Option<String>,
+    pub downloads: Option<u64>,
+    pub endorsements: Option<u64>,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    // Nexus
+    pub mod_id: Option<u64>,
+    pub domain_name: Option<String>,
+    // Thunderstore
+    pub community: Option<String>,
+    pub namespace: Option<String>,
+    pub package_name: Option<String>,
+    pub full_name: Option<String>,
+    pub package_url: Option<String>,
+    pub rating_score: Option<i64>,
+    pub latest_version: Option<String>,
+    // mod.io
+    pub modio_game_id: Option<u32>,
+    pub modio_mod_id: Option<u64>,
+    pub profile_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogSearchPage {
+    pub items: Vec<CatalogHit>,
+    pub total_count: u32,
+    pub next_offset: u32,
+    pub has_more: bool,
+    pub nexus_available: bool,
+    pub thunderstore_available: bool,
+    pub modio_available: bool,
+}
+
+fn catalog_from_nexus(hit: nexus::ModSearchHit) -> CatalogHit {
+    CatalogHit {
+        source: "nexus".into(),
+        id: format!("nexus:{}:{}", hit.domain_name, hit.mod_id),
+        name: hit.name,
+        summary: hit.summary,
+        picture_url: hit.picture_url,
+        author: hit.author,
+        downloads: hit.downloads,
+        endorsements: hit.endorsements,
+        category: hit.category,
+        tags: hit.tags,
+        mod_id: Some(hit.mod_id),
+        domain_name: Some(hit.domain_name),
+        community: None,
+        namespace: None,
+        package_name: None,
+        full_name: None,
+        package_url: None,
+        rating_score: None,
+        latest_version: None,
+        modio_game_id: None,
+        modio_mod_id: None,
+        profile_url: None,
+    }
+}
+
+fn catalog_from_ts(detail: TsPackageDetail) -> CatalogHit {
+    CatalogHit {
+        source: "thunderstore".into(),
+        id: format!(
+            "thunderstore:{}:{}:{}",
+            detail.community, detail.namespace, detail.name
+        ),
+        name: detail.name.clone(),
+        summary: detail.description.clone(),
+        picture_url: detail.icon_url.clone(),
+        author: Some(detail.namespace.clone()),
+        downloads: Some(detail.downloads),
+        endorsements: None,
+        category: detail.categories.first().cloned(),
+        tags: detail.categories.clone(),
+        mod_id: None,
+        domain_name: None,
+        community: Some(detail.community),
+        namespace: Some(detail.namespace),
+        package_name: Some(detail.name),
+        full_name: Some(detail.full_name),
+        package_url: Some(detail.package_url),
+        rating_score: Some(detail.rating_score),
+        latest_version: detail.latest_version,
+        modio_game_id: None,
+        modio_mod_id: None,
+        profile_url: None,
+    }
+}
+
+fn catalog_from_modio(hit: modio_api::ModioModHit) -> CatalogHit {
+    CatalogHit {
+        source: "modio".into(),
+        id: format!("modio:{}:{}", hit.game_id, hit.mod_id),
+        name: hit.name,
+        summary: Some(hit.summary),
+        picture_url: hit.picture_url,
+        author: hit.author,
+        downloads: Some(hit.downloads),
+        endorsements: None,
+        category: hit.tags.first().cloned(),
+        tags: hit.tags,
+        mod_id: None,
+        domain_name: None,
+        community: None,
+        namespace: None,
+        package_name: None,
+        full_name: Some(hit.name_id),
+        package_url: None,
+        rating_score: None,
+        latest_version: None,
+        modio_game_id: Some(hit.game_id),
+        modio_mod_id: Some(hit.mod_id),
+        profile_url: Some(hit.profile_url),
+    }
+}
+
+fn interleave_catalog_many(sources: Vec<Vec<CatalogHit>>) -> Vec<CatalogHit> {
+    let mut iters: Vec<_> = sources.into_iter().map(|v| v.into_iter().peekable()).collect();
+    let mut out = Vec::new();
+    loop {
+        let mut progressed = false;
+        for it in iters.iter_mut() {
+            if let Some(item) = it.next() {
+                out.push(item);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn search_catalog(
+    state: State<'_, AppState>,
+    game_id: String,
+    query: String,
+    source_filter: Option<String>,
+    sort: Option<String>,
+    category: Option<String>,
+    tags_include: Option<Vec<String>>,
+    tags_exclude: Option<Vec<String>>,
+    game_version: Option<String>,
+    offset: Option<u32>,
+    count: Option<u32>,
+) -> Result<CatalogSearchPage, String> {
+    let (nexus_domain, ts_community, modio_game_id, adult) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (
+            if game.nexus_domain.is_empty() {
+                None
+            } else {
+                Some(game.nexus_domain.clone())
+            },
+            game.thunderstore_community.clone(),
+            game.modio_game_id,
+            cfg.adult_content,
+        )
+    };
+
+    let filter = source_filter
+        .unwrap_or_else(|| "all".into())
+        .to_lowercase();
+    let want_nexus = (filter == "all" || filter == "nexus") && nexus_domain.is_some();
+    let want_ts = (filter == "all" || filter == "thunderstore") && ts_community.is_some();
+    let want_modio = (filter == "all" || filter == "modio") && modio_game_id.is_some();
+    if !want_nexus && !want_ts && !want_modio {
+        return Err(
+            "No catalog sources configured. Set a Nexus domain, Thunderstore community, and/or mod.io game ID."
+                .into(),
+        );
+    }
+
+    let offset = offset.unwrap_or(0) as usize;
+    let count = {
+        let c = count.unwrap_or(24) as usize;
+        if c == 0 {
+            24
+        } else {
+            c
+        }
+    };
+    let sort = sort.unwrap_or_else(|| {
+        if query.trim().is_empty() {
+            "downloads".into()
+        } else {
+            "relevance".into()
+        }
+    });
+
+    let mut nexus_hits = Vec::new();
+    let mut nexus_total = 0u32;
+    let mut nexus_available = false;
+    if want_nexus {
+        if let Some(domain) = &nexus_domain {
+            match state.client() {
+                Ok(client) => {
+                    nexus_available = true;
+                    let nexus_sort = if sort == "downloads" || sort == "relevance" {
+                        if query.trim().is_empty() {
+                            "downloads".into()
+                        } else {
+                            "endorsements".into()
+                        }
+                    } else {
+                        sort.clone()
+                    };
+                    let opts = nexus::BrowseSearchOpts {
+                        sort: nexus_sort,
+                        category: category.clone(),
+                        tags_include: tags_include.clone().unwrap_or_default(),
+                        tags_exclude: tags_exclude.clone().unwrap_or_default(),
+                        game_version: game_version.clone(),
+                        offset: offset as u32,
+                        count: count as u32,
+                    };
+                    match client.search_mods(domain, &query, adult, &opts).await {
+                        Ok(page) => {
+                            nexus_total = page.total_count as u32;
+                            nexus_hits = page.items.into_iter().map(catalog_from_nexus).collect();
+                        }
+                        Err(e) => log::warn!("Nexus catalog search failed: {e}"),
+                    }
+                }
+                Err(e) => log::warn!("Nexus client unavailable for catalog: {e}"),
+            }
+        }
+    }
+
+    let mut ts_hits = Vec::new();
+    let mut ts_total = 0u32;
+    let mut thunderstore_available = false;
+    if want_ts {
+        if let Some(community) = &ts_community {
+            thunderstore_available = true;
+            let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+            let cached = {
+                let cache = state.ts_package_cache.lock().map_err(|e| e.to_string())?;
+                cache.get(community).and_then(|(at, pkgs)| {
+                    if at.elapsed() < Duration::from_secs(15 * 60) {
+                        Some(pkgs.clone())
+                    } else {
+                        None
+                    }
+                })
+            };
+            let (page, total) = if let Some(packages) = cached {
+                filter_ts_packages(community, &packages, &query, adult, offset, count)
+            } else {
+                let packages = client
+                    .list_packages(community)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Ok(mut cache) = state.ts_package_cache.lock() {
+                    cache.insert(community.clone(), (Instant::now(), packages.clone()));
+                }
+                filter_ts_packages(community, &packages, &query, adult, offset, count)
+            };
+            ts_total = total as u32;
+            ts_hits = page.into_iter().map(catalog_from_ts).collect();
+        }
+    }
+
+    let mut modio_hits = Vec::new();
+    let mut modio_total = 0u32;
+    let mut modio_available = false;
+    if want_modio {
+        if let Some(gid) = modio_game_id {
+            let key = state
+                .modio_api_key
+                .lock()
+                .map_err(|e| e.to_string())?
+                .clone();
+            match key {
+                Some(key) => {
+                    modio_available = true;
+                    match ModioClient::new(&key) {
+                        Ok(client) => {
+                            match client
+                                .search_mods(gid, &query, offset as u32, count as u32, adult)
+                                .await
+                            {
+                                Ok((hits, total)) => {
+                                    modio_total = total;
+                                    modio_hits =
+                                        hits.into_iter().map(catalog_from_modio).collect();
+                                }
+                                Err(e) => log::warn!("mod.io catalog search failed: {e}"),
+                            }
+                        }
+                        Err(e) => log::warn!("mod.io client unavailable: {e}"),
+                    }
+                }
+                None => log::warn!("mod.io game id set but API key missing"),
+            }
+        }
+    }
+
+    let items = if filter == "all" {
+        let mut parts = Vec::new();
+        if want_nexus {
+            parts.push(nexus_hits);
+        }
+        if want_ts {
+            parts.push(ts_hits);
+        }
+        if want_modio {
+            parts.push(modio_hits);
+        }
+        interleave_catalog_many(parts)
+    } else if filter == "thunderstore" {
+        ts_hits
+    } else if filter == "modio" {
+        modio_hits
+    } else {
+        nexus_hits
+    };
+
+    let total_count = nexus_total
+        .saturating_add(ts_total)
+        .saturating_add(modio_total);
+    let has_more = (offset + count) < nexus_total as usize
+        || (offset + count) < ts_total as usize
+        || (offset + count) < modio_total as usize;
+
+    Ok(CatalogSearchPage {
+        items,
+        total_count,
+        next_offset: (offset + count) as u32,
+        has_more,
+        nexus_available,
+        thunderstore_available,
+        modio_available,
+    })
+}
+
+fn filter_ts_packages(
+    community: &str,
+    packages: &[thunderstore::TsPackage],
+    query: &str,
+    include_nsfw: bool,
+    offset: usize,
+    count: usize,
+) -> (Vec<TsPackageDetail>, usize) {
+    let mut packages: Vec<_> = packages.iter().filter(|p| !p.is_deprecated).cloned().collect();
+    if !include_nsfw {
+        packages.retain(|p| !p.has_nsfw_content);
+    }
+    let q = query.trim().to_lowercase();
+    if !q.is_empty() {
+        packages.retain(|p| {
+            p.name.to_lowercase().contains(&q)
+                || p.full_name.to_lowercase().contains(&q)
+                || p.owner.to_lowercase().contains(&q)
+                || p.versions
+                    .first()
+                    .map(|v| v.description.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+                || p.categories.iter().any(|c| c.to_lowercase().contains(&q))
+        });
+    }
+    packages.sort_by(|a, b| {
+        b.is_pinned.cmp(&a.is_pinned).then_with(|| {
+            let da = a.versions.first().map(|v| v.downloads).unwrap_or(0);
+            let db = b.versions.first().map(|v| v.downloads).unwrap_or(0);
+            db.cmp(&da)
+        })
+    });
+    let total = packages.len();
+    let page = packages
+        .into_iter()
+        .skip(offset)
+        .take(count)
+        .map(|p| {
+            // Rebuild detail similarly to thunderstore::detail_from_package
+            let latest = p.versions.first();
+            TsPackageDetail {
+                community: community.to_string(),
+                namespace: p.owner.clone(),
+                name: p.name.clone(),
+                full_name: p.full_name.clone(),
+                package_url: p.package_url.clone(),
+                uuid4: p.uuid4.clone(),
+                rating_score: p.rating_score,
+                is_deprecated: p.is_deprecated,
+                has_nsfw_content: p.has_nsfw_content,
+                categories: p.categories.clone(),
+                description: latest.map(|v| v.description.clone()),
+                icon_url: latest.map(|v| v.icon.clone()),
+                downloads: latest.map(|v| v.downloads).unwrap_or(0),
+                latest_version: latest.map(|v| v.version_number.clone()),
+                versions: p.versions,
+            }
+        })
+        .collect();
+    (page, total)
+}
+
+#[tauri::command]
+pub async fn get_thunderstore_package(
+    community: String,
+    namespace: String,
+    name: String,
+) -> Result<TsPackageDetail, String> {
+    let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+    client
+        .get_package(&community, &namespace, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn download_thunderstore_mod(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    community: String,
+    namespace: String,
+    name: String,
+    version: Option<String>,
+) -> Result<Vec<StagedMod>, String> {
+    let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+    let order = client
+        .resolve_install_order(&community, &namespace, &name, version.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut staged_all = Vec::new();
+    for pkg in order {
+        let ns = pkg.namespace.clone();
+        let pkg_name = pkg.name.clone();
+        if mods::has_thunderstore_package(&state.paths, &game_id, &ns, &pkg_name)
+            .map_err(|e| e.to_string())?
+        {
+            continue;
+        }
+        let ver = pkg
+            .versions
+            .first()
+            .ok_or_else(|| format!("No versions for {}", pkg.full_name))?;
+        let label = format!("{}-{}", pkg.full_name, ver.version_number);
+        let dl_id = uuid::Uuid::new_v4().to_string();
+        let dest = state
+            .paths
+            .downloads_dir()
+            .join(format!("ts_{}_{}.zip", dl_id, sanitize_filename::sanitize(&pkg_name)));
+
+        {
+            let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+            downloads.insert(
+                0,
+                DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+            );
+        }
+        let _ = app.emit("downloads-changed", ());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        {
+            let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
+            jobs.insert(
+                dl_id.clone(),
+                DownloadJob {
+                    cancel: cancel.clone(),
+                    pause: pause.clone(),
+                    batch_id: None,
+                    dest: Some(dest.clone()),
+                    source: None,
+                },
+            );
+        }
+
+        let control = TransferControl {
+            cancel: cancel.clone(),
+            pause: pause.clone(),
+        };
+        match client.download_version(ver, &dest, Some(&control)).await {
+            Ok(()) => {
+                let display = if pkg.name == name && pkg.namespace == namespace {
+                    pkg.name.clone()
+                } else {
+                    format!("{} (dependency)", pkg.name)
+                };
+                let staged = mods::stage_thunderstore_mod(
+                    &state.paths,
+                    &game_id,
+                    &community,
+                    &ns,
+                    &pkg_name,
+                    &ver.version_number,
+                    Some(pkg.uuid4.clone()),
+                    &display,
+                    &dest,
+                )
+                .map_err(|e| e.to_string())?;
+                staged_all.push(staged);
+                if let Ok(mut downloads) = state.downloads.lock() {
+                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                        d.status = "done".into();
+                    }
+                }
+                clear_download_job(&state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if let Ok(mut downloads) = state.downloads.lock() {
+                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                        d.status = "failed".into();
+                        d.error = Some(msg.clone());
+                    }
+                }
+                clear_download_job(&state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+                return Err(msg);
+            }
+        }
+    }
+    Ok(staged_all)
+}
+
+#[tauri::command]
+pub async fn get_modio_mod(
+    state: State<'_, AppState>,
+    game_id: u32,
+    mod_id: u64,
+) -> Result<ModioModDetail, String> {
+    let key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "mod.io API key required".to_string())?;
+    let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
+    client
+        .get_mod(game_id, mod_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn modio_files(
+    state: State<'_, AppState>,
+    game_id: u32,
+    mod_id: u64,
+) -> Result<Vec<ModioFileInfo>, String> {
+    let key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "mod.io API key required".to_string())?;
+    let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
+    let detail = client
+        .get_mod(game_id, mod_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    client
+        .list_files(game_id, mod_id, detail.primary_file_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn download_modio_mod(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    modio_game_id: u32,
+    mod_id: u64,
+    file_id: Option<u64>,
+    name: String,
+    version: Option<String>,
+    install_deps: Option<bool>,
+) -> Result<Vec<StagedMod>, String> {
+    let key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "mod.io API key required".to_string())?;
+    let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
+    let install_deps = install_deps.unwrap_or(true);
+
+    let mut queue: Vec<(u64, String, Option<u64>, Option<String>)> = Vec::new();
+    if install_deps {
+        match client.dependency_mod_ids(modio_game_id, mod_id).await {
+            Ok(deps) => {
+                for dep_id in deps {
+                    if mods::has_modio_mod(&state.paths, &game_id, dep_id)
+                        .map_err(|e| e.to_string())?
+                    {
+                        continue;
+                    }
+                    let detail = client
+                        .get_mod(modio_game_id, dep_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    queue.push((
+                        dep_id,
+                        format!("{} (dependency)", detail.name),
+                        detail.primary_file_id,
+                        None,
+                    ));
+                }
+            }
+            Err(e) => log::warn!("mod.io deps lookup failed: {e}"),
+        }
+    }
+    queue.push((mod_id, name, file_id, version));
+
+    let mut staged_all = Vec::new();
+    for (mid, label, fid, ver) in queue {
+        if mods::has_modio_mod(&state.paths, &game_id, mid).map_err(|e| e.to_string())?
+            && mid != mod_id
+        {
+            continue;
+        }
+        let detail = client
+            .get_mod(modio_game_id, mid)
+            .await
+            .map_err(|e| e.to_string())?;
+        let resolved_file = fid.or(detail.primary_file_id).ok_or_else(|| {
+            format!("No downloadable file for mod.io mod {mid}")
+        })?;
+        let dl_id = uuid::Uuid::new_v4().to_string();
+        let dest = state.paths.downloads_dir().join(format!(
+            "modio_{}_{}_{}.zip",
+            dl_id,
+            sanitize_filename::sanitize(&detail.name_id),
+            resolved_file
+        ));
+        {
+            let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+            downloads.insert(
+                0,
+                DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+            );
+        }
+        let _ = app.emit("downloads-changed", ());
+        match client
+            .download_file(modio_game_id, mid, Some(resolved_file), &dest)
+            .await
+        {
+            Ok(()) => {
+                let staged = mods::stage_modio_mod(
+                    &state.paths,
+                    &game_id,
+                    modio_game_id,
+                    mid,
+                    resolved_file,
+                    &detail.name,
+                    ver,
+                    &dest,
+                )
+                .map_err(|e| e.to_string())?;
+                staged_all.push(staged);
+                if let Ok(mut downloads) = state.downloads.lock() {
+                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                        d.status = "done".into();
+                    }
+                }
+                clear_download_job(&state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if let Ok(mut downloads) = state.downloads.lock() {
+                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                        d.status = "failed".into();
+                        d.error = Some(msg.clone());
+                    }
+                }
+                clear_download_job(&state, &dl_id);
+                let _ = app.emit("downloads-changed", ());
+                return Err(msg);
+            }
+        }
+    }
+    Ok(staged_all)
 }
 
 #[tauri::command]
@@ -1704,6 +2802,7 @@ pub fn deploy_mods(
         &game_id,
         &game.plugin_id,
         &PathBuf::from(&game.install_path),
+        game.project_name.as_deref(),
     )
     .map_err(|e| e.to_string())
 }

@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-pub const APP_NAME: &str = "nexus-manager";
+pub const APP_NAME: &str = "emperor-mod-manager";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const KEYRING_SERVICE: &str = "nexus-manager";
+pub const KEYRING_SERVICE: &str = "emperor-mod-manager";
 pub const KEYRING_USER: &str = "nexus-api-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,12 +52,23 @@ impl Default for AppConfig {
 pub struct ManagedGame {
     pub id: String,
     pub title: String,
+    /// Nexus Mods domain; empty when Thunderstore-only.
+    #[serde(default)]
     pub nexus_domain: String,
     pub install_path: String,
     pub launcher: String,
     pub plugin_id: String,
     #[serde(default)]
     pub cover_path: Option<String>,
+    /// Optional Unreal project folder override (e.g. "Pal", "Phoenix").
+    #[serde(default)]
+    pub project_name: Option<String>,
+    /// Thunderstore community identifier (e.g. "lethal-company").
+    #[serde(default)]
+    pub thunderstore_community: Option<String>,
+    /// mod.io numeric game id when this title is catalogued there.
+    #[serde(default)]
+    pub modio_game_id: Option<u32>,
 }
 
 pub struct Paths {
@@ -68,7 +79,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn resolve() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "nexusmanager", APP_NAME)
+        let dirs = ProjectDirs::from("dev", "emperormodmanager", APP_NAME)
             .context("failed to resolve project directories")?;
         let paths = Self {
             config_dir: dirs.config_dir().to_path_buf(),

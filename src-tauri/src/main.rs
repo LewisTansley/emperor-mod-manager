@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    nexus_manager_lib::run();
+    emperor_mod_manager_lib::run();
 }

@@ -1,5 +1,7 @@
 //! Installed-game detection (Linux via lib_game_detector; Windows via Steam/Heroic).
 
+use std::path::Path;
+
 use serde::Serialize;
 
 use crate::games::{match_plugin, GamePluginInfo};
@@ -19,6 +21,8 @@ pub struct DetectedGame {
     pub plugin_id: Option<String>,
     pub nexus_domain: Option<String>,
     pub cover_path: Option<String>,
+    /// When set (e.g. "unreal"), the install can be managed via a generic engine plugin.
+    pub engine_hint: Option<String>,
 }
 
 pub(crate) fn make_id(title: &str, launcher: &str, path: &Option<String>) -> String {
@@ -48,6 +52,22 @@ pub(crate) fn finish_detected(
         }) => (Some(id.to_string()), Some(nexus_domain.to_string())),
         None => (None, None),
     };
+
+    let engine_hint = if supported {
+        None
+    } else {
+        install_path.as_deref().and_then(|p| {
+            let path = Path::new(p);
+            if crate::games::detect_ue_layout(path).is_some() {
+                Some("unreal".to_string())
+            } else if crate::games::looks_like_unity_install(path) {
+                Some("bepinex".to_string())
+            } else {
+                None
+            }
+        })
+    };
+
     let id = make_id(&title, &launcher, &install_path);
     DetectedGame {
         id,
@@ -58,6 +78,7 @@ pub(crate) fn finish_detected(
         plugin_id,
         nexus_domain,
         cover_path,
+        engine_hint,
     }
 }
 

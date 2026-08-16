@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BrowseMeta,
   BrowseSearchOpts,
+  CatalogSearchPage,
+  CatalogSuggestion,
   CollectionDetail,
   CollectionModFile,
   CollectionSearchPage,
@@ -12,11 +14,15 @@ import type {
   ManagedGame,
   ModDetail,
   ModFileInfo,
+  ModioFileInfo,
+  ModioModDetail,
   ModSearchPage,
   NexusUser,
   Settings,
   StagedMod,
   ThemePreference,
+  TsPackageDetail,
+  UeLayoutInfo,
 } from "./types";
 
 export const api = {
@@ -24,6 +30,8 @@ export const api = {
   setApiKey: (key: string) => invoke<NexusUser>("set_api_key", { key }),
   validateUser: () => invoke<NexusUser>("validate_user"),
   clearApiKey: () => invoke<void>("clear_api_key"),
+  setModioApiKey: (key: string) => invoke<void>("set_modio_api_key", { key }),
+  clearModioApiKey: () => invoke<void>("clear_modio_api_key"),
   setAdultContent: (enabled: boolean) =>
     invoke<void>("set_adult_content", { enabled }),
   setAutoclickFreeDownload: (enabled: boolean) =>
@@ -39,7 +47,24 @@ export const api = {
     launcher: string;
     pluginId: string;
     coverPath?: string | null;
+    projectName?: string | null;
+    thunderstoreCommunity?: string | null;
+    modioGameId?: number | null;
   }) => invoke<ManagedGame>("manage_game", game),
+  updateManagedGame: (args: {
+    id: string;
+    nexusDomain?: string | null;
+    projectName?: string | null;
+    thunderstoreCommunity?: string | null;
+    modioGameId?: number | null;
+  }) => invoke<ManagedGame>("update_managed_game", args),
+  detectUeLayout: (installPath: string, projectName?: string | null) =>
+    invoke<UeLayoutInfo | null>("detect_ue_layout", {
+      installPath,
+      projectName: projectName ?? null,
+    }),
+  suggestCatalogIds: (title: string) =>
+    invoke<CatalogSuggestion>("suggest_catalog_ids", { title }),
   unmanageGame: (id: string) => invoke<void>("unmanage_game", { id }),
   setActiveGame: (id: string) => invoke<void>("set_active_game", { id }),
   searchMods: (domain: string, query: string, opts: BrowseSearchOpts = {}) =>
@@ -54,6 +79,53 @@ export const api = {
       offset: opts.offset ?? null,
       count: opts.count ?? null,
     }),
+  searchCatalog: (
+    gameId: string,
+    query: string,
+    opts: BrowseSearchOpts & { sourceFilter?: string | null } = {},
+  ) =>
+    invoke<CatalogSearchPage>("search_catalog", {
+      gameId,
+      query,
+      sourceFilter: opts.sourceFilter ?? null,
+      sort: opts.sort ?? null,
+      category: opts.category ?? null,
+      tagsInclude: opts.tagsInclude ?? null,
+      tagsExclude: opts.tagsExclude ?? null,
+      gameVersion: opts.gameVersion ?? null,
+      offset: opts.offset ?? null,
+      count: opts.count ?? null,
+    }),
+  getThunderstorePackage: (
+    community: string,
+    namespace: string,
+    name: string,
+  ) =>
+    invoke<TsPackageDetail>("get_thunderstore_package", {
+      community,
+      namespace,
+      name,
+    }),
+  downloadThunderstoreMod: (args: {
+    gameId: string;
+    community: string;
+    namespace: string;
+    name: string;
+    version?: string | null;
+  }) => invoke<StagedMod[]>("download_thunderstore_mod", args),
+  getModioMod: (gameId: number, modId: number) =>
+    invoke<ModioModDetail>("get_modio_mod", { gameId, modId }),
+  modioFiles: (gameId: number, modId: number) =>
+    invoke<ModioFileInfo[]>("modio_files", { gameId, modId }),
+  downloadModioMod: (args: {
+    gameId: string;
+    modioGameId: number;
+    modId: number;
+    fileId?: number | null;
+    name: string;
+    version?: string | null;
+    installDeps?: boolean | null;
+  }) => invoke<StagedMod[]>("download_modio_mod", args),
   getMod: (domain: string, modId: number) =>
     invoke<ModDetail>("get_mod", { domain, modId }),
   getGame: (domain: string) => invoke<GameInfo>("get_game", { domain }),

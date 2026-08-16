@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Emperor Mod Manager
+Comment=Linux-native mod manager
+Exec=emperor-mod-manager %u
+Icon=emperor-mod-manager
+Terminal=false
+Categories=Game;Utility;
+MimeType=x-scheme-handler/nxm;
+StartupWMClass=emperor-mod-manager

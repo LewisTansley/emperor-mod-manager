@@ -9,6 +9,7 @@ export type DetectedGame = {
   plugin_id: string | null;
   nexus_domain: string | null;
   cover_path: string | null;
+  engine_hint: string | null;
 };
 
 export type ManagedGame = {
@@ -19,6 +20,96 @@ export type ManagedGame = {
   launcher: string;
   plugin_id: string;
   cover_path?: string | null;
+  project_name?: string | null;
+  thunderstore_community?: string | null;
+  modio_game_id?: number | null;
+};
+
+export type UeLayoutInfo = {
+  project_name: string;
+  binaries_platform: string;
+  paks_dir: string;
+  binaries_dir: string;
+};
+
+export type CatalogSuggestion = {
+  nexus_domain: string | null;
+  nexus_name: string | null;
+  thunderstore_community: string | null;
+  thunderstore_name: string | null;
+  modio_game_id: number | null;
+  modio_name: string | null;
+};
+
+export type CatalogSource = "nexus" | "thunderstore" | "modio";
+
+export type CatalogHit = {
+  source: CatalogSource;
+  id: string;
+  name: string;
+  summary: string | null;
+  picture_url: string | null;
+  author: string | null;
+  downloads: number | null;
+  endorsements: number | null;
+  category: string | null;
+  tags: string[];
+  mod_id: number | null;
+  domain_name: string | null;
+  community: string | null;
+  namespace: string | null;
+  package_name: string | null;
+  full_name: string | null;
+  package_url: string | null;
+  rating_score: number | null;
+  latest_version: string | null;
+  modio_game_id: number | null;
+  modio_mod_id: number | null;
+  profile_url: string | null;
+};
+
+export type CatalogSearchPage = {
+  items: CatalogHit[];
+  total_count: number;
+  next_offset: number;
+  has_more: boolean;
+  nexus_available: boolean;
+  thunderstore_available: boolean;
+  modio_available: boolean;
+};
+
+export type TsPackageVersion = {
+  name: string;
+  full_name: string;
+  description: string;
+  icon: string;
+  version_number: string;
+  dependencies: string[];
+  download_url: string;
+  downloads: number;
+  date_created: string;
+  website_url: string;
+  is_active: boolean;
+  uuid4: string;
+  file_size: number;
+};
+
+export type TsPackageDetail = {
+  community: string;
+  namespace: string;
+  name: string;
+  full_name: string;
+  package_url: string;
+  uuid4: string;
+  rating_score: number;
+  is_deprecated: boolean;
+  has_nsfw_content: boolean;
+  categories: string[];
+  description: string | null;
+  icon_url: string | null;
+  downloads: number;
+  versions: TsPackageVersion[];
+  latest_version: string | null;
 };
 
 export type GameCategory = {
@@ -166,6 +257,7 @@ export type CollectionSearchPage = {
 export type StagedMod = {
   id: string;
   name: string;
+  source?: "nexus" | "thunderstore" | "modio";
   nexus_mod_id: number;
   nexus_file_id: number;
   version: string | null;
@@ -173,6 +265,38 @@ export type StagedMod = {
   staging_path: string;
   enabled: boolean;
   order: number;
+  ts_namespace?: string | null;
+  ts_name?: string | null;
+  ts_package_uuid?: string | null;
+  modio_game_id?: number | null;
+  modio_mod_id?: number | null;
+  modio_file_id?: number | null;
+};
+
+export type ModioModDetail = {
+  game_id: number;
+  mod_id: number;
+  name: string;
+  name_id: string;
+  summary: string;
+  description: string | null;
+  picture_url: string | null;
+  author: string | null;
+  downloads: number;
+  profile_url: string;
+  tags: string[];
+  has_dependencies: boolean;
+  primary_file_id: number | null;
+};
+
+export type ModioFileInfo = {
+  file_id: number;
+  filename: string;
+  version: string | null;
+  filesize: number;
+  changelog: string | null;
+  is_primary: boolean;
+  date_added: number;
 };
 
 export type DeployResult = {
@@ -198,6 +322,7 @@ export type Settings = {
   last_active_game_id: string | null;
   theme?: ThemePreference;
   has_api_key: boolean;
+  has_modio_api_key?: boolean;
   user: NexusUser | null;
   config_dir: string;
   data_dir: string;

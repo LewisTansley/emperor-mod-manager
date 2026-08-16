@@ -40,7 +40,7 @@ impl Default for AssistBounds {
     }
 }
 
-const NXM_SENTINEL_HOST: &str = "nexus-manager.invalid";
+const NXM_SENTINEL_HOST: &str = "emperor-mod-manager.invalid";
 const NXM_SENTINEL_PATH: &str = "/capture-nxm";
 const CDN_SENTINEL_PATH: &str = "/capture-download";
 
@@ -48,11 +48,11 @@ const CDN_SENTINEL_PATH: &str = "/capture-download";
 const AUTOCLICK_JS: &str = r#"
 (function () {
   var key = (location.href || '').split('#')[0];
-  if (window.__nexusManagerAutoclickKey === key) return;
-  window.__nexusManagerAutoclickKey = key;
-  if (window.__nexusManagerAutoclickTimer) {
-    clearInterval(window.__nexusManagerAutoclickTimer);
-    window.__nexusManagerAutoclickTimer = null;
+  if (window.__emperorModManagerAutoclickKey === key) return;
+  window.__emperorModManagerAutoclickKey = key;
+  if (window.__emperorModManagerAutoclickTimer) {
+    clearInterval(window.__emperorModManagerAutoclickTimer);
+    window.__emperorModManagerAutoclickTimer = null;
   }
   var started = Date.now();
   var deadline = started + 180000;
@@ -60,10 +60,10 @@ const AUTOCLICK_JS: &str = r#"
   var lastClickAt = 0;
   var pageKeyAtStart = key;
   var done = false;
-  var assist = window.__nexusManagerAssist || {};
+  var assist = window.__emperorModManagerAssist || {};
   var targetFileId = (assist.fileId || '') + '';
-  var state = window.__nexusManagerAutoclickState || {};
-  window.__nexusManagerAutoclickState = state;
+  var state = window.__emperorModManagerAutoclickState || {};
+  window.__emperorModManagerAutoclickState = state;
   state.installed = true;
   state.pageKey = key;
   state.phase = 'openDialog';
@@ -266,11 +266,11 @@ const AUTOCLICK_JS: &str = r#"
   }
 
   function bridgeNxm(href) {
-    if (typeof window.__nexusManagerBridgeNxm === 'function') {
-      window.__nexusManagerBridgeNxm(href);
+    if (typeof window.__emperorModManagerBridgeNxm === 'function') {
+      window.__emperorModManagerBridgeNxm(href);
       return;
     }
-    window.location.href = 'https://nexus-manager.invalid/capture-nxm?url=' + encodeURIComponent(href);
+    window.location.href = 'https://emperor-mod-manager.invalid/capture-nxm?url=' + encodeURIComponent(href);
   }
 
   function realisticClick(el) {
@@ -409,10 +409,10 @@ const AUTOCLICK_JS: &str = r#"
     return null;
   }
 
-  window.__nexusManagerAutoclickTimer = setInterval(function () {
+  window.__emperorModManagerAutoclickTimer = setInterval(function () {
     if (done || Date.now() > deadline) {
-      clearInterval(window.__nexusManagerAutoclickTimer);
-      window.__nexusManagerAutoclickTimer = null;
+      clearInterval(window.__emperorModManagerAutoclickTimer);
+      window.__emperorModManagerAutoclickTimer = null;
       state.phase = 'done';
       touch('expired');
       return;
@@ -420,8 +420,8 @@ const AUTOCLICK_JS: &str = r#"
 
     if (succeeded()) {
       done = true;
-      clearInterval(window.__nexusManagerAutoclickTimer);
-      window.__nexusManagerAutoclickTimer = null;
+      clearInterval(window.__emperorModManagerAutoclickTimer);
+      window.__emperorModManagerAutoclickTimer = null;
       state.phase = 'done';
       touch('succeeded');
       return;
@@ -489,13 +489,13 @@ const NXM_HOOK_JS: &str = r#"
     href = (href || '') + '';
     if (href.indexOf('nxm://') !== 0) return false;
     try {
-      window.location.href = 'https://nexus-manager.invalid/capture-nxm?url=' + encodeURIComponent(href);
+      window.location.href = 'https://emperor-mod-manager.invalid/capture-nxm?url=' + encodeURIComponent(href);
     } catch (err) {}
     return true;
   }
-  window.__nexusManagerBridgeNxm = bridge;
-  if (window.__nexusManagerNxmHook) return;
-  window.__nexusManagerNxmHook = true;
+  window.__emperorModManagerBridgeNxm = bridge;
+  if (window.__emperorModManagerNxmHook) return;
+  window.__emperorModManagerNxmHook = true;
   document.addEventListener('click', function (e) {
     var el = e.target;
     while (el && el.tagName !== 'A') el = el.parentElement;
@@ -534,13 +534,13 @@ const CDN_HOOK_JS: &str = r#"
   function bridge(href) {
     if (!isCdn(href)) return false;
     try {
-      window.location.href = 'https://nexus-manager.invalid/capture-download?url=' + encodeURIComponent(href);
+      window.location.href = 'https://emperor-mod-manager.invalid/capture-download?url=' + encodeURIComponent(href);
     } catch (err) {}
     return true;
   }
-  window.__nexusManagerBridgeCdn = bridge;
-  if (window.__nexusManagerCdnHook) return;
-  window.__nexusManagerCdnHook = true;
+  window.__emperorModManagerBridgeCdn = bridge;
+  if (window.__emperorModManagerCdnHook) return;
+  window.__emperorModManagerCdnHook = true;
   document.addEventListener('click', function (e) {
     var el = e.target;
     while (el && el.tagName !== 'A') el = el.parentElement;
@@ -883,7 +883,7 @@ fn schedule_autoclick_telemetry(webview: Webview, href: String) {
             tokio::time::sleep(Duration::from_millis(2000)).await;
             let href_log = href.clone();
             let _ = webview.eval_with_callback(
-                "JSON.stringify(window.__nexusManagerAutoclickState || { missing: true })",
+                "JSON.stringify(window.__emperorModManagerAutoclickState || { missing: true })",
                 move |result| {
                     log::info!("autoclick telemetry attempt {attempt} on {href_log}: {result}");
                 },
@@ -893,7 +893,7 @@ fn schedule_autoclick_telemetry(webview: Webview, href: String) {
 }
 
 fn assist_context_js(mod_id: u64, file_id: u64) -> String {
-    format!("window.__nexusManagerAssist = {{ fileId: {file_id}, modId: {mod_id} }};")
+    format!("window.__emperorModManagerAssist = {{ fileId: {file_id}, modId: {mod_id} }};")
 }
 
 fn inject_assist_scripts(
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn extracts_sentinel_nxm_url() {
-        let raw = "https://nexus-manager.invalid/capture-nxm?url=nxm%3A%2F%2Fstardewvalley%2Fmods%2F2400%2Ffiles%2F12345%3Fkey%3Dabc%26expires%3D1";
+        let raw = "https://emperor-mod-manager.invalid/capture-nxm?url=nxm%3A%2F%2Fstardewvalley%2Fmods%2F2400%2Ffiles%2F12345%3Fkey%3Dabc%26expires%3D1";
         let parsed = url::Url::parse(raw).unwrap();
         let nxm = extract_sentinel_nxm(&parsed).unwrap();
         assert_eq!(
@@ -1192,7 +1192,7 @@ mod tests {
     #[test]
     fn rejects_non_nxm_sentinel_payload() {
         let parsed =
-            url::Url::parse("https://nexus-manager.invalid/capture-nxm?url=https://example.com")
+            url::Url::parse("https://emperor-mod-manager.invalid/capture-nxm?url=https://example.com")
                 .unwrap();
         assert!(extract_sentinel_nxm(&parsed).is_none());
     }
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn extracts_sentinel_cdn_url() {
-        let raw = "https://nexus-manager.invalid/capture-download?url=https%3A%2F%2Fcf-files.nexusmods.com%2Fcdn%2F1%2F2%2Fmod.zip";
+        let raw = "https://emperor-mod-manager.invalid/capture-download?url=https%3A%2F%2Fcf-files.nexusmods.com%2Fcdn%2F1%2F2%2Fmod.zip";
         let parsed = url::Url::parse(raw).unwrap();
         let cdn = extract_sentinel_download(&parsed).unwrap();
         assert_eq!(cdn, "https://cf-files.nexusmods.com/cdn/1/2/mod.zip");
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     fn rejects_non_cdn_sentinel_payload() {
         let parsed = url::Url::parse(
-            "https://nexus-manager.invalid/capture-download?url=https://example.com/file.zip",
+            "https://emperor-mod-manager.invalid/capture-download?url=https://example.com/file.zip",
         )
         .unwrap();
         assert!(extract_sentinel_download(&parsed).is_none());
@@ -1242,7 +1242,7 @@ mod tests {
         assert!(AUTOCLICK_JS.contains("shadowRoot"));
         assert!(AUTOCLICK_JS.contains("bodyTextDeep"));
         assert!(AUTOCLICK_JS.contains("nxm-button-secondary-filled-weak"));
-        assert!(AUTOCLICK_JS.contains("__nexusManagerAssist"));
+        assert!(AUTOCLICK_JS.contains("__emperorModManagerAssist"));
         assert!(AUTOCLICK_JS.contains("openDialog"));
         assert!(AUTOCLICK_JS.contains("clickSlow"));
         assert!(AUTOCLICK_JS.contains("bodyHasSlow"));

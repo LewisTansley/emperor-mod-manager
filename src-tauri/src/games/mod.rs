@@ -10,8 +10,9 @@ mod cyberpunk2077;
 mod daysgone;
 mod fromsoftware;
 mod re_engine;
-mod stalker2heartofchornobyl;
 mod stardewvalley;
+mod unity_bepinex;
+mod unreal_engine;
 mod warhammer40kdarktide;
 
 pub use baldursgate3::BaldursGate3Plugin;
@@ -24,8 +25,16 @@ pub use re_engine::{
     ResidentEvil22019Plugin, ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
     ResidentEvilRequiemPlugin, ResidentEvilVillagePlugin,
 };
-pub use stalker2heartofchornobyl::Stalker2HeartOfChornobylPlugin;
 pub use stardewvalley::StardewValleyPlugin;
+pub use unity_bepinex::{
+    looks_like_unity_install, thunderstore_community_for_plugin, AgainstTheStormPlugin,
+    AmongUsPlugin, BepInExPlugin, ContentWarningPlugin, CultOfTheLambPlugin, GtfoPlugin,
+    LethalCompanyPlugin, RiskOfRain2Plugin, RoundsPlugin, TimberbornPlugin, ValheimPlugin,
+};
+pub use unreal_engine::{
+    detect_ue_layout, layout_info, DeployContext, HogwartsLegacyPlugin, PalworldPlugin,
+    Stalker2HeartOfChornobylPlugin, UeLayoutInfo, UnrealEnginePlugin,
+};
 pub use warhammer40kdarktide::Warhammer40kDarktidePlugin;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -41,6 +50,17 @@ pub trait GamePlugin: Send + Sync {
 
     /// Resolve where staged mod files should be linked inside the game install.
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf>;
+
+    /// Resolve with optional deploy context (UE project override, LogicMod markers).
+    fn resolve_deploy_root_ctx(
+        &self,
+        install_path: &Path,
+        relative: &Path,
+        ctx: &DeployContext<'_>,
+    ) -> Result<PathBuf> {
+        let _ = ctx;
+        self.resolve_deploy_root(install_path, relative)
+    }
 
     /// Prefer a subdirectory name under Mods/ for folder-style games.
     fn prefers_mod_folder(&self) -> bool {
@@ -73,6 +93,15 @@ pub trait GamePlugin: Send + Sync {
         Vec::new()
     }
 
+    fn preflight_warnings_ctx(
+        &self,
+        install_path: &Path,
+        ctx: &DeployContext<'_>,
+    ) -> Vec<String> {
+        let _ = ctx;
+        self.preflight_warnings(install_path)
+    }
+
     /// Per-staging-pack warnings (e.g. SMAPI installer deployed as a mod).
     fn staging_deploy_warnings(&self, _content_root: &Path, _mod_name: &str) -> Vec<String> {
         Vec::new()
@@ -96,7 +125,8 @@ pub trait GamePlugin: Send + Sync {
 }
 
 pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
-    // More specific match_names first (FromSoft + RE Engine remakes).
+    // More specific match_names first (FromSoft + RE Engine remakes + UE + BepInEx titles).
+    // Generic UnrealEnginePlugin / BepInExPlugin have empty match_names (detection via engine_hint).
     vec![
         &StardewValleyPlugin,
         &BaldursGate3Plugin,
@@ -104,6 +134,20 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &DaysGonePlugin,
         &Warhammer40kDarktidePlugin,
         &Stalker2HeartOfChornobylPlugin,
+        &PalworldPlugin,
+        &HogwartsLegacyPlugin,
+        &UnrealEnginePlugin,
+        &LethalCompanyPlugin,
+        &ValheimPlugin,
+        &RiskOfRain2Plugin,
+        &AmongUsPlugin,
+        &ContentWarningPlugin,
+        &GtfoPlugin,
+        &TimberbornPlugin,
+        &CultOfTheLambPlugin,
+        &AgainstTheStormPlugin,
+        &RoundsPlugin,
+        &BepInExPlugin,
         &EldenRingPlugin,
         &DarkSouls3Plugin,
         &DarkSouls2Plugin,
@@ -126,6 +170,9 @@ pub fn match_plugin(title: &str, install_path: Option<&str>) -> Option<GamePlugi
     let lower = title.to_lowercase();
     for plugin in all_plugins() {
         let info = plugin.info();
+        if info.match_names.is_empty() {
+            continue;
+        }
         for name in info.match_names {
             if lower.contains(&name.to_lowercase()) {
                 return Some(info);

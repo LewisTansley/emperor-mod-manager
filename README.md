@@ -1,16 +1,17 @@
-# Nexus Manager
+# Emperor Mod Manager
 
-Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/) on **Linux** and **Windows**.
+Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, and mod.io on **Linux** and **Windows**.
 
 **MVP+ features**
 
 - Detect installed games (Linux: Steam / Heroic / Lutris / Bottles via `lib_game_detector`; Windows: Steam registry + libraries, optional Heroic)
-- Manage supported titles: **Stardew Valley**, **Baldur's Gate 3**, **Cyberpunk 2077**, **Days Gone**, **S.T.A.L.K.E.R. 2: Heart of Chornobyl**, **Warhammer 40,000: Darktide**, **Dark Souls** (PTDE), **Dark Souls Remastered**, **Dark Souls 2**, **Dark Souls 3**, **Elden Ring**, **Resident Evil 7**, **Village**, **Requiem**, **2/3/4 Remake**
+- Manage supported titles: **Stardew Valley**, **Baldur's Gate 3**, **Cyberpunk 2077**, **Days Gone**, **S.T.A.L.K.E.R. 2: Heart of Chornobyl**, **Palworld**, **Hogwarts Legacy**, **Warhammer 40,000: Darktide**, **Dark Souls** (PTDE), **Dark Souls Remastered**, **Dark Souls 2**, **Dark Souls 3**, **Elden Ring**, **Resident Evil 7**, **Village**, **Requiem**, **2/3/4 Remake**, a **generic Unreal Engine** pipeline for other UE4/UE5 installs, and **Unity/BepInEx** titles (**Lethal Company**, **Valheim**, **Risk of Rain 2**, **Among Us**, **Content Warning**, **GTFO**, **Timberborn**, **Cult of the Lamb**, **Against the Storm**, **ROUNDS**, plus generic BepInEx)
 - Days Gone: `.pak` mods deploy to `BendGame/Saved/Paks` (Windows `%LOCALAPPDATA%` or Steam Proton compatdata). First deploy renames `startuppackages.pak` → `startuppackages_modsenabled.pak` when needed so custom paks load.
 - Darktide: mods deploy under `<game>/mods/`; enabled names are written to `mods/mod_load_order.txt`. Deploy runs `tools/dtkit-patch --patch bundle` (idempotent enable; not `--toggle`). Install the Darktide Mod Loader first so the patcher binary is present.
 - RE Engine Resident Evil titles deploy `natives/`, `reframework/`, and `pak_mods/` into the game install (plus REF injectors like `dinput8.dll`). Install [REFramework](https://github.com/praydog/reframework) and enable **Loose File Loader** for loose-file mods; this app does not perform Fluffy-style PAK invalidation.
 - FromSoftware titles deploy under `<Game>/mods/<ModName>/` (resolves the Steam `Game/` subfolder when present). Launch with an external injector such as [me3](https://github.com/garyttierney/me3), Mod Engine 2, Elden Mod Loader, or legacy Mod Engine — this app does not install or launch those tools.
-- Search mods & Collections on Nexus (GraphQL v2 + REST v1)
+- Unity/BepInEx titles deploy plugins under `BepInEx/plugins/` (Doorstop / BepInExPack trees deploy to the install root). Install BepInEx or a Thunderstore BepInExPack first; the app warns when the loader is missing.
+- Search mods & Collections on Nexus (GraphQL v2 + REST v1). **Browse** can merge **Nexus**, **Thunderstore**, and **mod.io** in one list when each source is configured (source badges; All / Nexus / Thunderstore / mod.io filter). Thunderstore and mod.io installs resolve soft dependencies automatically.
 - **Premium:** one-click API downloads and Collection batch install
 - **Free:** visible **Download Assist** WebView on the Nexus file page (persistent website session in-app), optional **autoclick** (Nexus Fast Download–style) on Mod Manager / Slow Download when the button is enabled, keyed `nxm://` staging, local archive import, and **Collection install** via a sequential Download Assist queue
 - Hardlink/symlink deploy with copy fallback (basic load order)
@@ -24,6 +25,7 @@ Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/) on **Linux** an
 - **Windows:** [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) (installer can bootstrap it); optional [Developer Mode](https://learn.microsoft.com/windows/apps/get-started/enable-your-device-for-development) for symlink deploy instead of file copies
 - A Nexus Mods account and **personal API key**
 - **Nexus Premium** for one-click `download_link.json` without a site-issued key (and API Collection batch install)
+- Optional [mod.io API key](https://mod.io/me/access) (read-only) to browse/download from mod.io for managed games with a mod.io game ID
 
 ## Setup
 
@@ -48,6 +50,14 @@ Release builds for **both** Linux and Windows run in parallel via CI (`npm run b
 
 The key is stored in the OS keyring when available (Linux Secret Service / Windows Credential Manager), otherwise in the app config directory as `nexus_api_key` (mode `0600` on Unix).
 
+### mod.io API key
+
+1. Open [mod.io Access](https://mod.io/me/access) and create / copy an API key
+2. Paste it under **Setup → mod.io** in the app
+3. Set a **mod.io game ID** on the managed game (Library → Catalog & deploy settings), or rely on a seeded ID when one exists
+
+The key is stored like the Nexus key (`modio-api-key` in the keyring, or `modio_api_key` in the config directory). Auth is **API key only** — no OAuth, Steam login, upload, subscribe, rate, or comments.
+
 ### Free-account downloads
 
 1. Browse a mod file → **Download Assist**
@@ -62,7 +72,7 @@ Autoclick only runs in the user-opened assist window and only clicks Nexus’s f
 
 ### `nxm://` handler
 
-- **Linux:** the bundled desktop entry declares `MimeType=x-scheme-handler/nxm`. After installing the package, browsers can open “Download with manager” links in Nexus Manager.
+- **Linux:** the bundled desktop entry declares `MimeType=x-scheme-handler/nxm`. After installing the package, browsers can open “Download with manager” links in Emperor Mod Manager.
 - **Windows:** the NSIS installer / deep-link plugin registers the `nxm` protocol for the app.
 
 ## Data layout
@@ -71,11 +81,11 @@ Paths use the OS conventions via the `directories` crate:
 
 | Purpose | Linux (XDG) | Windows |
 |---------|-------------|---------|
-| Config (`config.toml`) | `~/.config/nexus-manager/` | `%APPDATA%\nexusmanager\nexus-manager\` |
-| Staged mods / load order | `~/.local/share/nexus-manager/` | `%APPDATA%\nexusmanager\nexus-manager\` (data) |
-| Download cache | `~/.cache/nexus-manager/` | `%LOCALAPPDATA%\nexusmanager\nexus-manager\cache\` |
+| Config (`config.toml`) | `~/.config/emperor-mod-manager/` | `%APPDATA%\emperormodmanager\emperor-mod-manager\` |
+| Staged mods / load order | `~/.local/share/emperor-mod-manager/` | `%APPDATA%\emperormodmanager\emperor-mod-manager\` (data) |
+| Download cache | `~/.cache/emperor-mod-manager/` | `%LOCALAPPDATA%\emperormodmanager\emperor-mod-manager\cache\` |
 
-Exact folder names follow `ProjectDirs` (`dev` / `nexusmanager` / `nexus-manager`).
+Exact folder names follow `ProjectDirs` (`dev` / `emperormodmanager` / `emperor-mod-manager`).
 
 ## License
 
@@ -83,4 +93,4 @@ AGPL-3.0-or-later (required by `lib_game_detector` on Linux).
 
 ## Not in MVP+
 
-FOMOD wizards, LOOT sorting, BSA/BA2 packing, Proton script-extender shims, multi-profile workflows.
+FOMOD wizards, LOOT sorting, BSA/BA2 packing, Proton script-extender shims, multi-profile workflows, MelonLoader, r2modman/Gale profile import, mod.io OAuth / upload / ratings, bundling a shared app-wide mod.io key.

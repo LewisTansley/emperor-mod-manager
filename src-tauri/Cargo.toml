@@ -1,13 +1,13 @@
 [package]
-name = "nexus-manager"
+name = "emperor-mod-manager"
 version = "0.2.1"
-description = "Nexus Mods manager for Linux and Windows"
-authors = ["nexus-manager contributors"]
+description = "Mod manager for Linux and Windows"
+authors = ["emperor-mod-manager contributors"]
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [lib]
-name = "nexus_manager_lib"
+name = "emperor_mod_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -40,6 +40,7 @@ hex = "0.4"
 regex = "1"
 log = "0.4"
 env_logger = "0.11"
+modio = "0.14.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lib_game_detector = { version = "0.0.35", features = ["bundled_sqlite"] }

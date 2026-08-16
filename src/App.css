@@ -241,6 +241,60 @@ a {
   padding: 1.25rem 1.35rem 1.5rem;
 }
 
+.panel label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0.5rem 0;
+}
+
+.panel label input {
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  color: var(--ink);
+  border-radius: 0.45rem;
+  padding: 0.45rem 0.55rem;
+  font: inherit;
+}
+
+.field-hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+  opacity: 0.9;
+}
+
+.unreal-manage-panel {
+  margin: 1rem 0;
+}
+
+.inline-version {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.inline-version select {
+  border: 1px solid var(--line);
+  background: var(--input-bg);
+  color: var(--ink);
+  border-radius: 0.45rem;
+  padding: 0.35rem 0.5rem;
+  font: inherit;
+}
+
+.source-filter {
+  margin-left: 0.5rem;
+}
+
+.row-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
 .panel h1 {
   margin: 0 0 0.5rem;
   font-family: "IBM Plex Serif", Georgia, serif;

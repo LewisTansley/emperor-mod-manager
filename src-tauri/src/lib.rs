@@ -12,7 +12,9 @@ mod games;
 ))]
 mod linux_embed;
 mod mods;
+mod modio_api;
 mod nexus;
+mod thunderstore;
 
 use commands::AppState;
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -48,6 +50,9 @@ pub fn run() {
             commands::list_plugins,
             commands::list_managed,
             commands::manage_game,
+            commands::update_managed_game,
+            commands::detect_ue_layout,
+            commands::suggest_catalog_ids,
             commands::unmanage_game,
             commands::get_settings,
             commands::set_adult_content,
@@ -57,7 +62,15 @@ pub fn run() {
             commands::set_api_key,
             commands::validate_user,
             commands::clear_api_key,
+            commands::set_modio_api_key,
+            commands::clear_modio_api_key,
             commands::search_mods,
+            commands::search_catalog,
+            commands::get_thunderstore_package,
+            commands::download_thunderstore_mod,
+            commands::get_modio_mod,
+            commands::modio_files,
+            commands::download_modio_mod,
             commands::get_game,
             commands::get_mod,
             commands::mod_files,

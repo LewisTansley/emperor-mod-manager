@@ -80,6 +80,14 @@ pub struct GameInfo {
     pub categories: Vec<GameCategory>,
 }
 
+/// Lightweight game row from `GET /v1/games.json` (catalog matching).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NexusGameEntry {
+    pub id: u64,
+    pub name: String,
+    pub domain_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModDetail {
     pub mod_id: u64,
@@ -222,7 +230,7 @@ impl NexusClient {
         headers.insert(
             USER_AGENT,
             HeaderValue::from_str(&format!("{APP_NAME}/{APP_VERSION}"))
-                .unwrap_or(HeaderValue::from_static("nexus-manager/0.1.0")),
+                .unwrap_or(HeaderValue::from_static("emperor-mod-manager/0.1.0")),
         );
         let http = reqwest::Client::builder()
             .default_headers(headers)
@@ -441,6 +449,38 @@ impl NexusClient {
                     domain_name: domain.to_string(),
                     category: None,
                     tags: Vec::new(),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn list_games(&self) -> Result<Vec<NexusGameEntry>> {
+        let url = format!("{REST_BASE}/games.json");
+        let resp = self.http.get(&url).send().await?;
+        self.check_rate_limit(&resp);
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("list games failed ({status}): {body}");
+        }
+        let n: Value = resp.json().await?;
+        let arr = n
+            .as_array()
+            .ok_or_else(|| anyhow!("games.json: expected array"))?;
+        Ok(arr
+            .iter()
+            .filter_map(|g| {
+                let domain_name = g.get("domain_name")?.as_str()?.to_string();
+                let name = g
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(domain_name.as_str())
+                    .to_string();
+                let id = g.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                Some(NexusGameEntry {
+                    id,
+                    name,
+                    domain_name,
                 })
             })
             .collect())

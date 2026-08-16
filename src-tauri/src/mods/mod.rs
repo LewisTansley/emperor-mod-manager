@@ -13,20 +13,74 @@ use walkdir::WalkDir;
 
 use crate::{
     config::Paths,
-    games::{normalize_relative, normalize_staging_root, plugin_by_id, GamePlugin},
+    games::{
+        normalize_relative, normalize_staging_root, plugin_by_id, DeployContext, GamePlugin,
+    },
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ModSource {
+    #[default]
+    Nexus,
+    Thunderstore,
+    Modio,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedMod {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub source: ModSource,
+    #[serde(default)]
     pub nexus_mod_id: u64,
+    #[serde(default)]
     pub nexus_file_id: u64,
     pub version: Option<String>,
+    /// Nexus domain, or Thunderstore community id.
     pub domain: String,
     pub staging_path: String,
     pub enabled: bool,
     pub order: u32,
+    /// Thunderstore package namespace (owner).
+    #[serde(default)]
+    pub ts_namespace: Option<String>,
+    /// Thunderstore package name (without namespace).
+    #[serde(default)]
+    pub ts_name: Option<String>,
+    /// Thunderstore package UUID (optional).
+    #[serde(default)]
+    pub ts_package_uuid: Option<String>,
+    #[serde(default)]
+    pub modio_game_id: Option<u32>,
+    #[serde(default)]
+    pub modio_mod_id: Option<u64>,
+    #[serde(default)]
+    pub modio_file_id: Option<u64>,
+}
+
+impl Default for StagedMod {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            source: ModSource::Nexus,
+            nexus_mod_id: 0,
+            nexus_file_id: 0,
+            version: None,
+            domain: String::new(),
+            staging_path: String::new(),
+            enabled: true,
+            order: 0,
+            ts_namespace: None,
+            ts_name: None,
+            ts_package_uuid: None,
+            modio_game_id: None,
+            modio_mod_id: None,
+            modio_file_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -163,13 +217,16 @@ pub fn stage_mod(
 
     let mut order = load_loadorder(paths, game_id)?;
     // Replace existing same file if present
-    order
-        .mods
-        .retain(|m| !(m.nexus_mod_id == mod_id && m.nexus_file_id == file_id));
+    order.mods.retain(|m| {
+        !(m.source == ModSource::Nexus
+            && m.nexus_mod_id == mod_id
+            && m.nexus_file_id == file_id)
+    });
     let next_order = order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1;
     let staged = StagedMod {
         id: format!("{mod_id}_{file_id}"),
         name: name.to_string(),
+        source: ModSource::Nexus,
         nexus_mod_id: mod_id,
         nexus_file_id: file_id,
         version,
@@ -177,10 +234,135 @@ pub fn stage_mod(
         staging_path: staging.to_string_lossy().to_string(),
         enabled: true,
         order: next_order,
+        ts_namespace: None,
+        ts_name: None,
+        ts_package_uuid: None,
+        modio_game_id: None,
+        modio_mod_id: None,
+        modio_file_id: None,
     };
     order.mods.push(staged.clone());
     save_loadorder(paths, game_id, &order)?;
     Ok(staged)
+}
+
+pub fn stage_thunderstore_mod(
+    paths: &Paths,
+    game_id: &str,
+    community: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+    package_uuid: Option<String>,
+    display_name: &str,
+    archive: &Path,
+) -> Result<StagedMod> {
+    crate::config::ensure_game_dirs(paths, game_id)?;
+    let safe = sanitize_filename::sanitize(display_name);
+    let ns_safe = sanitize_filename::sanitize(namespace);
+    let name_safe = sanitize_filename::sanitize(name);
+    let ver_safe = sanitize_filename::sanitize(version);
+    let staging = paths
+        .mods_dir(game_id)
+        .join(format!("{safe}_{ns_safe}_{name_safe}_{ver_safe}"));
+    extract_archive(archive, &staging)?;
+
+    let mut order = load_loadorder(paths, game_id)?;
+    let id = format!("ts_{namespace}_{name}");
+    order.mods.retain(|m| m.id != id);
+    let next_order = order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1;
+    let staged = StagedMod {
+        id,
+        name: display_name.to_string(),
+        source: ModSource::Thunderstore,
+        nexus_mod_id: 0,
+        nexus_file_id: 0,
+        version: Some(version.to_string()),
+        domain: community.to_string(),
+        staging_path: staging.to_string_lossy().to_string(),
+        enabled: true,
+        order: next_order,
+        ts_namespace: Some(namespace.to_string()),
+        ts_name: Some(name.to_string()),
+        ts_package_uuid: package_uuid,
+        modio_game_id: None,
+        modio_mod_id: None,
+        modio_file_id: None,
+    };
+    order.mods.push(staged.clone());
+    save_loadorder(paths, game_id, &order)?;
+    Ok(staged)
+}
+
+pub fn stage_modio_mod(
+    paths: &Paths,
+    game_id: &str,
+    modio_game_id: u32,
+    modio_mod_id: u64,
+    modio_file_id: u64,
+    name: &str,
+    version: Option<String>,
+    archive: &Path,
+) -> Result<StagedMod> {
+    crate::config::ensure_game_dirs(paths, game_id)?;
+    let safe = sanitize_filename::sanitize(name);
+    let staging = paths.mods_dir(game_id).join(format!(
+        "{safe}_{modio_game_id}_{modio_mod_id}_{modio_file_id}"
+    ));
+    extract_archive(archive, &staging)?;
+
+    let mut order = load_loadorder(paths, game_id)?;
+    let id = format!("modio_{modio_game_id}_{modio_mod_id}_{modio_file_id}");
+    order.mods.retain(|m| {
+        !(m.source == ModSource::Modio
+            && m.modio_game_id == Some(modio_game_id)
+            && m.modio_mod_id == Some(modio_mod_id)
+            && m.modio_file_id == Some(modio_file_id))
+    });
+    let next_order = order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1;
+    let staged = StagedMod {
+        id,
+        name: name.to_string(),
+        source: ModSource::Modio,
+        nexus_mod_id: 0,
+        nexus_file_id: 0,
+        version,
+        domain: format!("modio:{modio_game_id}"),
+        staging_path: staging.to_string_lossy().to_string(),
+        enabled: true,
+        order: next_order,
+        ts_namespace: None,
+        ts_name: None,
+        ts_package_uuid: None,
+        modio_game_id: Some(modio_game_id),
+        modio_mod_id: Some(modio_mod_id),
+        modio_file_id: Some(modio_file_id),
+    };
+    order.mods.push(staged.clone());
+    save_loadorder(paths, game_id, &order)?;
+    Ok(staged)
+}
+
+/// True when a Thunderstore package (any version) is already staged.
+pub fn has_thunderstore_package(
+    paths: &Paths,
+    game_id: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<bool> {
+    let order = load_loadorder(paths, game_id)?;
+    Ok(order.mods.iter().any(|m| {
+        m.source == ModSource::Thunderstore
+            && m.ts_namespace.as_deref() == Some(namespace)
+            && m.ts_name.as_deref() == Some(name)
+    }))
+}
+
+pub fn has_modio_mod(paths: &Paths, game_id: &str, modio_mod_id: u64) -> Result<bool> {
+    let order = load_loadorder(paths, game_id)?;
+    Ok(order.mods.iter().any(|m| {
+        m.source == ModSource::Modio && m.modio_mod_id == Some(modio_mod_id)
+    }))
 }
 
 pub fn set_enabled(paths: &Paths, game_id: &str, mod_uid: &str, enabled: bool) -> Result<()> {
@@ -325,9 +507,14 @@ pub fn deploy(
     game_id: &str,
     plugin_id: &str,
     install_path: &Path,
+    project_name: Option<&str>,
 ) -> Result<DeployResult> {
     let plugin = plugin_by_id(plugin_id).context("unknown game plugin")?;
     let mut warnings = Vec::new();
+    let base_ctx = DeployContext {
+        project_name,
+        content_root: None,
+    };
 
     if !install_path.is_dir() {
         bail!(
@@ -337,7 +524,7 @@ pub fn deploy(
     }
 
     warnings.extend(plugin.prepare_deploy(install_path)?);
-    warnings.extend(plugin.preflight_warnings(install_path));
+    warnings.extend(plugin.preflight_warnings_ctx(install_path, &base_ctx));
 
     purge_deploy(paths, game_id)?;
 
@@ -374,8 +561,14 @@ pub fn deploy(
                 enabled_mod_folders.push(folder_name);
             }
         }
-        let (files, copied) =
-            deploy_tree(plugin, install_path, &root, &staged.name, &mut deployed)?;
+        let (files, copied) = deploy_tree(
+            plugin,
+            install_path,
+            &root,
+            &staged.name,
+            project_name,
+            &mut deployed,
+        )?;
         if files == 0 {
             warnings.push(format!("No files deployed from {}", staged.name));
         }
@@ -416,6 +609,7 @@ fn deploy_tree(
     install_path: &Path,
     content_root: &Path,
     mod_name: &str,
+    project_name: Option<&str>,
     deployed: &mut DeployManifest,
 ) -> Result<(usize, usize)> {
     let mut n = 0usize;
@@ -424,6 +618,10 @@ fn deploy_tree(
     let wrap = !to_root
         && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root));
     let folder_name = plugin.wrap_mod_folder_name(content_root, mod_name);
+    let ctx = DeployContext {
+        project_name,
+        content_root: Some(content_root),
+    };
 
     for entry in WalkDir::new(content_root)
         .into_iter()
@@ -443,7 +641,7 @@ fn deploy_tree(
         let dest = if to_root {
             install_path.join(&deploy_rel)
         } else {
-            plugin.resolve_deploy_root(install_path, &deploy_rel)?
+            plugin.resolve_deploy_root_ctx(install_path, &deploy_rel, &ctx)?
         };
         if entry.file_type().is_dir() {
             fs::create_dir_all(&dest)?;
@@ -507,11 +705,12 @@ mod tests {
                 staging_path: staging.to_string_lossy().into(),
                 enabled: true,
                 order: 1,
+                ..Default::default()
             }],
         };
         save_loadorder(&paths, game_id, &order).unwrap();
 
-        let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "warnings: {:?}", result.warnings);
         assert!(install.path().join("bin/x64/version.dll").exists());
         assert!(install.path().join("red4ext/RED4ext.dll").exists());
@@ -544,12 +743,13 @@ mod tests {
                     staging_path: staging.to_string_lossy().into(),
                     enabled: true,
                     order: 1,
+                    ..Default::default()
                 }],
             },
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert_eq!(result.file_count, 1, "{:?}", result.warnings);
         assert!(install.path().join("bin/x64/global.ini").exists());
     }
@@ -580,12 +780,13 @@ mod tests {
                     staging_path: staging.to_string_lossy().into(),
                     enabled: true,
                     order: 1,
+                    ..Default::default()
                 }],
             },
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install
             .path()
@@ -600,7 +801,7 @@ mod tests {
         let game_id = "cp_empty";
         let install = tempfile::tempdir().unwrap();
         save_loadorder(&paths, game_id, &LoadOrder::default()).unwrap();
-        let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert_eq!(result.file_count, 0);
         assert_eq!(result.enabled_mods, 0);
         assert!(!result.warnings.is_empty());
@@ -629,11 +830,12 @@ mod tests {
                         .into(),
                     enabled: true,
                     order: 1,
+                    ..Default::default()
                 }],
             },
         )
         .unwrap();
-        let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert_eq!(result.file_count, 0);
         assert!(result.warnings.iter().any(|w| w.contains("Missing staging")));
     }
@@ -664,12 +866,13 @@ mod tests {
                     staging_path: staging.to_string_lossy().into(),
                     enabled: true,
                     order: 1,
+                    ..Default::default()
                 }],
             },
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "cyberpunk2077", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("mods/MyRedMod/info.json").exists());
         assert!(!install.path().join("mods/Nexus REDmod Title").exists());
@@ -696,6 +899,7 @@ mod tests {
                     staging_path: staging.to_string_lossy().into(),
                     enabled: true,
                     order: 1,
+                    ..Default::default()
                 }],
             },
         )
@@ -716,7 +920,7 @@ mod tests {
         std::fs::write(inner.join("Cool.dll"), b"dll").unwrap();
         stage_stardew(&paths, game_id, "1_1", "Cool Mod", staging);
 
-        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "stardewvalley", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("Mods/CoolMod/manifest.json").exists());
         assert!(install.path().join("Mods/CoolMod/Cool.dll").exists());
@@ -740,7 +944,7 @@ mod tests {
         .unwrap();
         stage_stardew(&paths, game_id, "2_2", "Pack", staging);
 
-        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "stardewvalley", install.path(), None).unwrap();
         assert_eq!(result.file_count, 1, "{:?}", result.warnings);
         assert!(install.path().join("Mods/CoolMod/manifest.json").exists());
         assert!(!install
@@ -764,7 +968,7 @@ mod tests {
         }
         stage_stardew(&paths, game_id, "3_3", "Bundle", staging);
 
-        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "stardewvalley", install.path(), None).unwrap();
         assert_eq!(result.file_count, 2, "{:?}", result.warnings);
         assert!(install.path().join("Mods/ModA/manifest.json").exists());
         assert!(install.path().join("Mods/ModB/manifest.json").exists());
@@ -781,7 +985,7 @@ mod tests {
         std::fs::write(staging.join("manifest.json"), "{}").unwrap();
         stage_stardew(&paths, game_id, "4_4", "M", staging);
 
-        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "stardewvalley", install.path(), None).unwrap();
         assert!(result
             .warnings
             .iter()
@@ -802,7 +1006,7 @@ mod tests {
         std::fs::write(inner.join("smapi-internal").join("config.json"), b"{}").unwrap();
         stage_stardew(&paths, game_id, "5_5", "SMAPI", staging);
 
-        let result = deploy(&paths, game_id, "stardewvalley", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "stardewvalley", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("StardewModdingAPI.exe").exists());
         assert!(install.path().join("smapi-internal/config.json").exists());
@@ -858,6 +1062,7 @@ mod tests {
                         staging_path: holy_light_staging.to_string_lossy().into(),
                         enabled: true,
                         order: 1,
+                        ..Default::default()
                     },
                     StagedMod {
                         id: "2_2".into(),
@@ -869,6 +1074,7 @@ mod tests {
                         staging_path: dmf_staging.to_string_lossy().into(),
                         enabled: true,
                         order: 2,
+                        ..Default::default()
                     },
                     StagedMod {
                         id: "3_3".into(),
@@ -880,13 +1086,14 @@ mod tests {
                         staging_path: health_staging.to_string_lossy().into(),
                         enabled: false,
                         order: 3,
+                        ..Default::default()
                     },
                 ],
             },
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("mods/HolyLight/HolyLight.mod").exists());
         assert!(!install.path().join("mods/Holy Light").exists());
@@ -937,12 +1144,13 @@ mod tests {
                     staging_path: staging.to_string_lossy().into(),
                     enabled: true,
                     order: 1,
+                    ..Default::default()
                 }],
             },
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path()).unwrap();
+        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path(), None).unwrap();
         assert!(result.file_count >= 3, "{:?}", result.warnings);
         assert!(install.path().join("tools/dtkit-patch.exe").exists());
         assert!(install.path().join("binaries/mod_loader").exists());

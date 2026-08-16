@@ -15,6 +15,8 @@ import { RichText } from "./RichText";
 import type {
   BrowseMeta,
   BrowseSearchOpts,
+  CatalogHit,
+  CatalogSuggestion,
   CollectionDetail,
   CollectionHit,
   CollectionModFile,
@@ -24,11 +26,13 @@ import type {
   ManagedGame,
   ModDetail,
   ModFileInfo,
-  ModSearchHit,
   Settings,
   StagedMod,
   TagFilterState,
   ThemePreference,
+  TsPackageDetail,
+  ModioModDetail,
+  ModioFileInfo,
 } from "./types";
 import "./App.css";
 
@@ -37,6 +41,7 @@ type ViewMode = "list" | "grid";
 type DetailTab = "info" | "files";
 type GameDetailTab = "info" | "mods";
 type BrowseTagMap = Record<string, TagFilterState>;
+type CatalogSourceFilter = "all" | "nexus" | "thunderstore" | "modio";
 
 type StatusNotice = {
   kind: "ok" | "warn";
@@ -44,7 +49,7 @@ type StatusNotice = {
 };
 
 type BrowseDetail =
-  | { kind: "mod"; hit: ModSearchHit; tab: DetailTab }
+  | { kind: "mod"; hit: CatalogHit; tab: DetailTab }
   | { kind: "collection"; hit: CollectionHit; tab: DetailTab };
 
 /** Cycle: unset → include → exclude → unset */
@@ -353,9 +358,10 @@ function App() {
   const [mods, setMods] = useState<StagedMod[]>([]);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [modHits, setModHits] = useState<ModSearchHit[]>([]);
+  const [modHits, setModHits] = useState<CatalogHit[]>([]);
   const [collectionHits, setCollectionHits] = useState<CollectionHit[]>([]);
   const [browseMode, setBrowseMode] = useState<"mods" | "collections">("mods");
+  const [sourceFilter, setSourceFilter] = useState<CatalogSourceFilter>("all");
   const [libraryView, setLibraryView] = useState<ViewMode>("grid");
   const [browseView, setBrowseView] = useState<ViewMode>("grid");
   const [browseSort, setBrowseSort] = useState("endorsements");
@@ -375,7 +381,13 @@ function App() {
   } | null>(null);
   const [gameInfo, setGameInfo] = useState<GameInfo | null>(null);
   const [modDetail, setModDetail] = useState<ModDetail | null>(null);
+  const [tsDetail, setTsDetail] = useState<TsPackageDetail | null>(null);
+  const [tsVersion, setTsVersion] = useState("");
+  const [modioDetail, setModioDetail] = useState<ModioModDetail | null>(null);
+  const [modioFiles, setModioFiles] = useState<ModioFileInfo[]>([]);
   const [modFiles, setModFiles] = useState<ModFileInfo[]>([]);
+  const [modioKeyInput, setModioKeyInput] = useState("");
+  const [modioGameIdEdit, setModioGameIdEdit] = useState("");
   const [collectionModFiles, setCollectionModFiles] = useState<CollectionModFile[]>([]);
   const [collectionDetail, setCollectionDetail] = useState<CollectionDetail | null>(null);
   const [includeOptional, setIncludeOptional] = useState(false);
@@ -383,6 +395,22 @@ function App() {
   const [activeBatch, setActiveBatch] = useState<ActiveDownloadBatch | null>(null);
   const [assistHint, setAssistHint] = useState<string | null>(null);
   const [assistActive, setAssistActive] = useState(false);
+  const [unrealManage, setUnrealManage] = useState<DetectedGame | null>(null);
+  const [unrealDomain, setUnrealDomain] = useState("");
+  const [unrealCommunity, setUnrealCommunity] = useState("");
+  const [unrealModioId, setUnrealModioId] = useState("");
+  const [unrealProject, setUnrealProject] = useState("");
+  const [bepinexManage, setBepinexManage] = useState<DetectedGame | null>(null);
+  const [bepinexDomain, setBepinexDomain] = useState("");
+  const [bepinexCommunity, setBepinexCommunity] = useState("");
+  const [bepinexModioId, setBepinexModioId] = useState("");
+  const [catalogHints, setCatalogHints] = useState<CatalogSuggestion | null>(
+    null,
+  );
+  const catalogSuggestGen = useRef(0);
+  const [ueProjectEdit, setUeProjectEdit] = useState("");
+  const [ueDomainEdit, setUeDomainEdit] = useState("");
+  const [tsCommunityEdit, setTsCommunityEdit] = useState("");
   const assistQueueRef = useRef<AssistQueueState | null>(null);
   const activeBatchRef = useRef<ActiveDownloadBatch | null>(null);
   activeBatchRef.current = activeBatch;
@@ -520,13 +548,17 @@ function App() {
 
   useEffect(() => {
     if (!activeGame || tab !== "browse") return;
+    if (!activeGame.nexus_domain) {
+      setBrowseMeta(null);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
         const meta = await api.browseMeta(activeGame.nexus_domain);
         if (!cancelled) setBrowseMeta(meta);
       } catch (e) {
-        if (!cancelled) setError(String(e));
+        if (!cancelled) setBrowseMeta(null);
       }
     })();
     return () => {
@@ -1222,8 +1254,21 @@ function App() {
     });
   }
 
+  async function saveModioApiKey() {
+    await withBusy("Validating mod.io API key…", async () => {
+      await api.setModioApiKey(modioKeyInput);
+      setModioKeyInput("");
+      await refreshSettings();
+      setNotice({ kind: "ok", message: "mod.io API key saved." });
+    });
+  }
+
   async function manage(game: DetectedGame) {
-    if (!game.supported || !game.plugin_id || !game.nexus_domain || !game.install_path) {
+    if (!game.supported || !game.plugin_id || !game.install_path) {
+      setError("This game is not supported yet.");
+      return;
+    }
+    if (!game.nexus_domain && game.engine_hint !== "bepinex") {
       setError("This game is not supported yet.");
       return;
     }
@@ -1231,7 +1276,7 @@ function App() {
       await api.manageGame({
         id: game.id,
         title: game.title,
-        nexusDomain: game.nexus_domain!,
+        nexusDomain: game.nexus_domain ?? "",
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: game.plugin_id!,
@@ -1244,6 +1289,183 @@ function App() {
       } else {
         setActiveId(game.id);
       }
+    });
+  }
+
+  function beginUnrealManage(game: DetectedGame) {
+    if (!game.install_path) {
+      setError("Install path is required to manage this Unreal game.");
+      return;
+    }
+    setError(null);
+    setBepinexManage(null);
+    setUnrealManage(game);
+    setUnrealDomain("");
+    setUnrealCommunity("");
+    setUnrealModioId("");
+    setUnrealProject("");
+    setCatalogHints(null);
+    void api.detectUeLayout(game.install_path).then((layout) => {
+      if (layout?.project_name) {
+        setUnrealProject(layout.project_name);
+      }
+    });
+    const gen = ++catalogSuggestGen.current;
+    void withBusy("Looking up catalogs…", async () => {
+      try {
+        const s = await api.suggestCatalogIds(game.title);
+        if (catalogSuggestGen.current !== gen) {
+          return;
+        }
+        if (s.nexus_domain) {
+          setUnrealDomain(s.nexus_domain);
+        }
+        if (s.thunderstore_community) {
+          setUnrealCommunity(s.thunderstore_community);
+        }
+        if (s.modio_game_id != null) {
+          setUnrealModioId(String(s.modio_game_id));
+        }
+        setCatalogHints(s);
+      } catch {
+        // Leave fields empty for manual entry.
+      }
+    });
+  }
+
+  function beginBepinexManage(game: DetectedGame) {
+    if (!game.install_path) {
+      setError("Install path is required to manage this Unity game.");
+      return;
+    }
+    setError(null);
+    setUnrealManage(null);
+    setBepinexManage(game);
+    setBepinexDomain(game.nexus_domain ?? "");
+    setBepinexCommunity("");
+    setBepinexModioId("");
+    setCatalogHints(null);
+    const gen = ++catalogSuggestGen.current;
+    void withBusy("Looking up catalogs…", async () => {
+      try {
+        const s = await api.suggestCatalogIds(game.title);
+        if (catalogSuggestGen.current !== gen) {
+          return;
+        }
+        if (s.nexus_domain) {
+          setBepinexDomain(s.nexus_domain);
+        } else if (!game.nexus_domain) {
+          setBepinexDomain("");
+        }
+        if (s.thunderstore_community) {
+          setBepinexCommunity(s.thunderstore_community);
+        }
+        if (s.modio_game_id != null) {
+          setBepinexModioId(String(s.modio_game_id));
+        }
+        setCatalogHints(s);
+      } catch {
+        // Leave fields empty for manual entry.
+      }
+    });
+  }
+
+  async function confirmUnrealManage() {
+    const game = unrealManage;
+    if (!game?.install_path) {
+      return;
+    }
+    const domain = unrealDomain.trim().toLowerCase().replace(/\s+/g, "");
+    const community = unrealCommunity.trim().toLowerCase();
+    const midRaw = unrealModioId.trim();
+    const modioGameId = midRaw ? Number.parseInt(midRaw, 10) : 0;
+    if (!domain && !community && !(Number.isFinite(modioGameId) && modioGameId > 0)) {
+      setError(
+        "Enter a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.",
+      );
+      return;
+    }
+    await withBusy(`Managing ${game.title}…`, async () => {
+      await api.manageGame({
+        id: game.id,
+        title: game.title,
+        nexusDomain: domain,
+        installPath: game.install_path!,
+        launcher: game.launcher,
+        pluginId: "unreal",
+        coverPath: game.cover_path,
+        projectName: unrealProject.trim() || null,
+        thunderstoreCommunity: community || null,
+        modioGameId: Number.isFinite(modioGameId) && modioGameId > 0 ? modioGameId : null,
+      });
+      setUnrealManage(null);
+      setCatalogHints(null);
+      const list = await refreshManaged();
+      const managedGame = list.find((g) => g.id === game.id);
+      if (managedGame) {
+        await openGame(managedGame, "mods");
+      } else {
+        setActiveId(game.id);
+      }
+    });
+  }
+
+  async function confirmBepinexManage() {
+    const game = bepinexManage;
+    if (!game?.install_path) {
+      return;
+    }
+    const domain = bepinexDomain.trim().toLowerCase().replace(/\s+/g, "");
+    const community = bepinexCommunity.trim().toLowerCase();
+    const midRaw = bepinexModioId.trim();
+    const modioGameId = midRaw ? Number.parseInt(midRaw, 10) : 0;
+    if (!domain && !community && !(Number.isFinite(modioGameId) && modioGameId > 0)) {
+      setError(
+        "Enter a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.",
+      );
+      return;
+    }
+    await withBusy(`Managing ${game.title}…`, async () => {
+      await api.manageGame({
+        id: game.id,
+        title: game.title,
+        nexusDomain: domain,
+        installPath: game.install_path!,
+        launcher: game.launcher,
+        pluginId: "bepinex",
+        coverPath: game.cover_path,
+        thunderstoreCommunity: community || null,
+        modioGameId: Number.isFinite(modioGameId) && modioGameId > 0 ? modioGameId : null,
+      });
+      setBepinexManage(null);
+      setCatalogHints(null);
+      const list = await refreshManaged();
+      const managedGame = list.find((g) => g.id === game.id);
+      if (managedGame) {
+        await openGame(managedGame, "mods");
+      } else {
+        setActiveId(game.id);
+      }
+    });
+  }
+
+  async function saveUeGameSettings() {
+    if (!libraryDetail) {
+      return;
+    }
+    await withBusy("Saving game settings…", async () => {
+      const midRaw = modioGameIdEdit.trim();
+      const modioGameId = midRaw ? Number.parseInt(midRaw, 10) : 0;
+      const updated = await api.updateManagedGame({
+        id: libraryDetail.game.id,
+        nexusDomain: ueDomainEdit.trim() || null,
+        projectName: ueProjectEdit.trim(),
+        thunderstoreCommunity: tsCommunityEdit.trim() || null,
+        modioGameId: Number.isFinite(modioGameId) ? modioGameId : 0,
+      });
+      setLibraryDetail({ ...libraryDetail, game: updated });
+      await refreshManaged();
+      setNotice({ kind: "ok", message: "Game settings saved." });
     });
   }
 
@@ -1260,6 +1482,12 @@ function App() {
   }, [browseSort, browseCategory, browseTags, browseVersion]);
 
   browseOptsRef.current = browseOpts;
+
+  useEffect(() => {
+    if (tab !== "browse" || browseMode !== "mods" || !browseSearched) return;
+    void runSearch("mods", searchQuery, { ...browseOpts, offset: 0 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceFilter]);
 
   const activeTagCount = useMemo(
     () => Object.keys(browseTags).length,
@@ -1293,6 +1521,19 @@ function App() {
       setError("Manage a game first.");
       return;
     }
+    const hasNexus = Boolean(activeGame.nexus_domain);
+    const hasTs = Boolean(activeGame.thunderstore_community);
+    const hasModio = Boolean(activeGame.modio_game_id);
+    if (mode === "collections" && !hasNexus) {
+      setError("Collections require a Nexus Mods domain for this game.");
+      return;
+    }
+    if (mode === "mods" && !hasNexus && !hasTs && !hasModio) {
+      setError(
+        "Set a Nexus domain, Thunderstore community, and/or mod.io game ID for this game.",
+      );
+      return;
+    }
     if (append) {
       if (
         browseLoadingMoreRef.current ||
@@ -1309,10 +1550,39 @@ function App() {
     const requestOpts: BrowseSearchOpts = { ...opts, offset };
     let appendOk = false;
 
-    const applyPage = (
-      items: ModSearchHit[] | CollectionHit[],
+    const applyModPage = (
+      items: CatalogHit[],
       totalCount: number,
-      merge: "mods" | "collections" | "replace-mods" | "replace-collections",
+      hasMore: boolean,
+      nextOffset: number,
+      merge: "replace" | "append",
+    ) => {
+      browseNextOffsetRef.current = nextOffset;
+      browseHasMoreRef.current = hasMore;
+      setBrowseHasMore(hasMore);
+      setBrowseTotalCount(totalCount);
+      if (merge === "replace") {
+        setModHits(items);
+        setBrowseSearched(true);
+      } else {
+        setModHits((prev) => {
+          const seen = new Set(prev.map((m) => m.id));
+          const merged = [...prev];
+          for (const item of items) {
+            if (!seen.has(item.id)) {
+              seen.add(item.id);
+              merged.push(item);
+            }
+          }
+          return merged;
+        });
+      }
+    };
+
+    const applyCollectionPage = (
+      items: CollectionHit[],
+      totalCount: number,
+      merge: "replace" | "append",
     ) => {
       const nextOffset = offset + items.length;
       browseNextOffsetRef.current = nextOffset;
@@ -1320,30 +1590,14 @@ function App() {
       browseHasMoreRef.current = hasMore;
       setBrowseHasMore(hasMore);
       setBrowseTotalCount(totalCount);
-
-      if (merge === "replace-mods") {
-        setModHits(items as ModSearchHit[]);
+      if (merge === "replace") {
+        setCollectionHits(items);
         setBrowseSearched(true);
-      } else if (merge === "replace-collections") {
-        setCollectionHits(items as CollectionHit[]);
-        setBrowseSearched(true);
-      } else if (merge === "mods") {
-        setModHits((prev) => {
-          const seen = new Set(prev.map((m) => m.mod_id));
-          const merged = [...prev];
-          for (const item of items as ModSearchHit[]) {
-            if (!seen.has(item.mod_id)) {
-              seen.add(item.mod_id);
-              merged.push(item);
-            }
-          }
-          return merged;
-        });
       } else {
         setCollectionHits((prev) => {
           const seen = new Set(prev.map((c) => c.slug));
           const merged = [...prev];
-          for (const item of items as CollectionHit[]) {
+          for (const item of items) {
             if (!seen.has(item.slug)) {
               seen.add(item.slug);
               merged.push(item);
@@ -1358,33 +1612,46 @@ function App() {
       if (!append) {
         browseNextOffsetRef.current = 0;
         browseAppendFailedRef.current = false;
-        await withBusy("Searching Nexus…", async () => {
-          if (mode === "mods") {
-            const page = await api.searchMods(
-              activeGame.nexus_domain,
-              query,
-              requestOpts,
-            );
-            if (requestId !== browseRequestIdRef.current) return;
-            applyPage(page.items, page.total_count, "replace-mods");
-          } else {
-            const page = await api.searchCollections(
-              activeGame.nexus_domain,
-              query,
-              requestOpts,
-            );
-            if (requestId !== browseRequestIdRef.current) return;
-            applyPage(page.items, page.total_count, "replace-collections");
-          }
-        });
-      } else if (mode === "mods") {
-        const page = await api.searchMods(
-          activeGame.nexus_domain,
-          query,
-          requestOpts,
+        await withBusy(
+          mode === "mods" ? "Searching mods…" : "Searching Nexus…",
+          async () => {
+            if (mode === "mods") {
+              const page = await api.searchCatalog(activeGame.id, query, {
+                ...requestOpts,
+                sourceFilter,
+              });
+              if (requestId !== browseRequestIdRef.current) return;
+              applyModPage(
+                page.items,
+                page.total_count,
+                page.has_more,
+                page.next_offset,
+                "replace",
+              );
+            } else {
+              const page = await api.searchCollections(
+                activeGame.nexus_domain,
+                query,
+                requestOpts,
+              );
+              if (requestId !== browseRequestIdRef.current) return;
+              applyCollectionPage(page.items, page.total_count, "replace");
+            }
+          },
         );
+      } else if (mode === "mods") {
+        const page = await api.searchCatalog(activeGame.id, query, {
+          ...requestOpts,
+          sourceFilter,
+        });
         if (requestId !== browseRequestIdRef.current) return;
-        applyPage(page.items, page.total_count, "mods");
+        applyModPage(
+          page.items,
+          page.total_count,
+          page.has_more,
+          page.next_offset,
+          "append",
+        );
         appendOk = true;
         browseAppendFailedRef.current = false;
       } else {
@@ -1394,7 +1661,7 @@ function App() {
           requestOpts,
         );
         if (requestId !== browseRequestIdRef.current) return;
-        applyPage(page.items, page.total_count, "collections");
+        applyCollectionPage(page.items, page.total_count, "append");
         appendOk = true;
         browseAppendFailedRef.current = false;
       }
@@ -1475,20 +1742,53 @@ function App() {
     });
   }
 
-  async function openMod(hit: ModSearchHit, detailTab: DetailTab = "info") {
+  async function openMod(hit: CatalogHit, detailTab: DetailTab = "info") {
     if (!activeGame) return;
     setBrowseDetail({ kind: "mod", hit, tab: detailTab });
     setModDetail(null);
+    setTsDetail(null);
+    setTsVersion("");
     setCollectionModFiles([]);
     setCollectionDetail(null);
+    setModioDetail(null);
+    setModioFiles([]);
+    if (hit.source === "thunderstore") {
+      if (!hit.community || !hit.namespace || !hit.package_name) return;
+      await withBusy("Loading package…", async () => {
+        const detail = await api.getThunderstorePackage(
+          hit.community!,
+          hit.namespace!,
+          hit.package_name!,
+        );
+        setTsDetail(detail);
+        setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+      });
+      return;
+    }
+    if (hit.source === "modio") {
+      if (hit.modio_game_id == null || hit.modio_mod_id == null) return;
+      await withBusy("Loading mod.io mod…", async () => {
+        const detail = await api.getModioMod(hit.modio_game_id!, hit.modio_mod_id!);
+        setModioDetail(detail);
+        if (detailTab === "files") {
+          setModioFiles(
+            await api.modioFiles(hit.modio_game_id!, hit.modio_mod_id!),
+          );
+        }
+      });
+      return;
+    }
+    const domain = hit.domain_name || activeGame.nexus_domain;
+    const modId = hit.mod_id;
+    if (!modId) return;
     if (detailTab === "files") {
       setModFiles([]);
       await withBusy("Loading files…", async () => {
-        setModFiles(await api.modFiles(hit.domain_name || activeGame.nexus_domain, hit.mod_id));
+        setModFiles(await api.modFiles(domain, modId));
       });
     } else {
       await withBusy("Loading mod…", async () => {
-        setModDetail(await api.getMod(hit.domain_name || activeGame.nexus_domain, hit.mod_id));
+        setModDetail(await api.getMod(domain, modId));
       });
     }
   }
@@ -1522,21 +1822,61 @@ function App() {
     const next = { ...browseDetail, tab: detailTab };
     setBrowseDetail(next);
     if (next.kind === "mod") {
-      if (detailTab === "files" && modFiles.length === 0) {
+      if (next.hit.source === "thunderstore") {
+        if (!tsDetail && next.hit.community && next.hit.namespace && next.hit.package_name) {
+          await withBusy("Loading package…", async () => {
+            const detail = await api.getThunderstorePackage(
+              next.hit.community!,
+              next.hit.namespace!,
+              next.hit.package_name!,
+            );
+            setTsDetail(detail);
+            setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+          });
+        }
+      } else if (next.hit.source === "modio") {
+        if (
+          next.hit.modio_game_id != null &&
+          next.hit.modio_mod_id != null &&
+          (!modioDetail || (detailTab === "files" && modioFiles.length === 0))
+        ) {
+          await withBusy(
+            detailTab === "files" ? "Loading files…" : "Loading mod.io mod…",
+            async () => {
+              if (!modioDetail) {
+                setModioDetail(
+                  await api.getModioMod(
+                    next.hit.modio_game_id!,
+                    next.hit.modio_mod_id!,
+                  ),
+                );
+              }
+              if (detailTab === "files" && modioFiles.length === 0) {
+                setModioFiles(
+                  await api.modioFiles(
+                    next.hit.modio_game_id!,
+                    next.hit.modio_mod_id!,
+                  ),
+                );
+              }
+            },
+          );
+        }
+      } else if (detailTab === "files" && modFiles.length === 0 && next.hit.mod_id) {
         await withBusy("Loading files…", async () => {
           setModFiles(
             await api.modFiles(
               next.hit.domain_name || activeGame.nexus_domain,
-              next.hit.mod_id,
+              next.hit.mod_id!,
             ),
           );
         });
-      } else if (detailTab === "info" && !modDetail) {
+      } else if (detailTab === "info" && !modDetail && next.hit.mod_id) {
         await withBusy("Loading mod…", async () => {
           setModDetail(
             await api.getMod(
               next.hit.domain_name || activeGame.nexus_domain,
-              next.hit.mod_id,
+              next.hit.mod_id!,
             ),
           );
         });
@@ -1565,6 +1905,10 @@ function App() {
   function closeBrowseDetail() {
     setBrowseDetail(null);
     setModDetail(null);
+    setTsDetail(null);
+    setTsVersion("");
+    setModioDetail(null);
+    setModioFiles([]);
     setModFiles([]);
     setCollectionModFiles([]);
     setCollectionDetail(null);
@@ -1574,12 +1918,50 @@ function App() {
     await api.setActiveGame(game.id);
     setActiveId(game.id);
     setLibraryDetail({ game, tab: detailTab });
+    setUeDomainEdit(game.nexus_domain);
+    setUeProjectEdit(game.project_name ?? "");
+    setTsCommunityEdit(game.thunderstore_community ?? "");
+    setModioGameIdEdit(
+      game.modio_game_id != null && game.modio_game_id > 0
+        ? String(game.modio_game_id)
+        : "",
+    );
     setTab("library");
     setGameInfo(null);
+    if (game.nexus_domain) {
+      try {
+        setGameInfo(await api.getGame(game.nexus_domain));
+      } catch {
+        /* Nexus metadata is optional for local game info */
+      }
+    }
+  }
+
+  async function installThunderstorePackage() {
+    if (!activeGame || browseDetail?.kind !== "mod") return;
+    const hit = browseDetail.hit;
+    if (hit.source !== "thunderstore" || !hit.community || !hit.namespace || !hit.package_name) {
+      return;
+    }
+    setTab("downloads");
+    setBusy(`Installing ${hit.name}…`);
+    setError(null);
     try {
-      setGameInfo(await api.getGame(game.nexus_domain));
-    } catch {
-      /* Nexus metadata is optional for local game info */
+      await api.downloadThunderstoreMod({
+        gameId: activeGame.id,
+        community: hit.community,
+        namespace: hit.namespace,
+        name: hit.package_name,
+        version: tsVersion || null,
+      });
+      await refreshMods(activeGame.id);
+      await refreshDownloads();
+      setNotice({ kind: "ok", message: `Installed ${hit.name} (with dependencies).` });
+    } catch (e) {
+      setError(String(e));
+      await refreshDownloads();
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -1592,9 +1974,41 @@ function App() {
     setGameInfo(null);
   }
 
+  async function installModioFile(fileId?: number | null, version?: string | null) {
+    if (!activeGame || browseDetail?.kind !== "mod") return;
+    const hit = browseDetail.hit;
+    if (hit.source !== "modio" || hit.modio_game_id == null || hit.modio_mod_id == null) {
+      return;
+    }
+    setTab("downloads");
+    setBusy(`Installing ${hit.name}…`);
+    setError(null);
+    try {
+      await api.downloadModioMod({
+        gameId: activeGame.id,
+        modioGameId: hit.modio_game_id,
+        modId: hit.modio_mod_id,
+        fileId: fileId ?? null,
+        name: hit.name,
+        version: version ?? null,
+        installDeps: true,
+      });
+      await refreshMods(activeGame.id);
+      await refreshDownloads();
+      setNotice({ kind: "ok", message: `Installed ${hit.name}.` });
+    } catch (e) {
+      setError(String(e));
+      await refreshDownloads();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+
   async function installFile(file: ModFileInfo) {
     if (!activeGame || browseDetail?.kind !== "mod") return;
     const selectedMod = browseDetail.hit;
+    if (selectedMod.source !== "nexus" || selectedMod.mod_id == null) return;
     const domain = selectedMod.domain_name || activeGame.nexus_domain;
     const name = selectedMod.name;
     setTab("downloads");
@@ -1782,9 +2196,9 @@ function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">N</span>
+          <span className="brand-mark">E</span>
           <div>
-            <strong>Nexus Manager</strong>
+            <strong>Emperor Mod Manager</strong>
             <small>MVP+</small>
           </div>
         </div>
@@ -1916,7 +2330,49 @@ function App() {
                   })
                 }
               >
-                Clear API key
+                Clear Nexus API key
+              </button>
+            )}
+            <h2 style={{ marginTop: "1.5rem" }}>mod.io</h2>
+            <p>
+              Optional read-only API key from{" "}
+              <a
+                href="https://mod.io/me/access"
+                target="_blank"
+                rel="noreferrer"
+              >
+                mod.io → Access
+              </a>
+              . Used to browse and download mods for games with a mod.io game ID.
+              OAuth, uploads, and ratings are not supported.
+            </p>
+            {settings?.has_modio_api_key && (
+              <div className="status-card">
+                <span className="pill ok">mod.io API key saved</span>
+              </div>
+            )}
+            <div className="row">
+              <input
+                type="password"
+                placeholder="mod.io API key"
+                value={modioKeyInput}
+                onChange={(e) => setModioKeyInput(e.target.value)}
+              />
+              <button onClick={saveModioApiKey} disabled={!modioKeyInput.trim()}>
+                Save & validate
+              </button>
+            </div>
+            {settings?.has_modio_api_key && (
+              <button
+                className="danger"
+                onClick={() =>
+                  withBusy("Clearing mod.io key…", async () => {
+                    await api.clearModioApiKey();
+                    await refreshSettings();
+                  })
+                }
+              >
+                Clear mod.io API key
               </button>
             )}
           </section>
@@ -2034,12 +2490,31 @@ function App() {
                     <dl className="meta">
                       <dt>Launcher</dt>
                       <dd>{libraryDetail.game.launcher}</dd>
-                      <dt>Domain</dt>
-                      <dd>{libraryDetail.game.nexus_domain}</dd>
+                      <dt>Nexus domain</dt>
+                      <dd>{libraryDetail.game.nexus_domain || "—"}</dd>
+                      {libraryDetail.game.thunderstore_community && (
+                        <>
+                          <dt>Thunderstore</dt>
+                          <dd>{libraryDetail.game.thunderstore_community}</dd>
+                        </>
+                      )}
+                      {libraryDetail.game.modio_game_id != null &&
+                        libraryDetail.game.modio_game_id > 0 && (
+                        <>
+                          <dt>mod.io game ID</dt>
+                          <dd>{libraryDetail.game.modio_game_id}</dd>
+                        </>
+                      )}
                       <dt>Install</dt>
                       <dd>{libraryDetail.game.install_path}</dd>
                       <dt>Plugin</dt>
                       <dd>{libraryDetail.game.plugin_id}</dd>
+                      {libraryDetail.game.project_name && (
+                        <>
+                          <dt>UE project</dt>
+                          <dd>{libraryDetail.game.project_name}</dd>
+                        </>
+                      )}
                       {gameInfo?.genre && (
                         <>
                           <dt>Genre</dt>
@@ -2065,6 +2540,55 @@ function App() {
                         </>
                       )}
                     </dl>
+                    <div className="panel" style={{ marginTop: "1rem" }}>
+                        <h3>Catalog & deploy settings</h3>
+                        <p className="note">
+                          Override Nexus domain, Thunderstore community, mod.io game ID,
+                          or Unreal project folder when auto-detect is wrong. At least one
+                          catalog source is required to browse.
+                        </p>
+                        <label>
+                          Nexus domain
+                          <input
+                            value={ueDomainEdit}
+                            onChange={(e) => setUeDomainEdit(e.target.value)}
+                            placeholder="optional if Thunderstore/mod.io only"
+                          />
+                        </label>
+                        <label>
+                          Thunderstore community
+                          <input
+                            value={tsCommunityEdit}
+                            onChange={(e) => setTsCommunityEdit(e.target.value)}
+                            placeholder="e.g. lethal-company, valheim"
+                          />
+                        </label>
+                        <label>
+                          mod.io game ID
+                          <input
+                            value={modioGameIdEdit}
+                            onChange={(e) => setModioGameIdEdit(e.target.value)}
+                            placeholder="numeric id from mod.io"
+                            inputMode="numeric"
+                          />
+                        </label>
+                        {(libraryDetail.game.plugin_id === "unreal" ||
+                          libraryDetail.game.plugin_id === "stalker2heartofchornobyl" ||
+                          libraryDetail.game.plugin_id === "palworld" ||
+                          libraryDetail.game.plugin_id === "hogwartslegacy") && (
+                          <label>
+                            Project folder
+                            <input
+                              value={ueProjectEdit}
+                              onChange={(e) => setUeProjectEdit(e.target.value)}
+                              placeholder="e.g. Pal, Phoenix, Stalker2"
+                            />
+                          </label>
+                        )}
+                        <button type="button" onClick={() => void saveUeGameSettings()}>
+                          Save
+                        </button>
+                      </div>
                   </div>
                 ) : (
                   <div className="detail-body">
@@ -2080,7 +2604,11 @@ function App() {
                             <div>
                               <strong>{m.name}</strong>
                               <small>
-                                #{m.nexus_mod_id} · file {m.nexus_file_id}
+                                {m.source === "thunderstore"
+                                  ? `Thunderstore · ${m.ts_namespace ?? "?"}-${m.ts_name ?? "?"}`
+                                  : m.source === "modio"
+                                    ? `mod.io · game ${m.modio_game_id ?? "?"} · mod ${m.modio_mod_id ?? "?"} · file ${m.modio_file_id ?? "?"}`
+                                    : `#${m.nexus_mod_id} · file ${m.nexus_file_id}`}
                                 {m.version ? ` · v${m.version}` : ""}
                               </small>
                             </div>
@@ -2111,7 +2639,7 @@ function App() {
                         </li>
                       ))}
                       {mods.length === 0 && (
-                        <li className="empty">No staged mods. Browse Nexus to install some.</li>
+                        <li className="empty">No staged mods. Browse mods to install some.</li>
                       )}
                     </ul>
                   </div>
@@ -2140,12 +2668,154 @@ function App() {
                   </div>
                 </div>
                 <p>
-                  Supported plugins: Stardew Valley, Baldur&apos;s Gate 3, Cyberpunk
-                  2077, Days Gone, S.T.A.L.K.E.R. 2: Heart of Chornobyl, Warhammer
-                  40,000: Darktide, Dark Souls, Dark Souls Remastered, Dark Souls 2,
-                  Dark Souls 3, Elden Ring, Resident Evil 7, Village, Requiem, 2/3/4
-                  Remake. Other unmanaged games appear as unsupported.
+                  Supported plugins include Stardew Valley, Baldur&apos;s Gate 3,
+                  Cyberpunk 2077, Days Gone, S.T.A.L.K.E.R. 2, Palworld, Hogwarts
+                  Legacy, Darktide, FromSoftware and Resident Evil titles, seeded
+                  Unity/BepInEx games (Lethal Company, Valheim, Risk of Rain 2, and
+                  more), plus generic Unreal and BepInEx pipelines. Browse can merge
+                  Nexus, Thunderstore, and mod.io when each source is configured.
                 </p>
+                {unrealManage && (
+                  <div className="panel unreal-manage-panel">
+                    <h2>Add as Unreal Engine game</h2>
+                    <p>
+                      <strong>{unrealManage.title}</strong> looks like an Unreal
+                      install. Catalog IDs are suggested from the game title when
+                      possible — edit them if needed, then confirm the project
+                      folder.
+                    </p>
+                    <label>
+                      Nexus domain (optional)
+                      <input
+                        value={unrealDomain}
+                        onChange={(e) => setUnrealDomain(e.target.value)}
+                        placeholder="e.g. palworld"
+                        autoFocus
+                      />
+                      {catalogHints?.nexus_name ? (
+                        <span className="field-hint">
+                          Matched: {catalogHints.nexus_name}
+                        </span>
+                      ) : null}
+                    </label>
+                    <label>
+                      Thunderstore community (optional)
+                      <input
+                        value={unrealCommunity}
+                        onChange={(e) => setUnrealCommunity(e.target.value)}
+                        placeholder="e.g. palworld"
+                      />
+                      {catalogHints?.thunderstore_name ? (
+                        <span className="field-hint">
+                          Matched: {catalogHints.thunderstore_name}
+                        </span>
+                      ) : null}
+                    </label>
+                    <label>
+                      mod.io game ID (optional)
+                      <input
+                        value={unrealModioId}
+                        onChange={(e) => setUnrealModioId(e.target.value)}
+                        placeholder="e.g. 1234"
+                        inputMode="numeric"
+                      />
+                      {catalogHints?.modio_name ? (
+                        <span className="field-hint">
+                          Matched: {catalogHints.modio_name}
+                        </span>
+                      ) : null}
+                    </label>
+                    <label>
+                      Project folder (optional)
+                      <input
+                        value={unrealProject}
+                        onChange={(e) => setUnrealProject(e.target.value)}
+                        placeholder="Auto-detected when possible"
+                      />
+                    </label>
+                    <div className="row-actions">
+                      <button onClick={() => void confirmUnrealManage()}>
+                        Manage
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          catalogSuggestGen.current += 1;
+                          setUnrealManage(null);
+                          setCatalogHints(null);
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {bepinexManage && (
+                  <div className="panel unreal-manage-panel">
+                    <h2>Add as Unity / BepInEx game</h2>
+                    <p>
+                      <strong>{bepinexManage.title}</strong> looks like a Unity
+                      install. Catalog IDs are suggested from the game title when
+                      possible — edit them if needed.
+                    </p>
+                    <label>
+                      Nexus domain (optional)
+                      <input
+                        value={bepinexDomain}
+                        onChange={(e) => setBepinexDomain(e.target.value)}
+                        placeholder="e.g. lethalcompany"
+                        autoFocus
+                      />
+                      {catalogHints?.nexus_name ? (
+                        <span className="field-hint">
+                          Matched: {catalogHints.nexus_name}
+                        </span>
+                      ) : null}
+                    </label>
+                    <label>
+                      Thunderstore community (optional)
+                      <input
+                        value={bepinexCommunity}
+                        onChange={(e) => setBepinexCommunity(e.target.value)}
+                        placeholder="e.g. lethal-company"
+                      />
+                      {catalogHints?.thunderstore_name ? (
+                        <span className="field-hint">
+                          Matched: {catalogHints.thunderstore_name}
+                        </span>
+                      ) : null}
+                    </label>
+                    <label>
+                      mod.io game ID (optional)
+                      <input
+                        value={bepinexModioId}
+                        onChange={(e) => setBepinexModioId(e.target.value)}
+                        placeholder="e.g. 1234"
+                        inputMode="numeric"
+                      />
+                      {catalogHints?.modio_name ? (
+                        <span className="field-hint">
+                          Matched: {catalogHints.modio_name}
+                        </span>
+                      ) : null}
+                    </label>
+                    <div className="row-actions">
+                      <button onClick={() => void confirmBepinexManage()}>
+                        Manage
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          catalogSuggestGen.current += 1;
+                          setBepinexManage(null);
+                          setCatalogHints(null);
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {managed.length > 0 && (
                   <>
                     <h2>Managed</h2>
@@ -2179,7 +2849,7 @@ function App() {
                             <div>
                               <strong>{g.title}</strong>
                               <small>
-                                {g.launcher} · {g.nexus_domain}
+                                {g.launcher} · {g.nexus_domain || g.thunderstore_community || g.plugin_id}
                               </small>
                             </div>
                           </li>
@@ -2199,6 +2869,22 @@ function App() {
                           imageSrc={mediaSrc(g.cover_path)}
                           hoverLabel="Manage"
                           onClick={() => manage(g)}
+                        />
+                      ) : g.engine_hint === "unreal" && g.install_path ? (
+                        <MediaCard
+                          key={g.id}
+                          title={g.title}
+                          imageSrc={mediaSrc(g.cover_path)}
+                          hoverLabel="Add as Unreal"
+                          onClick={() => beginUnrealManage(g)}
+                        />
+                      ) : g.engine_hint === "bepinex" && g.install_path ? (
+                        <MediaCard
+                          key={g.id}
+                          title={g.title}
+                          imageSrc={mediaSrc(g.cover_path)}
+                          hoverLabel="Add as BepInEx"
+                          onClick={() => beginBepinexManage(g)}
                         />
                       ) : (
                         <MediaCard
@@ -2226,11 +2912,29 @@ function App() {
                           <small>
                             {g.launcher}
                             {g.install_path ? ` · ${g.install_path}` : ""}
-                            {!g.supported ? " · unsupported" : ""}
+                            {!g.supported &&
+                            g.engine_hint !== "unreal" &&
+                            g.engine_hint !== "bepinex"
+                              ? " · unsupported"
+                              : ""}
+                            {g.engine_hint === "unreal" && !g.supported
+                              ? " · Unreal Engine"
+                              : ""}
+                            {g.engine_hint === "bepinex" && !g.supported
+                              ? " · Unity / BepInEx"
+                              : ""}
                           </small>
                         </div>
                         {g.supported ? (
                           <button onClick={() => manage(g)}>Manage</button>
+                        ) : g.engine_hint === "unreal" && g.install_path ? (
+                          <button onClick={() => beginUnrealManage(g)}>
+                            Add as Unreal
+                          </button>
+                        ) : g.engine_hint === "bepinex" && g.install_path ? (
+                          <button onClick={() => beginBepinexManage(g)}>
+                            Add as BepInEx
+                          </button>
                         ) : null}
                       </li>
                     ))}
@@ -2265,12 +2969,17 @@ function App() {
                     >
                       Info
                     </button>
-                    <button
-                      className={browseDetail.tab === "files" ? "active" : ""}
-                      onClick={() => setDetailTab("files")}
-                    >
-                      Files
-                    </button>
+                    {!(
+                      browseDetail.kind === "mod" &&
+                      browseDetail.hit.source === "thunderstore"
+                    ) && (
+                      <button
+                        className={browseDetail.tab === "files" ? "active" : ""}
+                        onClick={() => setDetailTab("files")}
+                      >
+                        Files
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -2280,13 +2989,18 @@ function App() {
                       <div className="detail-cover">
                         {mediaSrc(
                           null,
-                          modDetail?.picture_url ?? browseDetail.hit.picture_url,
+                          (browseDetail.hit.source === "modio"
+                            ? modioDetail?.picture_url
+                            : modDetail?.picture_url) ?? browseDetail.hit.picture_url,
                         ) ? (
                           <img
                             src={
                               mediaSrc(
                                 null,
-                                modDetail?.picture_url ?? browseDetail.hit.picture_url,
+                                (browseDetail.hit.source === "modio"
+                                  ? modioDetail?.picture_url
+                                  : modDetail?.picture_url) ??
+                                  browseDetail.hit.picture_url,
                               )!
                             }
                             alt=""
@@ -2297,8 +3011,13 @@ function App() {
                       </div>
                       <div className="detail-meta">
                         <p className="detail-author">
-                          {modDetail?.author ?? browseDetail.hit.author ?? "Unknown author"}
+                          {(browseDetail.hit.source === "modio"
+                            ? modioDetail?.author
+                            : modDetail?.author) ??
+                            browseDetail.hit.author ??
+                            "Unknown author"}
                           {modDetail?.uploaded_by &&
+                            browseDetail.hit.source !== "modio" &&
                             modDetail.uploaded_by !==
                               (modDetail.author ?? browseDetail.hit.author) && (
                               <span className="detail-author-secondary">
@@ -2308,8 +3027,9 @@ function App() {
                             )}
                         </p>
                         <div className="detail-stats">
-                          {(modDetail?.endorsements ?? browseDetail.hit.endorsements) !=
-                            null && (
+                          {browseDetail.hit.source !== "modio" &&
+                            (modDetail?.endorsements ?? browseDetail.hit.endorsements) !=
+                              null && (
                             <span>
                               {(
                                 modDetail?.endorsements ?? browseDetail.hit.endorsements
@@ -2317,16 +3037,25 @@ function App() {
                               endorsements
                             </span>
                           )}
-                          {(modDetail?.downloads ?? browseDetail.hit.downloads) != null && (
+                          {(
+                            (browseDetail.hit.source === "modio"
+                              ? modioDetail?.downloads
+                              : modDetail?.downloads) ?? browseDetail.hit.downloads
+                          ) != null && (
                             <span>
                               {(
-                                modDetail?.downloads ?? browseDetail.hit.downloads
+                                (browseDetail.hit.source === "modio"
+                                  ? modioDetail?.downloads
+                                  : modDetail?.downloads) ?? browseDetail.hit.downloads
                               )!.toLocaleString()}{" "}
                               downloads
                             </span>
                           )}
-                          {modDetail?.version && <span>v{modDetail.version}</span>}
-                          {(modDetail?.category ?? browseDetail.hit.category) && (
+                          {modDetail?.version && browseDetail.hit.source !== "modio" && (
+                            <span>v{modDetail.version}</span>
+                          )}
+                          {(modDetail?.category ?? browseDetail.hit.category) &&
+                            browseDetail.hit.source !== "modio" && (
                             <span>{modDetail?.category ?? browseDetail.hit.category}</span>
                           )}
                           {modDetail?.contains_adult_content && (
@@ -2362,20 +3091,84 @@ function App() {
                           )}
                         </dl>
                         <div className="detail-mod-actions">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              openExternal(
-                                `https://www.nexusmods.com/${
-                                  modDetail?.domain_name ||
-                                  browseDetail.hit.domain_name ||
-                                  activeGame?.nexus_domain
-                                }/mods/${browseDetail.hit.mod_id}`,
-                              )
-                            }
-                          >
-                            Open on Nexus
-                          </button>
+                          {browseDetail.hit.source === "thunderstore" ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  openExternal(
+                                    browseDetail.hit.package_url ||
+                                      `https://thunderstore.io/c/${browseDetail.hit.community}/p/${browseDetail.hit.namespace}/${browseDetail.hit.package_name}/`,
+                                  )
+                                }
+                              >
+                                Open on Thunderstore
+                              </button>
+                              <label className="inline-version">
+                                Version
+                                <select
+                                  value={tsVersion}
+                                  onChange={(e) => setTsVersion(e.target.value)}
+                                >
+                                  {(tsDetail?.versions ?? []).map((v) => (
+                                    <option key={v.uuid4} value={v.version_number}>
+                                      {v.version_number}
+                                      {v.downloads
+                                        ? ` · ${v.downloads.toLocaleString()} dl`
+                                        : ""}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <button
+                                type="button"
+                                onClick={() => void installThunderstorePackage()}
+                              >
+                                Install
+                              </button>
+                            </>
+                          ) : browseDetail.hit.source === "modio" ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  openExternal(
+                                    browseDetail.hit.profile_url ||
+                                      modioDetail?.profile_url ||
+                                      `https://mod.io/g/${browseDetail.hit.modio_game_id}/m/${browseDetail.hit.modio_mod_id}`,
+                                  )
+                                }
+                              >
+                                Open on mod.io
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void installModioFile(
+                                    modioDetail?.primary_file_id ?? null,
+                                    null,
+                                  )
+                                }
+                              >
+                                Install primary
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                openExternal(
+                                  `https://www.nexusmods.com/${
+                                    modDetail?.domain_name ||
+                                    browseDetail.hit.domain_name ||
+                                    activeGame?.nexus_domain
+                                  }/mods/${browseDetail.hit.mod_id}`,
+                                )
+                              }
+                            >
+                              Open on Nexus
+                            </button>
+                          )}
                           {modDetail?.uploaded_users_profile_url && (
                             <button
                               type="button"
@@ -2396,38 +3189,102 @@ function App() {
                         <RichText
                           className="detail-description detail-description-html"
                           text={
-                            modDetail?.description ??
-                            modDetail?.summary ??
-                            browseDetail.hit.summary
+                            browseDetail.hit.source === "thunderstore"
+                              ? (tsDetail?.description ??
+                                browseDetail.hit.summary)
+                              : browseDetail.hit.source === "modio"
+                                ? (modioDetail?.description ??
+                                  modioDetail?.summary ??
+                                  browseDetail.hit.summary)
+                                : (modDetail?.description ??
+                                  modDetail?.summary ??
+                                  browseDetail.hit.summary)
                           }
                         />
+                        {browseDetail.hit.source === "modio" &&
+                          modioDetail?.has_dependencies && (
+                          <p className="note">
+                            This mod lists dependencies on mod.io; missing ones are
+                            installed automatically before the primary file.
+                          </p>
+                        )}
+                        {browseDetail.hit.source === "thunderstore" &&
+                          tsDetail?.versions?.[0]?.dependencies?.length ? (
+                          <>
+                            <h2>Dependencies</h2>
+                            <ul className="list">
+                              {(
+                                tsDetail.versions.find(
+                                  (v) => v.version_number === tsVersion,
+                                ) ?? tsDetail.versions[0]
+                              ).dependencies.map((d) => (
+                                <li key={d}>
+                                  <strong>{d}</strong>
+                                </li>
+                              ))}
+                            </ul>
+                            <p className="note">
+                              Missing dependencies are installed automatically with the
+                              package.
+                            </p>
+                          </>
+                        ) : null}
                       </div>
                     ) : (
                       <div className="detail-body">
                         <h2>Files</h2>
-                        <ul className="list">
-                          {modFiles.map((f) => (
-                            <li key={f.file_id}>
-                              <div>
-                                <strong>{f.name}</strong>
-                                <small>
-                                  {f.category_name ?? "file"}
-                                  {f.version ? ` · v${f.version}` : ""}
-                                  {f.is_primary ? " · primary" : ""}
-                                  {f.size_kb != null
-                                    ? ` · ${(f.size_kb / 1024).toFixed(1)} MB`
-                                    : ""}
-                                </small>
-                              </div>
-                              <button onClick={() => installFile(f)}>
-                                {isPremium ? "Install" : "Download Assist"}
-                              </button>
-                            </li>
-                          ))}
-                          {modFiles.length === 0 && (
-                            <li className="empty">No files found for this mod.</li>
-                          )}
-                        </ul>
+                        {browseDetail.hit.source === "modio" ? (
+                          <ul className="list">
+                            {modioFiles.map((f) => (
+                              <li key={f.file_id}>
+                                <div>
+                                  <strong>{f.filename}</strong>
+                                  <small>
+                                    {f.version ? `v${f.version}` : "file"}
+                                    {f.is_primary ? " · primary" : ""}
+                                    {f.filesize
+                                      ? ` · ${(f.filesize / (1024 * 1024)).toFixed(1)} MB`
+                                      : ""}
+                                  </small>
+                                </div>
+                                <button
+                                  onClick={() =>
+                                    void installModioFile(f.file_id, f.version)
+                                  }
+                                >
+                                  Install
+                                </button>
+                              </li>
+                            ))}
+                            {modioFiles.length === 0 && (
+                              <li className="empty">No files found for this mod.</li>
+                            )}
+                          </ul>
+                        ) : (
+                          <ul className="list">
+                            {modFiles.map((f) => (
+                              <li key={f.file_id}>
+                                <div>
+                                  <strong>{f.name}</strong>
+                                  <small>
+                                    {f.category_name ?? "file"}
+                                    {f.version ? ` · v${f.version}` : ""}
+                                    {f.is_primary ? " · primary" : ""}
+                                    {f.size_kb != null
+                                      ? ` · ${(f.size_kb / 1024).toFixed(1)} MB`
+                                      : ""}
+                                  </small>
+                                </div>
+                                <button onClick={() => installFile(f)}>
+                                  {isPremium ? "Install" : "Download Assist"}
+                                </button>
+                              </li>
+                            ))}
+                            {modFiles.length === 0 && (
+                              <li className="empty">No files found for this mod.</li>
+                            )}
+                          </ul>
+                        )}
                       </div>
                     )}
                   </>
@@ -2560,14 +3417,28 @@ function App() {
                                       onClick={() =>
                                         openMod(
                                           {
-                                            mod_id: group.mod_id,
+                                            source: "nexus",
+                                            id: `nexus:${group.domain_name}:${group.mod_id}`,
                                             name: group.mod_name,
                                             summary: null,
                                             picture_url: null,
                                             downloads: null,
                                             endorsements: null,
                                             author: null,
+                                            category: null,
+                                            tags: [],
+                                            mod_id: group.mod_id,
                                             domain_name: group.domain_name,
+                                            community: null,
+                                            namespace: null,
+                                            package_name: null,
+                                            full_name: null,
+                                            package_url: null,
+                                            rating_score: null,
+                                            latest_version: null,
+                                            modio_game_id: null,
+                                            modio_mod_id: null,
+                                            profile_url: null,
                                           },
                                           "info",
                                         )
@@ -2600,7 +3471,7 @@ function App() {
             ) : (
               <>
                 <div className="panel-head">
-                  <h1>Browse Nexus</h1>
+                  <h1>Browse Mods</h1>
                   <div className="panel-head-actions">
                     <div className="segment">
                       <button
@@ -2648,6 +3519,38 @@ function App() {
                         Collections
                       </button>
                     </div>
+                    {browseMode === "mods" &&
+                      [
+                        Boolean(activeGame?.nexus_domain),
+                        Boolean(activeGame?.thunderstore_community),
+                        Boolean(activeGame?.modio_game_id),
+                      ].filter(Boolean).length > 1 && (
+                        <div className="segment source-filter">
+                          {(
+                            [
+                              ["all", "All"] as const,
+                              ...(activeGame?.nexus_domain
+                                ? ([["nexus", "Nexus"]] as const)
+                                : []),
+                              ...(activeGame?.thunderstore_community
+                                ? ([["thunderstore", "Thunderstore"]] as const)
+                                : []),
+                              ...(activeGame?.modio_game_id
+                                ? ([["modio", "mod.io"]] as const)
+                                : []),
+                            ]
+                          ).map(([id, label]) => (
+                            <button
+                              key={id}
+                              type="button"
+                              className={sourceFilter === id ? "active" : ""}
+                              onClick={() => setSourceFilter(id)}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     <div className="segment">
                       <button
                         className={browseView === "list" ? "active" : ""}
@@ -2844,31 +3747,49 @@ function App() {
                         <div className="media-grid">
                           {modHits.map((m) => {
                             const tags = [
+                              m.source === "thunderstore"
+                                ? "Thunderstore"
+                                : m.source === "modio"
+                                  ? "mod.io"
+                                  : "Nexus",
                               ...(m.category ? [m.category] : []),
-                              ...(m.tags ?? []).slice(0, 3),
+                              ...(m.tags ?? []).slice(0, 2),
                             ];
                             return (
                               <MediaCard
-                                key={m.mod_id}
+                                key={m.id}
                                 title={m.name}
                                 imageSrc={mediaSrc(null, m.picture_url)}
                                 badge={m.author ?? "Mod"}
                                 overlay={
-                                  m.endorsements != null
+                                  m.source === "nexus" && m.endorsements != null
                                     ? `${m.endorsements.toLocaleString()} endorsements`
-                                    : null
+                                    : m.downloads != null
+                                      ? `${m.downloads.toLocaleString()} downloads`
+                                      : null
                                 }
                                 tags={tags}
                                 onClick={() => openMod(m, "info")}
                                 actions={
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      openMod(m, "files");
-                                    }}
-                                  >
-                                    Files
-                                  </button>
+                                  m.source === "thunderstore" ? (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openMod(m, "info");
+                                      }}
+                                    >
+                                      Install
+                                    </button>
+                                  ) : (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openMod(m, "files");
+                                      }}
+                                    >
+                                      Files
+                                    </button>
+                                  )
                                 }
                               />
                             );
@@ -2884,7 +3805,7 @@ function App() {
                       ) : (
                         <ul className="list">
                           {modHits.map((m) => (
-                            <li key={m.mod_id} className="list-row-clickable">
+                            <li key={m.id} className="list-row-clickable">
                               <div
                                 className="list-row-main"
                                 onClick={() => openMod(m, "info")}
@@ -2899,14 +3820,31 @@ function App() {
                               >
                                 <strong>{m.name}</strong>
                                 <small>
+                                  {m.source === "thunderstore"
+                                    ? "Thunderstore"
+                                    : m.source === "modio"
+                                      ? "mod.io"
+                                      : "Nexus"}
+                                  {" · "}
                                   {m.author ?? "unknown"}
-                                  {m.endorsements != null
+                                  {m.source === "nexus" && m.endorsements != null
                                     ? ` · ${m.endorsements} endorsements`
-                                    : ""}
+                                    : m.downloads != null
+                                      ? ` · ${m.downloads.toLocaleString()} downloads`
+                                      : ""}
                                 </small>
                                 {m.summary && <p className="summary">{m.summary}</p>}
                               </div>
-                              <button onClick={() => openMod(m, "files")}>Files</button>
+                              <button
+                                onClick={() =>
+                                  openMod(
+                                    m,
+                                    m.source === "thunderstore" ? "info" : "files",
+                                  )
+                                }
+                              >
+                                {m.source === "thunderstore" ? "Install" : "Files"}
+                              </button>
                             </li>
                           ))}
                         </ul>
