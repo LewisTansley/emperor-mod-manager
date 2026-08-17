@@ -146,6 +146,22 @@ pub struct CollectionHit {
     pub updated_at: Option<String>,
     pub mod_count: Option<u64>,
     pub file_size: Option<u64>,
+    #[serde(default = "nexus_collection_source")]
+    pub source: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub community: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub package_name: Option<String>,
+    #[serde(default)]
+    pub latest_version: Option<String>,
+}
+
+fn nexus_collection_source() -> String {
+    "nexus".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -966,6 +982,18 @@ impl NexusClient {
                                 .or_else(|| v.as_i64().map(|i| i as u64))
                                 .or_else(|| v.as_f64().map(|f| f as u64))
                         }),
+                    source: "nexus".into(),
+                    id: format!(
+                        "nexus:{}:{}",
+                        n.pointer("/game/domainName")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(domain),
+                        n.get("slug")?.as_str()?
+                    ),
+                    community: None,
+                    namespace: None,
+                    package_name: None,
+                    latest_version: None,
                 })
             })
             .collect();

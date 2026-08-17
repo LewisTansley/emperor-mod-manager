@@ -77,18 +77,21 @@ function ensureHooks() {
   hooksInstalled = true;
   DOMPurify.addHook("afterSanitizeAttributes", (node) => {
     if (node.tagName === "A") {
-      const href = node.getAttribute("href");
-      if (!href || !isSafeUrl(href)) {
+      const href = normalizeHref(node.getAttribute("href") ?? "");
+      if (!href) {
         node.removeAttribute("href");
       } else {
+        node.setAttribute("href", href);
         node.setAttribute("target", "_blank");
         node.setAttribute("rel", "noopener noreferrer");
       }
     }
     if (node.tagName === "IMG") {
-      const src = node.getAttribute("src");
-      if (!src || !isSafeUrl(src)) {
+      const src = normalizeHref(node.getAttribute("src") ?? "");
+      if (!src) {
         node.removeAttribute("src");
+      } else {
+        node.setAttribute("src", src);
       }
     }
     if (node.hasAttribute("style")) {
@@ -118,6 +121,14 @@ export function looksLikeBbcode(text: string): boolean {
 
 export function isSafeUrl(url: string): boolean {
   return /^https?:\/\//i.test(url.trim());
+}
+
+/** Safe http(s) href, or null. Protocol-relative `//host` becomes `https://host`. */
+export function normalizeHref(url: string): string | null {
+  const trimmed = url.trim();
+  const candidate = /^\/\//.test(trimmed) ? `https:${trimmed}` : trimmed;
+  if (!isSafeUrl(candidate)) return null;
+  return candidate;
 }
 
 export function isSafeColor(color: string): boolean {
@@ -177,6 +188,8 @@ function replaceRepeated(
 /** Convert Nexus-style BBCode into HTML. Leaves existing HTML tags intact. */
 export function bbcodeToHtml(input: string): string {
   let text = input.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // Pure-BBCode path HTML-escapes first; restore quotes so [url="..."] still matches.
+  text = text.replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 
   // Code blocks: escape inner content and skip further BBCode inside.
   text = text.replace(/\[code\]([\s\S]*?)\[\/code\]/gi, (_m, body: string) => {
@@ -188,26 +201,32 @@ export function bbcodeToHtml(input: string): string {
     return `<a href="${href}">YouTube: ${id}</a>`;
   });
 
-  text = text.replace(/\[img\]\s*(https?:\/\/[^[\]]+?)\s*\[\/img\]/gi, (_m, url: string) => {
-    const clean = url.trim();
-    if (!isSafeUrl(clean)) return "";
-    return `<img src="${escapeHtml(clean)}" alt="">`;
-  });
-
   text = text.replace(
-    /\[url=(https?:\/\/[^[\]]+?)\]([\s\S]*?)\[\/url\]/gi,
-    (_m, url: string, label: string) => {
-      const clean = url.trim();
-      if (!isSafeUrl(clean)) return label;
-      return `<a href="${escapeHtml(clean)}">${label}</a>`;
+    /\[img\]\s*((?:https?:)?\/\/[^[\]]+?)\s*\[\/img\]/gi,
+    (_m, url: string) => {
+      const href = normalizeHref(url);
+      if (!href) return "";
+      return `<img src="${escapeHtml(href)}" alt="">`;
     },
   );
 
-  text = text.replace(/\[url\]\s*(https?:\/\/[^[\]]+?)\s*\[\/url\]/gi, (_m, url: string) => {
-    const clean = url.trim();
-    if (!isSafeUrl(clean)) return escapeHtml(clean);
-    return `<a href="${escapeHtml(clean)}">${escapeHtml(clean)}</a>`;
-  });
+  text = text.replace(
+    /\[url=\s*["']?((?:https?:)?\/\/[^\]'"\s]+)["']?\s*\]([\s\S]*?)\[\/url\]/gi,
+    (_m, url: string, label: string) => {
+      const href = normalizeHref(url);
+      if (!href) return label;
+      return `<a href="${escapeHtml(href)}">${label}</a>`;
+    },
+  );
+
+  text = text.replace(
+    /\[url\]\s*((?:https?:)?\/\/[^[\]]+?)\s*\[\/url\]/gi,
+    (_m, url: string) => {
+      const href = normalizeHref(url);
+      if (!href) return escapeHtml(url.trim());
+      return `<a href="${escapeHtml(href)}">${escapeHtml(href)}</a>`;
+    },
+  );
 
   text = replaceRepeated(text, /\[b\]([\s\S]*?)\[\/b\]/gi, (_m, body) => `<strong>${body}</strong>`);
   text = replaceRepeated(text, /\[i\]([\s\S]*?)\[\/i\]/gi, (_m, body) => `<em>${body}</em>`);
@@ -298,8 +317,8 @@ export function bbcodeToHtml(input: string): string {
   // Drop any remaining simple paired unknown tags' markers: [tag]...[/tag] → ...
   text = text.replace(/\[([a-z]+)(?:=[^\]]*)?\]([\s\S]*?)\[\/\1\]/gi, "$2");
 
-  // Remove leftover lone BBCode markers
-  text = text.replace(/\[[a-z*/][^[\]]*\]/gi, "");
+  // Remove leftover lone BBCode markers, but keep markdown [label](url) intact.
+  text = text.replace(/\[[a-z*/][^[\]]*\](?!\()/gi, "");
 
   return text;
 }
@@ -320,13 +339,7 @@ export function markdownToHtml(input: string): string {
   text = text.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
   text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   text = text.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  text = text.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
-    (_m, label: string, url: string) => {
-      if (!isSafeUrl(url)) return label;
-      return `<a href="${url}">${label}</a>`;
-    },
-  );
+  text = convertMarkdownLinks(text);
   text = text.replace(/^(?:- |\* )(.+)(?:\n(?:- |\* ).+)*/gm, (block) => {
     const items = block
       .split("\n")
@@ -349,6 +362,95 @@ export function plainToHtml(input: string): string {
     .replace(/\n{2,}/g, "</p><p>")
     .replace(/\n/g, "<br>")
     .replace(/^(.*)$/s, "<p>$1</p>");
+}
+
+function unescapeBasicEntities(text: string): string {
+  return text.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+
+/** Convert leftover Markdown `[label](https://...)` even inside HTML/BBCode bodies. */
+export function convertMarkdownLinks(html: string): string {
+  return html.replace(
+    /\[([^\]]+)\]\(((?:https?:\/\/|\/\/)[^)\s]+)\)/g,
+    (_m, label: string, url: string) => {
+      const href = normalizeHref(unescapeBasicEntities(url));
+      if (!href) return label;
+      return `<a href="${escapeHtml(href)}">${label}</a>`;
+    },
+  );
+}
+
+const BARE_URL_RE = /(?:https?:\/\/|(?<=^|[\s("'>(])\/\/)[^\s<>"']+/gi;
+
+function splitTrailingUrlPunct(raw: string): { url: string; trail: string } {
+  let url = raw;
+  let trail = "";
+  while (/[.,;:!?]$/.test(url)) {
+    trail = `${url.slice(-1)}${trail}`;
+    url = url.slice(0, -1);
+  }
+  while (
+    url.endsWith(")") &&
+    (url.match(/\(/g)?.length ?? 0) < (url.match(/\)/g)?.length ?? 0)
+  ) {
+    trail = `)${trail}`;
+    url = url.slice(0, -1);
+  }
+  return { url, trail };
+}
+
+/** Wrap bare http(s) / protocol-relative URLs in text nodes (skip a, code, pre). */
+export function linkifyBareUrls(html: string): string {
+  if (!html) return html;
+  const doc = new DOMParser().parseFromString(
+    `<div id="rt-root">${html}</div>`,
+    "text/html",
+  );
+  const root = doc.getElementById("rt-root");
+  if (!root) return html;
+
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes: Text[] = [];
+  for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+    const text = current as Text;
+    const parent = text.parentElement;
+    if (!parent || parent.closest("a, code, pre")) continue;
+    const re = new RegExp(BARE_URL_RE.source, BARE_URL_RE.flags);
+    if (!re.test(text.nodeValue ?? "")) continue;
+    nodes.push(text);
+  }
+
+  for (const textNode of nodes) {
+    const value = textNode.nodeValue ?? "";
+    const re = new RegExp(BARE_URL_RE.source, BARE_URL_RE.flags);
+    const frag = doc.createDocumentFragment();
+    let last = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(value))) {
+      if (match.index > last) {
+        frag.appendChild(doc.createTextNode(value.slice(last, match.index)));
+      }
+      const { url, trail } = splitTrailingUrlPunct(match[0]);
+      const href = normalizeHref(url);
+      if (href) {
+        const a = doc.createElement("a");
+        a.setAttribute("href", href);
+        a.textContent = url;
+        frag.appendChild(a);
+        if (trail) frag.appendChild(doc.createTextNode(trail));
+      } else {
+        frag.appendChild(doc.createTextNode(match[0]));
+      }
+      last = match.index + match[0].length;
+    }
+    if (last === 0) continue;
+    if (last < value.length) {
+      frag.appendChild(doc.createTextNode(value.slice(last)));
+    }
+    textNode.parentNode?.replaceChild(frag, textNode);
+  }
+
+  return root.innerHTML;
 }
 
 export function sanitizeRichHtml(html: string): string {
@@ -384,5 +486,8 @@ export function renderRichText(raw: string | null | undefined): string {
     html = plainToHtml(trimmed);
   }
 
+  html = convertMarkdownLinks(html);
+  html = sanitizeRichHtml(html);
+  html = linkifyBareUrls(html);
   return sanitizeRichHtml(html);
 }

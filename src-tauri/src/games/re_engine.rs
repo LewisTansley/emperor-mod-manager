@@ -164,6 +164,30 @@ macro_rules! re_engine_plugin {
 }
 
 re_engine_plugin!(
+    MonsterHunterWildsPlugin,
+    "monsterhunterwilds",
+    "Monster Hunter Wilds",
+    "monsterhunterwilds",
+    &[
+        "monster hunter wilds",
+        "monsterhunterwilds",
+        "mh wilds",
+    ]
+);
+
+re_engine_plugin!(
+    MonsterHunterRisePlugin,
+    "monsterhunterrise",
+    "Monster Hunter Rise",
+    "monsterhunterrise",
+    &[
+        "monster hunter rise",
+        "monsterhunterrise",
+        "mh rise",
+    ]
+);
+
+re_engine_plugin!(
     ResidentEvilRequiemPlugin,
     "residentevilrequiem",
     "Resident Evil Requiem",

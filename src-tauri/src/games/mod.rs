@@ -6,36 +6,73 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 mod baldursgate3;
+mod bladeandsorcery;
+mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
 mod fromsoftware;
+mod helldivers2;
+mod kingdomcome;
+mod melonloader;
+mod monsterhunterworld;
+mod mountandblade;
+mod mysummercar;
+mod nomanssky;
 mod re_engine;
+mod rimworld;
+mod sevendaystodie;
+mod snowrunner;
+mod spaceengineers;
 mod stardewvalley;
+mod theforest;
 mod unity_bepinex;
 mod unreal_engine;
 mod warhammer40kdarktide;
+mod witcher3;
 
 pub use baldursgate3::BaldursGate3Plugin;
+pub use bladeandsorcery::BladeAndSorceryPlugin;
+pub use creation_engine::{
+    Fallout4Plugin, OblivionRemasteredPlugin, SkyrimSpecialEditionPlugin, StarfieldPlugin,
+};
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
 pub use fromsoftware::{
     DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
 };
+pub use helldivers2::Helldivers2Plugin;
+pub use kingdomcome::{KingdomComeDeliverance2Plugin, KingdomComeDeliverancePlugin};
+pub use melonloader::{BonelabPlugin, BoneworksPlugin};
+pub use monsterhunterworld::MonsterHunterWorldPlugin;
+pub use mountandblade::{MountAndBlade2BannerlordPlugin, MountAndBladeWarbandPlugin};
+pub use mysummercar::MySummerCarPlugin;
+pub use nomanssky::NoMansSkyPlugin;
 pub use re_engine::{
-    ResidentEvil22019Plugin, ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
+    MonsterHunterRisePlugin, MonsterHunterWildsPlugin, ResidentEvil22019Plugin,
+    ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
     ResidentEvilRequiemPlugin, ResidentEvilVillagePlugin,
 };
+pub use rimworld::RimWorldPlugin;
+pub use sevendaystodie::SevenDaysToDiePlugin;
+pub use snowrunner::SnowRunnerPlugin;
+pub use spaceengineers::SpaceEngineersPlugin;
 pub use stardewvalley::StardewValleyPlugin;
+pub use theforest::TheForestPlugin;
 pub use unity_bepinex::{
     looks_like_unity_install, thunderstore_community_for_plugin, AgainstTheStormPlugin,
-    AmongUsPlugin, BepInExPlugin, ContentWarningPlugin, CultOfTheLambPlugin, GtfoPlugin,
-    LethalCompanyPlugin, RiskOfRain2Plugin, RoundsPlugin, TimberbornPlugin, ValheimPlugin,
+    AmongUsPlugin, AtlyssPlugin, BepInExPlugin, ContentWarningPlugin, CultOfTheLambPlugin,
+    DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin, HollowKnightSilksongPlugin,
+    InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin, RiskOfRain2Plugin,
+    RoundsPlugin, Schedule1Plugin, SonsOfTheForestPlugin, SubnauticaBelowZeroPlugin,
+    SubnauticaPlugin, TimberbornPlugin, UltrakillPlugin, ValheimPlugin,
 };
 pub use unreal_engine::{
-    detect_ue_layout, layout_info, DeployContext, HogwartsLegacyPlugin, PalworldPlugin,
-    Stalker2HeartOfChornobylPlugin, UeLayoutInfo, UnrealEnginePlugin,
+    detect_ue_layout, layout_info, DeepRockGalacticPlugin, DeployContext, HogwartsLegacyPlugin,
+    MarvelRivalsPlugin, PalworldPlugin, PavlovPlugin, ReadyOrNotPlugin,
+    Stalker2HeartOfChornobylPlugin, Subnautica2Plugin, UeLayoutInfo, UnrealEnginePlugin,
 };
 pub use warhammer40kdarktide::Warhammer40kDarktidePlugin;
+pub use witcher3::Witcher3Plugin;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct GamePluginInfo {
@@ -131,12 +168,21 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &StardewValleyPlugin,
         &BaldursGate3Plugin,
         &Cyberpunk2077Plugin,
+        &Witcher3Plugin,
         &DaysGonePlugin,
         &Warhammer40kDarktidePlugin,
+        &Helldivers2Plugin,
         &Stalker2HeartOfChornobylPlugin,
         &PalworldPlugin,
         &HogwartsLegacyPlugin,
+        &ReadyOrNotPlugin,
+        &Subnautica2Plugin,
+        &MarvelRivalsPlugin,
+        &DeepRockGalacticPlugin,
+        &PavlovPlugin,
+        &OblivionRemasteredPlugin,
         &UnrealEnginePlugin,
+        &HollowKnightSilksongPlugin,
         &LethalCompanyPlugin,
         &ValheimPlugin,
         &RiskOfRain2Plugin,
@@ -147,12 +193,43 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &CultOfTheLambPlugin,
         &AgainstTheStormPlugin,
         &RoundsPlugin,
+        &SonsOfTheForestPlugin,
+        &SubnauticaBelowZeroPlugin,
+        &SubnauticaPlugin,
+        &Schedule1Plugin,
+        &RepoPlugin,
+        &PeakPlugin,
+        &H3vrPlugin,
+        &UltrakillPlugin,
+        &AtlyssPlugin,
+        &DysonSphereProgramPlugin,
+        &InscryptionPlugin,
+        &BonelabPlugin,
+        &BoneworksPlugin,
+        &BladeAndSorceryPlugin,
+        &TheForestPlugin,
+        &MySummerCarPlugin,
+        &SevenDaysToDiePlugin,
+        &RimWorldPlugin,
+        &NoMansSkyPlugin,
+        &SnowRunnerPlugin,
+        &SpaceEngineersPlugin,
+        &SkyrimSpecialEditionPlugin,
+        &Fallout4Plugin,
+        &StarfieldPlugin,
+        &MountAndBlade2BannerlordPlugin,
+        &MountAndBladeWarbandPlugin,
+        &KingdomComeDeliverance2Plugin,
+        &KingdomComeDeliverancePlugin,
         &BepInExPlugin,
         &EldenRingPlugin,
         &DarkSouls3Plugin,
         &DarkSouls2Plugin,
         &DarkSoulsRemasteredPlugin,
         &DarkSoulsPlugin,
+        &MonsterHunterWildsPlugin,
+        &MonsterHunterRisePlugin,
+        &MonsterHunterWorldPlugin,
         &ResidentEvilRequiemPlugin,
         &ResidentEvilVillagePlugin,
         &ResidentEvil42023Plugin,
@@ -387,5 +464,123 @@ mod tests {
         std::fs::write(wrapper.join("scoreboard.mod"), b"x").unwrap();
         let peeled = normalize_staging_root(normal.path(), &Warhammer40kDarktidePlugin).unwrap();
         assert_eq!(peeled, wrapper);
+    }
+
+    #[test]
+    fn match_subnautica_family_and_forest_order() {
+        assert_eq!(
+            match_plugin("Subnautica 2", None).unwrap().id,
+            "subnautica2"
+        );
+        assert_eq!(
+            match_plugin("Subnautica: Below Zero", None).unwrap().id,
+            "subnauticabelowzero"
+        );
+        assert_eq!(
+            match_plugin("Subnautica", None).unwrap().id,
+            "subnautica"
+        );
+        assert_eq!(
+            match_plugin("Sons of the Forest", None).unwrap().id,
+            "sonsoftheforest"
+        );
+        assert_eq!(
+            match_plugin("Ready or Not", None).unwrap().id,
+            "readyornot"
+        );
+        assert_eq!(
+            match_plugin("Schedule I", None).unwrap().id,
+            "schedule1"
+        );
+        assert_eq!(
+            match_plugin("Monster Hunter Wilds", None).unwrap().id,
+            "monsterhunterwilds"
+        );
+        assert_eq!(
+            match_plugin("Monster Hunter Rise", None).unwrap().id,
+            "monsterhunterrise"
+        );
+        assert_eq!(
+            match_plugin("The Forest", None).unwrap().id,
+            "theforest"
+        );
+        assert_eq!(
+            match_plugin("The Witcher 3: Wild Hunt", None).unwrap().id,
+            "witcher3"
+        );
+        assert_eq!(
+            match_plugin("HELLDIVERS 2", None).unwrap().id,
+            "helldivers2"
+        );
+        assert_eq!(
+            match_plugin("Blade & Sorcery", None).unwrap().id,
+            "bladeandsorcery"
+        );
+        assert_eq!(
+            match_plugin("My Summer Car", None).unwrap().id,
+            "mysummercar"
+        );
+        assert_eq!(
+            match_plugin("Monster Hunter: World", None).unwrap().id,
+            "monsterhunterworld"
+        );
+        assert_eq!(match_plugin("R.E.P.O.", None).unwrap().id, "repo");
+        assert_eq!(match_plugin("PEAK", None).unwrap().id, "peak");
+        assert_eq!(
+            match_plugin("Hot Dogs, Horseshoes & Hand Grenades", None)
+                .unwrap()
+                .id,
+            "h3vr"
+        );
+        assert_eq!(match_plugin("ULTRAKILL", None).unwrap().id, "ultrakill");
+        assert_eq!(match_plugin("ATLYSS", None).unwrap().id, "atlyss");
+        assert_eq!(
+            match_plugin("Dyson Sphere Program", None).unwrap().id,
+            "dysonsphereprogram"
+        );
+        assert_eq!(match_plugin("Inscryption", None).unwrap().id, "inscryption");
+        assert_eq!(
+            match_plugin("Hollow Knight: Silksong", None).unwrap().id,
+            "hollowknightsilksong"
+        );
+        assert_eq!(
+            match_plugin("7 Days to Die", None).unwrap().id,
+            "7daystodie"
+        );
+        assert_eq!(match_plugin("RimWorld", None).unwrap().id, "rimworld");
+        assert_eq!(
+            match_plugin("No Man's Sky", None).unwrap().id,
+            "nomanssky"
+        );
+        assert_eq!(
+            match_plugin("Marvel Rivals", None).unwrap().id,
+            "marvelrivals"
+        );
+        assert_eq!(match_plugin("BONELAB", None).unwrap().id, "bonelab");
+        assert_eq!(match_plugin("BONEWORKS", None).unwrap().id, "boneworks");
+        assert_eq!(
+            match_plugin("Deep Rock Galactic", None).unwrap().id,
+            "deeprockgalactic"
+        );
+        assert_eq!(match_plugin("Pavlov VR", None).unwrap().id, "pavlov");
+        assert_eq!(match_plugin("SnowRunner", None).unwrap().id, "snowrunner");
+        assert_eq!(
+            match_plugin("Space Engineers", None).unwrap().id,
+            "spaceengineers"
+        );
+        assert_eq!(
+            match_plugin("The Elder Scrolls V: Skyrim Special Edition", None)
+                .unwrap()
+                .id,
+            "skyrimspecialedition"
+        );
+        assert_eq!(match_plugin("Fallout 4", None).unwrap().id, "fallout4");
+        assert_eq!(match_plugin("Starfield", None).unwrap().id, "starfield");
+        assert_eq!(
+            match_plugin("The Elder Scrolls IV: Oblivion Remastered", None)
+                .unwrap()
+                .id,
+            "oblivionremastered"
+        );
     }
 }

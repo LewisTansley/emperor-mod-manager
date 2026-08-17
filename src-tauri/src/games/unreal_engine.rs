@@ -573,6 +573,213 @@ ue_title_plugin!(
     ]
 );
 
+ue_title_plugin!(
+    ReadyOrNotPlugin,
+    "readyornot",
+    "Ready or Not",
+    "readyornot",
+    &["ready or not", "readyornot"],
+    "ReadyOrNot",
+    &[
+        "ReadyOrNot",
+        "Binaries",
+        "Content",
+        "Engine",
+        "LogicMods",
+        "Paks",
+        "ue4ss",
+        "~mods",
+    ]
+);
+
+ue_title_plugin!(
+    Subnautica2Plugin,
+    "subnautica2",
+    "Subnautica 2",
+    "subnautica2",
+    &["subnautica 2", "subnautica2"],
+    "Subnautica2",
+    &[
+        "Subnautica2",
+        "Binaries",
+        "Content",
+        "Engine",
+        "LogicMods",
+        "Paks",
+        "ue4ss",
+        "~mods",
+    ]
+);
+
+ue_title_plugin!(
+    DeepRockGalacticPlugin,
+    "deeprockgalactic",
+    "Deep Rock Galactic",
+    "deeprockgalactic",
+    &["deep rock galactic", "deeprockgalactic"],
+    "FSD",
+    &[
+        "FSD",
+        "Binaries",
+        "Content",
+        "Engine",
+        "LogicMods",
+        "Paks",
+        "ue4ss",
+        "~mods",
+    ]
+);
+
+const MARVEL_PRESERVE: &[&str] = &[
+    "Marvel",
+    "MarvelGame",
+    "Binaries",
+    "Content",
+    "Engine",
+    "LogicMods",
+    "Paks",
+    "ue4ss",
+    "~mods",
+];
+
+const PAVLOV_PRESERVE: &[&str] = &[
+    "Pavlov",
+    "Binaries",
+    "Content",
+    "Engine",
+    "LogicMods",
+    "Paks",
+    "ue4ss",
+    "~mods",
+];
+
+/// Steam layout is often `MarvelRivals/MarvelGame/Marvel/...`.
+pub fn marvel_ue_install_root(install_path: &Path) -> PathBuf {
+    if looks_like_ue_project(&install_path.join("Marvel")) {
+        return install_path.to_path_buf();
+    }
+    let nested = install_path.join("MarvelGame");
+    if looks_like_ue_project(&nested.join("Marvel")) {
+        return nested;
+    }
+    install_path.to_path_buf()
+}
+
+pub struct MarvelRivalsPlugin;
+
+impl GamePlugin for MarvelRivalsPlugin {
+    fn info(&self) -> GamePluginInfo {
+        GamePluginInfo {
+            id: "marvelrivals",
+            display_name: "Marvel Rivals",
+            nexus_domain: "marvelrivals",
+            match_names: &["marvel rivals", "marvelrivals"],
+        }
+    }
+
+    fn preserve_staging_root_names(&self) -> &[&str] {
+        MARVEL_PRESERVE
+    }
+
+    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+        let root = marvel_ue_install_root(install_path);
+        resolve_ue_deploy(&root, relative, Some("Marvel"), &DeployContext::default())
+    }
+
+    fn resolve_deploy_root_ctx(
+        &self,
+        install_path: &Path,
+        relative: &Path,
+        ctx: &DeployContext<'_>,
+    ) -> Result<PathBuf> {
+        let root = marvel_ue_install_root(install_path);
+        resolve_ue_deploy(&root, relative, Some("Marvel"), ctx)
+    }
+
+    fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
+        let root = marvel_ue_install_root(install_path);
+        let mut warnings = ue_preflight_warnings(&root, Some("Marvel"));
+        warnings.push(
+            "Marvel Rivals paks need a UTOC signature bypass (or equivalent) before ~mods will load."
+                .into(),
+        );
+        warnings
+    }
+
+    fn preflight_warnings_ctx(
+        &self,
+        install_path: &Path,
+        ctx: &DeployContext<'_>,
+    ) -> Vec<String> {
+        let root = marvel_ue_install_root(install_path);
+        let preferred = ctx.project_name.or(Some("Marvel"));
+        let mut warnings = ue_preflight_warnings(&root, preferred);
+        warnings.push(
+            "Marvel Rivals paks need a UTOC signature bypass (or equivalent) before ~mods will load."
+                .into(),
+        );
+        warnings
+    }
+}
+
+pub struct PavlovPlugin;
+
+impl GamePlugin for PavlovPlugin {
+    fn info(&self) -> GamePluginInfo {
+        GamePluginInfo {
+            id: "pavlov",
+            display_name: "Pavlov VR",
+            nexus_domain: "pavlov",
+            match_names: &["pavlov vr", "pavlov"],
+        }
+    }
+
+    fn preserve_staging_root_names(&self) -> &[&str] {
+        PAVLOV_PRESERVE
+    }
+
+    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+        resolve_ue_deploy(
+            install_path,
+            relative,
+            Some("Pavlov"),
+            &DeployContext::default(),
+        )
+    }
+
+    fn resolve_deploy_root_ctx(
+        &self,
+        install_path: &Path,
+        relative: &Path,
+        ctx: &DeployContext<'_>,
+    ) -> Result<PathBuf> {
+        resolve_ue_deploy(install_path, relative, Some("Pavlov"), ctx)
+    }
+
+    fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
+        let mut warnings = ue_preflight_warnings(install_path, Some("Pavlov"));
+        warnings.push(
+            "Official Pavlov VR map/mod discovery is the in-game mod.io browser. Linked paks go under Pavlov/Content/Paks/~mods — verify in-game that the content appeared."
+                .into(),
+        );
+        warnings
+    }
+
+    fn preflight_warnings_ctx(
+        &self,
+        install_path: &Path,
+        ctx: &DeployContext<'_>,
+    ) -> Vec<String> {
+        let preferred = ctx.project_name.or(Some("Pavlov"));
+        let mut warnings = ue_preflight_warnings(install_path, preferred);
+        warnings.push(
+            "Official Pavlov VR map/mod discovery is the in-game mod.io browser. Linked paks go under Pavlov/Content/Paks/~mods — verify in-game that the content appeared."
+                .into(),
+        );
+        warnings
+    }
+}
+
 /// Generic UE plugin: any install with detected (or overridden) project folder.
 pub struct UnrealEnginePlugin;
 
@@ -755,6 +962,56 @@ mod tests {
     fn palworld_and_hogwarts_match() {
         assert_eq!(PalworldPlugin.info().id, "palworld");
         assert_eq!(HogwartsLegacyPlugin.info().nexus_domain, "hogwartslegacy");
+    }
+
+    #[test]
+    fn ready_or_not_and_subnautica2_flat_pak() {
+        let install = Path::new("/game");
+        assert_eq!(
+            ReadyOrNotPlugin
+                .resolve_deploy_root(install, Path::new("Foo.pak"))
+                .unwrap(),
+            PathBuf::from("/game/ReadyOrNot/Content/Paks/~mods/Foo.pak")
+        );
+        assert_eq!(
+            Subnautica2Plugin
+                .resolve_deploy_root(install, Path::new("Foo.ucas"))
+                .unwrap(),
+            PathBuf::from("/game/Subnautica2/Content/Paks/~mods/Foo.ucas")
+        );
+    }
+
+    #[test]
+    fn deeprock_and_pavlov_flat_pak() {
+        let install = Path::new("/game");
+        assert_eq!(
+            DeepRockGalacticPlugin
+                .resolve_deploy_root(install, Path::new("mod_P.pak"))
+                .unwrap(),
+            PathBuf::from("/game/FSD/Content/Paks/~mods/mod_P.pak")
+        );
+        assert_eq!(
+            PavlovPlugin
+                .resolve_deploy_root(install, Path::new("Map.pak"))
+                .unwrap(),
+            PathBuf::from("/game/Pavlov/Content/Paks/~mods/Map.pak")
+        );
+    }
+
+    #[test]
+    fn marvel_rivals_nested_marvelgame_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marvel = tmp.path().join("MarvelGame").join("Marvel");
+        std::fs::create_dir_all(marvel.join("Content").join("Paks")).unwrap();
+        let dest = MarvelRivalsPlugin
+            .resolve_deploy_root(tmp.path(), Path::new("Skin.pak"))
+            .unwrap();
+        assert_eq!(
+            dest,
+            marvel.join("Content").join("Paks").join("~mods").join("Skin.pak")
+        );
+        let warns = MarvelRivalsPlugin.preflight_warnings(tmp.path());
+        assert!(warns.iter().any(|w| w.contains("signature bypass")));
     }
 
     #[test]

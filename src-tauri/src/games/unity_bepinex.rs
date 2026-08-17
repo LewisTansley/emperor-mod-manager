@@ -121,6 +121,95 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         thunderstore_community: "rounds",
         match_names: &["rounds"],
     },
+    BepInExTitleSeed {
+        plugin_id: "sonsoftheforest",
+        display_name: "Sons of the Forest",
+        nexus_domain: "sonsoftheforest",
+        thunderstore_community: "sons-of-the-forest",
+        match_names: &["sons of the forest", "sonsoftheforest"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "subnauticabelowzero",
+        display_name: "Subnautica: Below Zero",
+        nexus_domain: "subnauticabelowzero",
+        thunderstore_community: "subnautica-below-zero",
+        match_names: &["below zero", "subnauticabelowzero"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "subnautica",
+        display_name: "Subnautica",
+        nexus_domain: "subnautica",
+        thunderstore_community: "subnautica",
+        match_names: &["subnautica"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "schedule1",
+        display_name: "Schedule I",
+        nexus_domain: "schedule1",
+        thunderstore_community: "schedule-i",
+        match_names: &["schedule 1", "schedule i", "schedule1"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "repo",
+        display_name: "R.E.P.O.",
+        nexus_domain: "repo",
+        thunderstore_community: "repo",
+        match_names: &["r.e.p.o.", "r.e.p.o", "repo"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "peak",
+        display_name: "PEAK",
+        nexus_domain: "peak",
+        thunderstore_community: "peak",
+        match_names: &["peak"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "h3vr",
+        display_name: "H3VR",
+        nexus_domain: "h3vr",
+        thunderstore_community: "h3vr",
+        match_names: &[
+            "hot dogs, horseshoes and hand grenades",
+            "hot dogs, horseshoes",
+            "hot dogs horseshoes",
+            "h3vr",
+        ],
+    },
+    BepInExTitleSeed {
+        plugin_id: "ultrakill",
+        display_name: "ULTRAKILL",
+        nexus_domain: "ultrakill",
+        thunderstore_community: "ultrakill",
+        match_names: &["ultrakill"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "atlyss",
+        display_name: "ATLYSS",
+        nexus_domain: "atlyss",
+        thunderstore_community: "atlyss",
+        match_names: &["atlyss"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "dysonsphereprogram",
+        display_name: "Dyson Sphere Program",
+        nexus_domain: "dysonsphereprogram",
+        thunderstore_community: "dyson-sphere-program",
+        match_names: &["dyson sphere program", "dysonsphereprogram"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "inscryption",
+        display_name: "Inscryption",
+        nexus_domain: "inscryption",
+        thunderstore_community: "inscryption",
+        match_names: &["inscryption"],
+    },
+    BepInExTitleSeed {
+        plugin_id: "hollowknightsilksong",
+        display_name: "Hollow Knight: Silksong",
+        nexus_domain: "hollowknightsilksong",
+        thunderstore_community: "hollow-knight-silksong",
+        match_names: &["silksong", "hollow knight: silksong", "hollowknightsilksong"],
+    },
 ];
 
 pub fn seed_by_plugin_id(plugin_id: &str) -> Option<&'static BepInExTitleSeed> {
@@ -137,7 +226,20 @@ pub fn seed_by_nexus_domain(domain: &str) -> Option<&'static BepInExTitleSeed> {
 }
 
 pub fn thunderstore_community_for_plugin(plugin_id: &str) -> Option<&'static str> {
-    seed_by_plugin_id(plugin_id).map(|s| s.thunderstore_community)
+    if let Some(s) = seed_by_plugin_id(plugin_id) {
+        return Some(s.thunderstore_community);
+    }
+    extra_thunderstore_community(plugin_id)
+}
+
+/// Thunderstore communities for named titles that are not BepInEx.
+fn extra_thunderstore_community(plugin_id: &str) -> Option<&'static str> {
+    match plugin_id {
+        "bladeandsorcery" => Some("blade-and-sorcery"),
+        "bonelab" => Some("bonelab"),
+        "boneworks" => Some("boneworks"),
+        _ => None,
+    }
 }
 
 /// True when the install looks like a Unity game (or already has BepInEx).
@@ -500,6 +602,95 @@ bepinex_title_plugin!(
     &["against the storm", "againstthestorm"]
 );
 bepinex_title_plugin!(RoundsPlugin, "rounds", "ROUNDS", "rounds", &["rounds"]);
+bepinex_title_plugin!(
+    SonsOfTheForestPlugin,
+    "sonsoftheforest",
+    "Sons of the Forest",
+    "sonsoftheforest",
+    &["sons of the forest", "sonsoftheforest"]
+);
+bepinex_title_plugin!(
+    SubnauticaBelowZeroPlugin,
+    "subnauticabelowzero",
+    "Subnautica: Below Zero",
+    "subnauticabelowzero",
+    &["below zero", "subnauticabelowzero"]
+);
+bepinex_title_plugin!(
+    SubnauticaPlugin,
+    "subnautica",
+    "Subnautica",
+    "subnautica",
+    &["subnautica"]
+);
+bepinex_title_plugin!(
+    Schedule1Plugin,
+    "schedule1",
+    "Schedule I",
+    "schedule1",
+    &["schedule 1", "schedule i", "schedule1"]
+);
+bepinex_title_plugin!(
+    RepoPlugin,
+    "repo",
+    "R.E.P.O.",
+    "repo",
+    &["r.e.p.o.", "r.e.p.o", "repo"]
+);
+bepinex_title_plugin!(
+    PeakPlugin,
+    "peak",
+    "PEAK",
+    "peak",
+    &["peak"]
+);
+bepinex_title_plugin!(
+    H3vrPlugin,
+    "h3vr",
+    "H3VR",
+    "h3vr",
+    &[
+        "hot dogs, horseshoes and hand grenades",
+        "hot dogs, horseshoes",
+        "hot dogs horseshoes",
+        "h3vr",
+    ]
+);
+bepinex_title_plugin!(
+    UltrakillPlugin,
+    "ultrakill",
+    "ULTRAKILL",
+    "ultrakill",
+    &["ultrakill"]
+);
+bepinex_title_plugin!(
+    AtlyssPlugin,
+    "atlyss",
+    "ATLYSS",
+    "atlyss",
+    &["atlyss"]
+);
+bepinex_title_plugin!(
+    DysonSphereProgramPlugin,
+    "dysonsphereprogram",
+    "Dyson Sphere Program",
+    "dysonsphereprogram",
+    &["dyson sphere program", "dysonsphereprogram"]
+);
+bepinex_title_plugin!(
+    InscryptionPlugin,
+    "inscryption",
+    "Inscryption",
+    "inscryption",
+    &["inscryption"]
+);
+bepinex_title_plugin!(
+    HollowKnightSilksongPlugin,
+    "hollowknightsilksong",
+    "Hollow Knight: Silksong",
+    "hollowknightsilksong",
+    &["silksong", "hollow knight: silksong", "hollowknightsilksong"]
+);
 
 /// Generic BepInEx plugin for any detected Unity install.
 pub struct BepInExPlugin;
@@ -604,5 +795,39 @@ mod tests {
         fs::create_dir_all(tmp.path().join("Game_Data").join("Managed")).unwrap();
         assert!(looks_like_unity_install(tmp.path()));
         assert_eq!(detect_unity_runtime(tmp.path()), UnityRuntime::Mono);
+    }
+
+    #[test]
+    fn schedule1_dll_goes_to_plugins() {
+        let dest = Schedule1Plugin
+            .resolve_deploy_root(Path::new("/game"), Path::new("CoolMod.dll"))
+            .unwrap();
+        assert_eq!(dest, PathBuf::from("/game/BepInEx/plugins/CoolMod.dll"));
+        assert_eq!(
+            thunderstore_community_for_plugin("schedule1"),
+            Some("schedule-i")
+        );
+        assert_eq!(
+            thunderstore_community_for_plugin("sonsoftheforest"),
+            Some("sons-of-the-forest")
+        );
+        assert_eq!(
+            thunderstore_community_for_plugin("bladeandsorcery"),
+            Some("blade-and-sorcery")
+        );
+        assert_eq!(thunderstore_community_for_plugin("repo"), Some("repo"));
+        assert_eq!(
+            thunderstore_community_for_plugin("hollowknightsilksong"),
+            Some("hollow-knight-silksong")
+        );
+        assert_eq!(
+            thunderstore_community_for_plugin("dysonsphereprogram"),
+            Some("dyson-sphere-program")
+        );
+        assert_eq!(thunderstore_community_for_plugin("bonelab"), Some("bonelab"));
+        assert_eq!(
+            thunderstore_community_for_plugin("boneworks"),
+            Some("boneworks")
+        );
     }
 }

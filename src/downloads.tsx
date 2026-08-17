@@ -19,12 +19,20 @@ export type AssistQueueState = {
   completed: number;
   failures: { name: string; reason: string }[];
   cancelled: boolean;
+  collection?: {
+    slug: string;
+    name: string;
+    revision: number | null;
+    existingModIds: string[];
+    files: { modId: number; fileId: number }[];
+  } | null;
 };
 
 /** Batch still has in-flight downloads after Assist sequencing finished. */
 export type ActiveDownloadBatch = {
   id: string;
   label: string | null;
+  collection?: AssistQueueState["collection"];
 };
 
 export function createQueueEntry(

@@ -12,6 +12,7 @@ import type {
   DetectedGame,
   DownloadItem,
   GameInfo,
+  InstalledCollection,
   ManagedGame,
   ModDetail,
   ModFileInfo,
@@ -125,6 +126,7 @@ export const api = {
     namespace: string;
     name: string;
     version?: string | null;
+    recordAsModpack?: boolean | null;
   }) => invoke<StagedMod[]>("download_thunderstore_mod", args),
   getModioMod: (gameId: number, modId: number) =>
     invoke<ModioModDetail>("get_modio_mod", { gameId, modId }),
@@ -152,6 +154,23 @@ export const api = {
     invoke<CollectionSearchPage>("search_collections", {
       domain,
       query,
+      sort: opts.sort ?? null,
+      category: opts.category ?? null,
+      tagsInclude: opts.tagsInclude ?? null,
+      tagsExclude: opts.tagsExclude ?? null,
+      gameVersion: opts.gameVersion ?? null,
+      offset: opts.offset ?? null,
+      count: opts.count ?? null,
+    }),
+  searchCollectionCatalog: (
+    gameId: string,
+    query: string,
+    opts: BrowseSearchOpts & { sourceFilter?: string | null } = {},
+  ) =>
+    invoke<CollectionSearchPage>("search_collection_catalog", {
+      gameId,
+      query,
+      sourceFilter: opts.sourceFilter ?? null,
       sort: opts.sort ?? null,
       category: opts.category ?? null,
       tagsInclude: opts.tagsInclude ?? null,
@@ -210,7 +229,30 @@ export const api = {
     slug: string;
     revision?: number | null;
     includeOptional: boolean;
+    name?: string | null;
   }) => invoke<number>("install_collection", args),
+  importThunderstoreProfile: (gameId: string, code: string) =>
+    invoke<InstalledCollection>("import_thunderstore_profile", { gameId, code }),
+  listInstalledCollections: (gameId: string) =>
+    invoke<InstalledCollection[]>("list_installed_collections", { gameId }),
+  uninstallCollection: (gameId: string, collectionId: string) =>
+    invoke<number>("uninstall_collection", { gameId, collectionId }),
+  recordNexusCollection: (args: {
+    gameId: string;
+    slug: string;
+    name: string;
+    revision?: number | null;
+    files: { modId: number; fileId: number }[];
+    existingModIds?: string[] | null;
+  }) =>
+    invoke<InstalledCollection>("record_nexus_collection", {
+      gameId: args.gameId,
+      slug: args.slug,
+      name: args.name,
+      revision: args.revision ?? null,
+      files: args.files,
+      existingModIds: args.existingModIds ?? null,
+    }),
   handleNxm: (url: string) => invoke<DownloadItem>("handle_nxm", { url }),
   importModArchive: (args: {
     gameId: string;

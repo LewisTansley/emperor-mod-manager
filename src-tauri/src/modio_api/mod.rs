@@ -350,6 +350,13 @@ pub fn seed_modio_game_id(plugin_id: &str) -> Option<u32> {
         "deeprockgalactic" => Some(2475),
         // OpenXcom (generic manage)
         "openxcom" => Some(51),
+        // Blade & Sorcery (official SDK / in-game manager)
+        "bladeandsorcery" => Some(165),
+        // BONELAB (CDN /mods/3541/...)
+        "bonelab" => Some(3541),
+        "snowrunner" => Some(123),
+        "pavlov" => Some(3959),
+        "spaceengineers" => Some(62),
         _ => None,
     }
 }
@@ -361,6 +368,12 @@ mod tests {
     #[test]
     fn seed_lookup() {
         assert_eq!(seed_modio_game_id("openxcom"), Some(51));
+        assert_eq!(seed_modio_game_id("bladeandsorcery"), Some(165));
+        assert_eq!(seed_modio_game_id("deeprockgalactic"), Some(2475));
+        assert_eq!(seed_modio_game_id("bonelab"), Some(3541));
+        assert_eq!(seed_modio_game_id("snowrunner"), Some(123));
+        assert_eq!(seed_modio_game_id("pavlov"), Some(3959));
+        assert_eq!(seed_modio_game_id("spaceengineers"), Some(62));
         assert_eq!(seed_modio_game_id("valheim"), None);
     }
 }

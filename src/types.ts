@@ -205,6 +205,12 @@ export type CollectionHit = {
   updated_at: string | null;
   mod_count: number | null;
   file_size: number | null;
+  source?: "nexus" | "thunderstore";
+  id?: string;
+  community?: string | null;
+  namespace?: string | null;
+  package_name?: string | null;
+  latest_version?: string | null;
 };
 
 export type CollectionDetail = {
@@ -256,8 +262,28 @@ export type ModSearchPage = {
 
 export type CollectionSearchPage = {
   items: CollectionHit[];
-  nodes_count: number;
+  nodes_count?: number;
   total_count: number;
+  next_offset?: number;
+  has_more?: boolean;
+  nexus_available?: boolean;
+  thunderstore_available?: boolean;
+};
+
+export type InstalledCollection = {
+  id: string;
+  source: "nexus" | "thunderstore";
+  kind: "collection" | "modpack" | "profile";
+  name: string;
+  slug?: string | null;
+  namespace?: string | null;
+  package_name?: string | null;
+  community?: string | null;
+  revision?: number | null;
+  version?: string | null;
+  profile_code?: string | null;
+  mod_ids: string[];
+  installed_at: string;
 };
 
 export type StagedMod = {
@@ -277,6 +303,9 @@ export type StagedMod = {
   modio_game_id?: number | null;
   modio_mod_id?: number | null;
   modio_file_id?: number | null;
+  collection_ids?: string[];
+  independent?: boolean;
+  depends_on?: string[];
 };
 
 export type ModioModDetail = {

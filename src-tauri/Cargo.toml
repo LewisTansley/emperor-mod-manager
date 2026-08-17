@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.2.2"
+version = "0.3.0"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -28,6 +28,8 @@ thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+serde_yaml = "0.9"
 zip = "2"
 unrar-ng = "0.7"
 sevenz-rust = "0.6"

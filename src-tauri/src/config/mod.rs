@@ -135,6 +135,10 @@ impl Paths {
         self.game_data_dir(game_id).join("loadorder.json")
     }
 
+    pub fn collections_file(&self, game_id: &str) -> PathBuf {
+        self.game_data_dir(game_id).join("collections.json")
+    }
+
     pub fn deploy_manifest(&self, game_id: &str) -> PathBuf {
         self.game_data_dir(game_id).join("deployed.json")
     }

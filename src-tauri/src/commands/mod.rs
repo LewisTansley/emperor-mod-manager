@@ -1,7 +1,7 @@
 //! Tauri IPC commands.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -19,12 +19,12 @@ use crate::{
     detection::{self, DetectedGame},
     games, migration,
     modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
-    mods::{self, StagedMod},
+    mods::{self, CollectionKind, CollectionSource, InstalledCollection, StagedMod},
     nexus::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
         ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
     },
-    thunderstore::{self, ThunderstoreClient, TsPackageDetail},
+    thunderstore::{self, ThunderstoreClient, TsPackageDetail, TsDependency},
 };
 
 pub enum DownloadResumeSource {
@@ -1237,6 +1237,43 @@ fn interleave_catalog_many(sources: Vec<Vec<CatalogHit>>) -> Vec<CatalogHit> {
     out
 }
 
+fn catalog_source_unavailable_error(
+    filter: &str,
+    has_nexus: bool,
+    has_ts: bool,
+    has_modio: bool,
+    collections: bool,
+) -> String {
+    let mut configured = Vec::new();
+    if has_nexus {
+        configured.push("Nexus");
+    }
+    if has_ts {
+        configured.push("Thunderstore");
+    }
+    if has_modio && !collections {
+        configured.push("mod.io");
+    }
+    if configured.is_empty() {
+        if collections {
+            return "Collections require a Nexus Mods domain or Thunderstore community for this game."
+                .into();
+        }
+        return "No catalog sources configured. Set a Nexus domain, Thunderstore community, and/or mod.io game ID."
+            .into();
+    }
+    let filter_label = match filter {
+        "nexus" => "Nexus",
+        "thunderstore" => "Thunderstore",
+        "modio" => "mod.io",
+        other => other,
+    };
+    let joined = configured.join(" / ");
+    format!(
+        "No results for the {filter_label} filter — this game only has {joined} configured. Switch source filter to All or {joined}."
+    )
+}
+
 #[tauri::command]
 pub async fn search_catalog(
     state: State<'_, AppState>,
@@ -1275,10 +1312,13 @@ pub async fn search_catalog(
     let want_ts = (filter == "all" || filter == "thunderstore") && ts_community.is_some();
     let want_modio = (filter == "all" || filter == "modio") && modio_game_id.is_some();
     if !want_nexus && !want_ts && !want_modio {
-        return Err(
-            "No catalog sources configured. Set a Nexus domain, Thunderstore community, and/or mod.io game ID."
-                .into(),
-        );
+        return Err(catalog_source_unavailable_error(
+            &filter,
+            nexus_domain.is_some(),
+            ts_community.is_some(),
+            modio_game_id.is_some(),
+            false,
+        ));
     }
 
     let offset = offset.unwrap_or(0) as usize;
@@ -1509,6 +1549,241 @@ fn filter_ts_packages(
     (page, total)
 }
 
+fn filter_ts_modpacks(
+    community: &str,
+    packages: &[thunderstore::TsPackage],
+    query: &str,
+    include_nsfw: bool,
+    offset: usize,
+    count: usize,
+) -> (Vec<TsPackageDetail>, usize) {
+    let packs: Vec<_> = packages
+        .iter()
+        .filter(|p| thunderstore::is_modpack_category(&p.categories))
+        .cloned()
+        .collect();
+    filter_ts_packages(community, &packs, query, include_nsfw, offset, count)
+}
+
+fn snapshot_mod_ids(paths: &crate::config::Paths, game_id: &str) -> Result<HashSet<String>, String> {
+    let order = mods::load_loadorder(paths, game_id).map_err(|e| e.to_string())?;
+    Ok(order.mods.into_iter().map(|m| m.id).collect())
+}
+
+async fn load_ts_packages_cached(
+    state: &AppState,
+    community: &str,
+) -> Result<Vec<thunderstore::TsPackage>, String> {
+    let cached = {
+        let cache = state.ts_package_cache.lock().map_err(|e| e.to_string())?;
+        cache.get(community).and_then(|(at, pkgs)| {
+            if at.elapsed() < Duration::from_secs(15 * 60) {
+                Some(pkgs.clone())
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(packages) = cached {
+        return Ok(packages);
+    }
+    let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+    let packages = client
+        .list_packages(community)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(mut cache) = state.ts_package_cache.lock() {
+        cache.insert(community.to_string(), (Instant::now(), packages.clone()));
+    }
+    Ok(packages)
+}
+
+fn collection_hit_from_ts(detail: TsPackageDetail) -> nexus::CollectionHit {
+    let slug = format!("{}-{}", detail.namespace, detail.name);
+    let dep_count = detail
+        .versions
+        .first()
+        .map(|v| v.dependencies.len() as u64 + 1);
+    nexus::CollectionHit {
+        slug,
+        name: detail.name.clone(),
+        summary: detail.description.clone(),
+        endorsements: None,
+        total_downloads: Some(detail.downloads),
+        domain_name: None,
+        revision_number: None,
+        tile_image_url: detail.icon_url.clone(),
+        author: Some(detail.namespace.clone()),
+        category: detail.categories.first().cloned(),
+        overall_rating: Some(detail.rating_score as f64),
+        overall_rating_count: None,
+        created_at: None,
+        updated_at: None,
+        mod_count: dep_count,
+        file_size: detail.versions.first().map(|v| v.file_size),
+        source: "thunderstore".into(),
+        id: mods::thunderstore_modpack_id(&detail.community, &detail.namespace, &detail.name),
+        community: Some(detail.community),
+        namespace: Some(detail.namespace),
+        package_name: Some(detail.name),
+        latest_version: detail.latest_version,
+    }
+}
+
+fn apply_ts_depends_on(
+    paths: &crate::config::Paths,
+    game_id: &str,
+    packages: &[TsPackageDetail],
+) -> Result<(), String> {
+    let known: HashSet<String> = packages
+        .iter()
+        .map(|p| mods::thunderstore_mod_id(&p.namespace, &p.name))
+        .collect();
+    for pkg in packages {
+        let id = mods::thunderstore_mod_id(&pkg.namespace, &pkg.name);
+        let deps: Vec<String> = pkg
+            .versions
+            .first()
+            .map(|v| {
+                v.dependencies
+                    .iter()
+                    .filter_map(|raw| TsDependency::parse(raw))
+                    .map(|d| mods::thunderstore_mod_id(&d.namespace, &d.name))
+                    .filter(|dep_id| known.contains(dep_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        mods::merge_mod_meta(paths, game_id, &id, &[], &deps, None, None)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+async fn stage_thunderstore_package_newest(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    client: &ThunderstoreClient,
+    game_id: &str,
+    community: &str,
+    pkg: &TsPackageDetail,
+    display_name: &str,
+    enabled: Option<bool>,
+) -> Result<StagedMod, String> {
+    let ns = pkg.namespace.clone();
+    let pkg_name = pkg.name.clone();
+    let ver = pkg
+        .versions
+        .first()
+        .ok_or_else(|| format!("No versions for {}", pkg.full_name))?;
+    let incoming_ver = &ver.version_number;
+    let order = mods::load_loadorder(&state.paths, game_id).map_err(|e| e.to_string())?;
+    if let Some(existing) = mods::find_thunderstore_package(&order, &ns, &pkg_name) {
+        if !mods::incoming_is_newer(existing.version.as_deref(), incoming_ver) {
+            let id = existing.id.clone();
+            let apply_enabled = match enabled {
+                Some(true) => Some(true),
+                _ => None,
+            };
+            return mods::merge_mod_meta(
+                &state.paths,
+                game_id,
+                &id,
+                &[],
+                &[],
+                None,
+                apply_enabled,
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Missing staged package {id}"));
+        }
+    }
+
+    let label = format!("{}-{}", pkg.full_name, incoming_ver);
+    let dl_id = uuid::Uuid::new_v4().to_string();
+    let dest = state.paths.downloads_dir().join(format!(
+        "ts_{}_{}.zip",
+        dl_id,
+        sanitize_filename::sanitize(&pkg_name)
+    ));
+
+    {
+        let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+        downloads.insert(
+            0,
+            DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+        );
+    }
+    let _ = app.emit("downloads-changed", ());
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    {
+        let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
+        jobs.insert(
+            dl_id.clone(),
+            DownloadJob {
+                cancel: cancel.clone(),
+                pause: pause.clone(),
+                batch_id: None,
+                dest: Some(dest.clone()),
+                source: None,
+            },
+        );
+    }
+
+    let control = TransferControl {
+        cancel: cancel.clone(),
+        pause: pause.clone(),
+    };
+    match client.download_version(ver, &dest, Some(&control)).await {
+        Ok(()) => {
+            let staged = mods::stage_thunderstore_mod(
+                &state.paths,
+                game_id,
+                community,
+                &ns,
+                &pkg_name,
+                incoming_ver,
+                Some(pkg.uuid4.clone()),
+                display_name,
+                &dest,
+            )
+            .map_err(|e| e.to_string())?;
+            if let Some(false) = enabled {
+                let _ = mods::merge_mod_meta(
+                    &state.paths,
+                    game_id,
+                    &staged.id,
+                    &[],
+                    &[],
+                    None,
+                    Some(false),
+                );
+            }
+            if let Ok(mut downloads) = state.downloads.lock() {
+                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                    d.status = "done".into();
+                }
+            }
+            clear_download_job(state, &dl_id);
+            let _ = app.emit("downloads-changed", ());
+            Ok(staged)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if let Ok(mut downloads) = state.downloads.lock() {
+                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                    d.status = "failed".into();
+                    d.error = Some(msg.clone());
+                }
+            }
+            clear_download_job(state, &dl_id);
+            let _ = app.emit("downloads-changed", ());
+            Err(msg)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_thunderstore_package(
     community: String,
@@ -1531,6 +1806,7 @@ pub async fn download_thunderstore_mod(
     namespace: String,
     name: String,
     version: Option<String>,
+    record_as_modpack: Option<bool>,
 ) -> Result<Vec<StagedMod>, String> {
     let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
     let order = client
@@ -1538,99 +1814,199 @@ pub async fn download_thunderstore_mod(
         .await
         .map_err(|e| e.to_string())?;
 
+    let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut staged_all = Vec::new();
-    for pkg in order {
-        let ns = pkg.namespace.clone();
-        let pkg_name = pkg.name.clone();
-        if mods::has_thunderstore_package(&state.paths, &game_id, &ns, &pkg_name)
-            .map_err(|e| e.to_string())?
-        {
-            continue;
-        }
-        let ver = pkg
-            .versions
-            .first()
-            .ok_or_else(|| format!("No versions for {}", pkg.full_name))?;
-        let label = format!("{}-{}", pkg.full_name, ver.version_number);
-        let dl_id = uuid::Uuid::new_v4().to_string();
-        let dest = state.paths.downloads_dir().join(format!(
-            "ts_{}_{}.zip",
-            dl_id,
-            sanitize_filename::sanitize(&pkg_name)
-        ));
-
-        {
-            let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
-            downloads.insert(
-                0,
-                DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
-            );
-        }
-        let _ = app.emit("downloads-changed", ());
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        let pause = Arc::new(AtomicBool::new(false));
-        {
-            let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
-            jobs.insert(
-                dl_id.clone(),
-                DownloadJob {
-                    cancel: cancel.clone(),
-                    pause: pause.clone(),
-                    batch_id: None,
-                    dest: Some(dest.clone()),
-                    source: None,
-                },
-            );
-        }
-
-        let control = TransferControl {
-            cancel: cancel.clone(),
-            pause: pause.clone(),
+    for pkg in &order {
+        let display = if pkg.name == name && pkg.namespace == namespace {
+            pkg.name.clone()
+        } else {
+            format!("{} (dependency)", pkg.name)
         };
-        match client.download_version(ver, &dest, Some(&control)).await {
-            Ok(()) => {
-                let display = if pkg.name == name && pkg.namespace == namespace {
-                    pkg.name.clone()
-                } else {
-                    format!("{} (dependency)", pkg.name)
-                };
-                let staged = mods::stage_thunderstore_mod(
-                    &state.paths,
-                    &game_id,
-                    &community,
-                    &ns,
-                    &pkg_name,
-                    &ver.version_number,
-                    Some(pkg.uuid4.clone()),
-                    &display,
-                    &dest,
-                )
-                .map_err(|e| e.to_string())?;
-                staged_all.push(staged);
-                if let Ok(mut downloads) = state.downloads.lock() {
-                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                        d.status = "done".into();
-                    }
-                }
-                clear_download_job(&state, &dl_id);
-                let _ = app.emit("downloads-changed", ());
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if let Ok(mut downloads) = state.downloads.lock() {
-                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                        d.status = "failed".into();
-                        d.error = Some(msg.clone());
-                    }
-                }
-                clear_download_job(&state, &dl_id);
-                let _ = app.emit("downloads-changed", ());
-                return Err(msg);
-            }
+        let staged = stage_thunderstore_package_newest(
+            &app,
+            &state,
+            &client,
+            &game_id,
+            &community,
+            pkg,
+            &display,
+            None,
+        )
+        .await?;
+        staged_all.push(staged);
+    }
+    apply_ts_depends_on(&state.paths, &game_id, &order)?;
+
+    if record_as_modpack.unwrap_or(false) {
+        let member_ids: Vec<String> = order
+            .iter()
+            .map(|p| mods::thunderstore_mod_id(&p.namespace, &p.name))
+            .collect();
+        let new_ids: Vec<String> = member_ids
+            .iter()
+            .filter(|id| !before.contains(*id))
+            .cloned()
+            .collect();
+        let root = order
+            .iter()
+            .find(|p| p.namespace == namespace && p.name == name);
+        let collection = InstalledCollection {
+            id: mods::thunderstore_modpack_id(&community, &namespace, &name),
+            source: CollectionSource::Thunderstore,
+            kind: CollectionKind::Modpack,
+            name: root.map(|p| p.name.clone()).unwrap_or_else(|| name.clone()),
+            slug: Some(format!("{namespace}-{name}")),
+            namespace: Some(namespace.clone()),
+            package_name: Some(name.clone()),
+            community: Some(community.clone()),
+            revision: None,
+            version: root.and_then(|p| p.latest_version.clone()),
+            profile_code: None,
+            mod_ids: member_ids,
+            installed_at: String::new(),
+        };
+        mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(staged_all)
+}
+
+#[tauri::command]
+pub async fn import_thunderstore_profile(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    code: String,
+) -> Result<InstalledCollection, String> {
+    let community = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        game.thunderstore_community
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Set a Thunderstore community for this game first.".to_string())?
+    };
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        return Err("Paste a Thunderstore / r2modman profile code.".into());
+    }
+
+    let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+    let bytes = client
+        .fetch_legacy_profile(&code)
+        .await
+        .map_err(|e| e.to_string())?;
+    let temp = state
+        .paths
+        .downloads_dir()
+        .join(format!("ts_profile_{}", sanitize_filename::sanitize(&code)));
+    let manifest =
+        thunderstore::extract_profile_zip(&bytes, &temp).map_err(|e| e.to_string())?;
+    if let Some(slug) = manifest.community.as_deref() {
+        if !slug.is_empty() && !thunderstore::community_slug_matches(slug, &community) {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(format!(
+                "This profile is for '{slug}', but this game is set to Thunderstore community '{community}'."
+            ));
         }
     }
-    Ok(staged_all)
+
+    let packages = load_ts_packages_cached(&state, &community).await?;
+    let by_key: HashMap<String, thunderstore::TsPackage> = packages
+        .into_iter()
+        .map(|p| (format!("{}-{}", p.owner, p.name).to_lowercase(), p))
+        .collect();
+
+    let before = snapshot_mod_ids(&state.paths, &game_id)?;
+    let mut member_ids = Vec::new();
+    let mut details_for_deps = Vec::new();
+
+    for m in &manifest.mods {
+        let Some((ns, pkg_name)) = thunderstore::parse_package_ident(&m.name) else {
+            log::warn!("Skipping unreadable profile package {}", m.name);
+            continue;
+        };
+        let key = format!("{ns}-{pkg_name}").to_lowercase();
+        let Some(pkg) = by_key.get(&key) else {
+            log::warn!("Profile package {ns}-{pkg_name} not found in {community}");
+            continue;
+        };
+        let mut detail = thunderstore::detail_from_package(&community, pkg.clone());
+        let ver = m.version.as_string();
+        if let Some(pos) = detail
+            .versions
+            .iter()
+            .position(|v| v.version_number == ver)
+        {
+            let selected = detail.versions.remove(pos);
+            detail.versions.insert(0, selected);
+            detail.latest_version = Some(ver);
+        } else {
+            detail.latest_version = detail.versions.first().map(|v| v.version_number.clone());
+        }
+        let enabled = if m.enabled { None } else { Some(false) };
+        let staged = stage_thunderstore_package_newest(
+            &app,
+            &state,
+            &client,
+            &game_id,
+            &community,
+            &detail,
+            &pkg_name,
+            enabled,
+        )
+        .await?;
+        member_ids.push(staged.id.clone());
+        details_for_deps.push(detail);
+    }
+
+    apply_ts_depends_on(&state.paths, &game_id, &details_for_deps)?;
+
+    let overlay_id = format!(
+        "overlay_{}",
+        mods::thunderstore_profile_id(&code).replace(':', "_")
+    );
+    if thunderstore::profile_has_overlay_files(&temp) {
+        let overlay_name = format!("{} configs", manifest.profile_name);
+        let staged = mods::stage_overlay_dir(
+            &state.paths,
+            &game_id,
+            &overlay_id,
+            &overlay_name,
+            &temp,
+        )
+        .map_err(|e| e.to_string())?;
+        member_ids.push(staged.id);
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+
+    let new_ids: Vec<String> = member_ids
+        .iter()
+        .filter(|id| !before.contains(*id))
+        .cloned()
+        .collect();
+    let collection = InstalledCollection {
+        id: mods::thunderstore_profile_id(&code),
+        source: CollectionSource::Thunderstore,
+        kind: CollectionKind::Profile,
+        name: manifest.profile_name,
+        slug: None,
+        namespace: None,
+        package_name: None,
+        community: Some(community),
+        revision: None,
+        version: None,
+        profile_code: Some(code),
+        mod_ids: member_ids,
+        installed_at: String::new(),
+    };
+    mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1696,16 +2072,13 @@ pub async fn download_modio_mod(
     let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
     let install_deps = install_deps.unwrap_or(true);
 
-    let mut queue: Vec<(u64, String, Option<u64>, Option<String>)> = Vec::new();
+    let mut queue: Vec<(u64, String, Option<u64>, Option<String>, bool)> = Vec::new();
+    let mut dep_ids: Vec<u64> = Vec::new();
     if install_deps {
         match client.dependency_mod_ids(modio_game_id, mod_id).await {
             Ok(deps) => {
                 for dep_id in deps {
-                    if mods::has_modio_mod(&state.paths, &game_id, dep_id)
-                        .map_err(|e| e.to_string())?
-                    {
-                        continue;
-                    }
+                    dep_ids.push(dep_id);
                     let detail = client
                         .get_mod(modio_game_id, dep_id)
                         .await
@@ -1715,21 +2088,17 @@ pub async fn download_modio_mod(
                         format!("{} (dependency)", detail.name),
                         detail.primary_file_id,
                         None,
+                        true,
                     ));
                 }
             }
             Err(e) => log::warn!("mod.io deps lookup failed: {e}"),
         }
     }
-    queue.push((mod_id, name, file_id, version));
+    queue.push((mod_id, name, file_id, version, false));
 
     let mut staged_all = Vec::new();
-    for (mid, label, fid, ver) in queue {
-        if mods::has_modio_mod(&state.paths, &game_id, mid).map_err(|e| e.to_string())?
-            && mid != mod_id
-        {
-            continue;
-        }
+    for (mid, label, fid, ver, _is_dep) in queue {
         let detail = client
             .get_mod(modio_game_id, mid)
             .await
@@ -1737,6 +2106,22 @@ pub async fn download_modio_mod(
         let resolved_file = fid
             .or(detail.primary_file_id)
             .ok_or_else(|| format!("No downloadable file for mod.io mod {mid}"))?;
+        let incoming_ver = ver.clone().or(None);
+        let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+        if let Some(existing) = mods::find_modio_mod(&order, modio_game_id, mid) {
+            let same_file = existing.modio_file_id == Some(resolved_file);
+            let keep = if same_file {
+                true
+            } else if let Some(inc) = incoming_ver.as_deref().filter(|s| !s.is_empty()) {
+                !mods::incoming_is_newer(existing.version.as_deref(), inc)
+            } else {
+                existing.version.is_some()
+            };
+            if keep {
+                staged_all.push(existing.clone());
+                continue;
+            }
+        }
         let dl_id = uuid::Uuid::new_v4().to_string();
         let dest = state.paths.downloads_dir().join(format!(
             "modio_{}_{}_{}.zip",
@@ -1791,6 +2176,21 @@ pub async fn download_modio_mod(
             }
         }
     }
+
+    let root_id = mods::modio_identity_id(modio_game_id, mod_id);
+    let dep_staged: Vec<String> = dep_ids
+        .iter()
+        .map(|id| mods::modio_identity_id(modio_game_id, *id))
+        .collect();
+    let _ = mods::merge_mod_meta(
+        &state.paths,
+        &game_id,
+        &root_id,
+        &[],
+        &dep_staged,
+        None,
+        None,
+    );
     Ok(staged_all)
 }
 
@@ -1869,6 +2269,150 @@ pub async fn search_collections(
         .search_collections(&domain, &query, adult, &opts)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionCatalogPage {
+    pub items: Vec<nexus::CollectionHit>,
+    pub total_count: u32,
+    pub next_offset: u32,
+    pub has_more: bool,
+    pub nexus_available: bool,
+    pub thunderstore_available: bool,
+}
+
+fn interleave_collection_hits(sources: Vec<Vec<nexus::CollectionHit>>) -> Vec<nexus::CollectionHit> {
+    let mut iters: Vec<_> = sources
+        .into_iter()
+        .map(|v| v.into_iter().peekable())
+        .collect();
+    let mut out = Vec::new();
+    loop {
+        let mut progressed = false;
+        for it in iters.iter_mut() {
+            if let Some(item) = it.next() {
+                out.push(item);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn search_collection_catalog(
+    state: State<'_, AppState>,
+    game_id: String,
+    query: String,
+    source_filter: Option<String>,
+    sort: Option<String>,
+    category: Option<String>,
+    tags_include: Option<Vec<String>>,
+    tags_exclude: Option<Vec<String>>,
+    game_version: Option<String>,
+    offset: Option<u32>,
+    count: Option<u32>,
+) -> Result<CollectionCatalogPage, String> {
+    let (nexus_domain, ts_community, adult) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (
+            if game.nexus_domain.is_empty() {
+                None
+            } else {
+                Some(game.nexus_domain.clone())
+            },
+            game.thunderstore_community.clone(),
+            cfg.adult_content,
+        )
+    };
+    let filter = source_filter.unwrap_or_else(|| "all".into()).to_lowercase();
+    let want_nexus = (filter == "all" || filter == "nexus") && nexus_domain.is_some();
+    let want_ts = (filter == "all" || filter == "thunderstore") && ts_community.is_some();
+    if !want_nexus && !want_ts {
+        return Err(catalog_source_unavailable_error(
+            &filter,
+            nexus_domain.is_some(),
+            ts_community.is_some(),
+            false,
+            true,
+        ));
+    }
+
+    let offset = offset.unwrap_or(0) as usize;
+    let count = {
+        let c = count.unwrap_or(25) as usize;
+        if c == 0 {
+            25
+        } else {
+            c
+        }
+    };
+
+    let mut nexus_hits = Vec::new();
+    let mut nexus_total = 0u32;
+    let mut nexus_available = false;
+    if want_nexus {
+        if let Some(domain) = &nexus_domain {
+            match state.client() {
+                Ok(client) => {
+                    nexus_available = true;
+                    let opts = nexus::BrowseSearchOpts {
+                        sort: sort.unwrap_or_else(|| "endorsements".into()),
+                        category,
+                        tags_include: tags_include.unwrap_or_default(),
+                        tags_exclude: tags_exclude.unwrap_or_default(),
+                        game_version,
+                        offset: offset as u32,
+                        count: count as u32,
+                    };
+                    match client.search_collections(domain, &query, adult, &opts).await {
+                        Ok(page) => {
+                            nexus_total = page.total_count as u32;
+                            nexus_hits = page.items;
+                        }
+                        Err(e) => log::warn!("Nexus collection search failed: {e}"),
+                    }
+                }
+                Err(e) => log::warn!("Nexus client unavailable for collections: {e}"),
+            }
+        }
+    }
+
+    let mut ts_hits = Vec::new();
+    let mut ts_total = 0u32;
+    let mut thunderstore_available = false;
+    if want_ts {
+        if let Some(community) = &ts_community {
+            thunderstore_available = true;
+            let packages = load_ts_packages_cached(&state, community).await?;
+            let (page, total) =
+                filter_ts_modpacks(community, &packages, &query, adult, offset, count);
+            ts_total = total as u32;
+            ts_hits = page.into_iter().map(collection_hit_from_ts).collect();
+        }
+    }
+
+    let items = interleave_collection_hits(vec![nexus_hits, ts_hits]);
+    let total_count = nexus_total.saturating_add(ts_total);
+    let has_more = (offset + count) < nexus_total as usize
+        || (offset + count) < ts_total as usize;
+
+    Ok(CollectionCatalogPage {
+        items,
+        total_count,
+        next_offset: (offset + count) as u32,
+        has_more,
+        nexus_available,
+        thunderstore_available,
+    })
 }
 
 #[tauri::command]
@@ -2146,6 +2690,7 @@ pub async fn install_collection(
     slug: String,
     revision: Option<i64>,
     include_optional: bool,
+    name: Option<String>,
 ) -> Result<usize, String> {
     if !state.ensure_premium_status().await {
         return Err("Collection batch install requires Nexus Premium. \
@@ -2164,7 +2709,9 @@ pub async fn install_collection(
         .map_err(|e| e.to_string())?;
 
     let batch_id = uuid::Uuid::new_v4().to_string();
+    let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut installed = 0usize;
+    let mut member_ids = Vec::new();
     for file in files {
         if file.optional && !include_optional {
             continue;
@@ -2200,10 +2747,39 @@ pub async fn install_collection(
         )
         .await
         {
-            Ok(_) => installed += 1,
+            Ok(staged) => {
+                member_ids.push(staged.id);
+                installed += 1;
+            }
             Err(e) if is_cancel_err(&e) || is_pause_err(&e) => break,
             Err(e) => return Err(e),
         }
+    }
+    if !member_ids.is_empty() {
+        let new_ids: Vec<String> = member_ids
+            .iter()
+            .filter(|id| !before.contains(*id))
+            .cloned()
+            .collect();
+        let collection = InstalledCollection {
+            id: mods::nexus_collection_id(&slug),
+            source: CollectionSource::Nexus,
+            kind: CollectionKind::Collection,
+            name: name
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| slug.clone()),
+            slug: Some(slug),
+            namespace: None,
+            package_name: None,
+            community: None,
+            revision,
+            version: None,
+            profile_code: None,
+            mod_ids: member_ids,
+            installed_at: String::new(),
+        };
+        mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
+            .map_err(|e| e.to_string())?;
     }
     Ok(installed)
 }
@@ -2847,6 +3423,74 @@ pub fn list_mods(state: State<'_, AppState>, game_id: String) -> Result<Vec<Stag
     Ok(order.mods)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct NexusCollectionFileRef {
+    pub mod_id: u64,
+    pub file_id: u64,
+}
+
+#[tauri::command]
+pub fn list_installed_collections(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<InstalledCollection>, String> {
+    mods::list_installed_collections(&state.paths, &game_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn uninstall_collection(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+) -> Result<usize, String> {
+    mods::uninstall_collection(&state.paths, &game_id, &collection_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn record_nexus_collection(
+    state: State<'_, AppState>,
+    game_id: String,
+    slug: String,
+    name: String,
+    revision: Option<i64>,
+    files: Vec<NexusCollectionFileRef>,
+    existing_mod_ids: Option<Vec<String>>,
+) -> Result<InstalledCollection, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mut member_ids = Vec::new();
+    for file in &files {
+        if let Some(staged) = mods::find_nexus_file(&order, file.mod_id, file.file_id) {
+            member_ids.push(staged.id.clone());
+        }
+    }
+    if member_ids.is_empty() {
+        return Err("No staged mods matched this collection yet.".into());
+    }
+    let preexisting: HashSet<String> = existing_mod_ids.unwrap_or_default().into_iter().collect();
+    let new_ids: Vec<String> = member_ids
+        .iter()
+        .filter(|id| !preexisting.contains(*id))
+        .cloned()
+        .collect();
+    let collection = InstalledCollection {
+        id: mods::nexus_collection_id(&slug),
+        source: CollectionSource::Nexus,
+        kind: CollectionKind::Collection,
+        name,
+        slug: Some(slug),
+        namespace: None,
+        package_name: None,
+        community: None,
+        revision,
+        version: None,
+        profile_code: None,
+        mod_ids: member_ids,
+        installed_at: String::new(),
+    };
+    mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn set_mod_enabled(
     state: State<'_, AppState>,
@@ -3179,4 +3823,42 @@ pub fn resume_download(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod catalog_filter_tests {
+    use super::catalog_source_unavailable_error;
+
+    #[test]
+    fn no_sources_uses_generic_message() {
+        let msg = catalog_source_unavailable_error("all", false, false, false, false);
+        assert!(
+            msg.contains("No catalog sources configured"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn filter_mismatch_mentions_configured_source() {
+        let msg = catalog_source_unavailable_error("modio", true, false, false, false);
+        assert!(msg.contains("mod.io filter"), "{msg}");
+        assert!(msg.contains("Nexus"), "{msg}");
+        assert!(
+            !msg.contains("No catalog sources configured"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn collections_no_sources() {
+        let msg = catalog_source_unavailable_error("all", false, false, false, true);
+        assert!(msg.contains("Collections require"), "{msg}");
+    }
+
+    #[test]
+    fn collections_filter_mismatch() {
+        let msg = catalog_source_unavailable_error("thunderstore", true, false, false, true);
+        assert!(msg.contains("Thunderstore filter"), "{msg}");
+        assert!(msg.contains("Nexus"), "{msg}");
+    }
 }

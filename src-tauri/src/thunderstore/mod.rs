@@ -1,6 +1,7 @@
 //! Thunderstore community package API client.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -13,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::{APP_NAME, APP_VERSION};
 use crate::nexus::{TransferControl, CANCELLED_MSG, PAUSED_MSG};
+use walkdir::WalkDir;
 
 const TS_BASE: &str = "https://thunderstore.io";
 
@@ -410,7 +412,7 @@ fn select_version<'a>(
         .ok_or_else(|| anyhow!("Package {} has no versions", pkg.full_name))
 }
 
-fn detail_from_package(community: &str, pkg: TsPackage) -> TsPackageDetail {
+pub fn detail_from_package(community: &str, pkg: TsPackage) -> TsPackageDetail {
     let latest = pkg.versions.first();
     TsPackageDetail {
         community: community.to_string(),
@@ -429,6 +431,150 @@ fn detail_from_package(community: &str, pkg: TsPackage) -> TsPackageDetail {
         latest_version: latest.map(|v| v.version_number.clone()),
         versions: pkg.versions,
     }
+}
+
+pub fn is_modpack_category(categories: &[String]) -> bool {
+    categories
+        .iter()
+        .any(|c| c.to_lowercase().contains("modpack"))
+}
+
+const PROFILE_DATA_PREFIX: &str = "#r2modman\n";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileManifest {
+    #[serde(rename = "profileName", alias = "name")]
+    pub profile_name: String,
+    #[serde(default)]
+    pub mods: Vec<ProfileMod>,
+    #[serde(default, alias = "game_slug")]
+    pub community: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileMod {
+    pub name: String,
+    #[serde(alias = "versionNumber")]
+    pub version: ProfileVersion,
+    #[serde(default = "profile_mod_enabled")]
+    pub enabled: bool,
+}
+
+fn profile_mod_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ProfileVersion {
+    Parts {
+        major: u64,
+        minor: u64,
+        patch: u64,
+    },
+    String(String),
+}
+
+impl ProfileVersion {
+    pub fn as_string(&self) -> String {
+        match self {
+            ProfileVersion::Parts {
+                major,
+                minor,
+                patch,
+            } => format!("{major}.{minor}.{patch}"),
+            ProfileVersion::String(s) => s.clone(),
+        }
+    }
+}
+
+/// `Owner-PackageName` without a version suffix.
+pub fn parse_package_ident(name: &str) -> Option<(String, String)> {
+    let (ns, rest) = name.split_once('-')?;
+    if ns.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((ns.to_string(), rest.to_string()))
+}
+
+pub fn community_slug_matches(profile: &str, community: &str) -> bool {
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    norm(profile) == norm(community)
+}
+
+impl ThunderstoreClient {
+    pub async fn fetch_legacy_profile(&self, key: &str) -> Result<Vec<u8>> {
+        let key = key.trim();
+        let url = format!("{TS_BASE}/api/experimental/legacyprofile/get/{key}/");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("profile code is expired or invalid");
+        }
+        if !resp.status().is_success() {
+            bail!("Thunderstore profile fetch failed: {}", resp.status());
+        }
+        let text = resp.text().await.context("read profile payload")?;
+        let encoded = text
+            .strip_prefix(PROFILE_DATA_PREFIX)
+            .or_else(|| text.trim_start().strip_prefix(PROFILE_DATA_PREFIX))
+            .ok_or_else(|| anyhow!("invalid profile data"))?;
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .context("decode profile payload")
+    }
+}
+
+pub fn extract_profile_zip(bytes: &[u8], dest: &Path) -> Result<ProfileManifest> {
+    if dest.exists() {
+        fs::remove_dir_all(dest)?;
+    }
+    fs::create_dir_all(dest)?;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).context("open profile zip")?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let outpath = match file.enclosed_name() {
+            Some(p) => dest.join(p),
+            None => continue,
+        };
+        if file.name().ends_with('/') {
+            fs::create_dir_all(&outpath)?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut outfile = fs::File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
+        }
+    }
+    let manifest_path = dest.join("export.r2x");
+    let reader = fs::File::open(&manifest_path).context("missing export.r2x in profile")?;
+    let manifest: ProfileManifest =
+        serde_yaml::from_reader(reader).context("parse export.r2x")?;
+    let _ = fs::remove_file(&manifest_path);
+    Ok(manifest)
+}
+
+pub fn profile_has_overlay_files(root: &Path) -> bool {
+    WalkDir::new(root).into_iter().flatten().any(|e| {
+        e.file_type().is_file()
+            && e.file_name()
+                .to_str()
+                .map(|n| n != "export.r2x")
+                .unwrap_or(true)
+    })
 }
 
 #[allow(dead_code)]
@@ -469,5 +615,18 @@ mod tests {
         assert_eq!(d.namespace, "Owner");
         assert_eq!(d.name, "Cool-Mod");
         assert_eq!(d.version, "1.2.3");
+    }
+
+    #[test]
+    fn parse_package_ident_owner_name() {
+        let (ns, name) = parse_package_ident("bbepis-BepInExPack").unwrap();
+        assert_eq!(ns, "bbepis");
+        assert_eq!(name, "BepInExPack");
+    }
+
+    #[test]
+    fn community_slug_ignores_hyphens() {
+        assert!(community_slug_matches("lethalcompany", "lethal-company"));
+        assert!(!community_slug_matches("valheim", "lethal-company"));
     }
 }

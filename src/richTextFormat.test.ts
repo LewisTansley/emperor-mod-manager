@@ -6,6 +6,7 @@ import {
   isSafeUrl,
   looksLikeBbcode,
   looksLikeHtml,
+  normalizeHref,
   renderRichText,
   sanitizeRichHtml,
 } from "./richTextFormat";
@@ -33,6 +34,15 @@ describe("url/color safety", () => {
     expect(isSafeUrl("http://example.com")).toBe(true);
     expect(isSafeUrl("javascript:alert(1)")).toBe(false);
     expect(isSafeUrl("data:text/html,hi")).toBe(false);
+    expect(isSafeUrl("//example.com/a")).toBe(false);
+    expect(isSafeUrl("/skyrim/mods/123")).toBe(false);
+  });
+
+  it("normalizes protocol-relative hrefs to https", () => {
+    expect(normalizeHref("//example.com/a")).toBe("https://example.com/a");
+    expect(normalizeHref("https://example.com/a")).toBe("https://example.com/a");
+    expect(normalizeHref("javascript:alert(1)")).toBeNull();
+    expect(normalizeHref("/skyrim/mods/123")).toBeNull();
   });
 
   it("allows hex and named colors only", () => {
@@ -68,6 +78,15 @@ describe("bbcodeToHtml", () => {
       '<a href="https://www.youtube.com/watch?v=9DXBti-c6C0">YouTube: 9DXBti-c6C0</a>',
     );
     expect(bbcodeToHtml("[url=javascript:alert(1)]x[/url]")).toBe("x");
+  });
+
+  it("renders quoted bbcode urls", () => {
+    expect(bbcodeToHtml('[url="https://example.com/x"]Click[/url]')).toBe(
+      '<a href="https://example.com/x">Click</a>',
+    );
+    expect(bbcodeToHtml("[url='https://example.com/y']Click[/url]")).toBe(
+      '<a href="https://example.com/y">Click</a>',
+    );
   });
 
   it("renders lists and line-oriented content", () => {
@@ -134,6 +153,43 @@ describe("renderRichText", () => {
     expect(html).toContain("<p>");
     expect(html).toContain('href="https://nexusmods.com"');
     expect(html).toContain('rel="noopener noreferrer"');
+  });
+
+  it("turns quoted bbcode urls into links", () => {
+    const html = renderRichText('[url="https://example.com/x"]Click[/url]');
+    expect(html).toContain('href="https://example.com/x"');
+    expect(html).toContain("Click");
+    expect(html).not.toContain("[url=");
+  });
+
+  it("linkifies bare https urls in plain text", () => {
+    const html = renderRichText("See https://example.com/x for details.");
+    expect(html).toContain('href="https://example.com/x"');
+    expect(html).toContain("rel=\"noopener noreferrer\"");
+  });
+
+  it("linkifies bare https urls inside html-ish bodies", () => {
+    const html = renderRichText("<p>See https://example.com/x</p>");
+    expect(html).toContain('href="https://example.com/x"');
+    expect(html).toContain("<p>");
+  });
+
+  it("converts markdown links mixed with html tags", () => {
+    const html = renderRichText('<p>Check [Nexus](https://nexusmods.com)</p>');
+    expect(html).toContain('href="https://nexusmods.com"');
+    expect(html).toContain("Nexus");
+    expect(html).not.toContain("[Nexus]");
+  });
+
+  it("strips javascript and other unsafe hrefs", () => {
+    const html = renderRichText('<p><a href="javascript:alert(1)">x</a></p>');
+    expect(html).not.toContain("javascript:");
+    expect(html).not.toMatch(/href\s*=\s*["']javascript/i);
+  });
+
+  it("rewrites protocol-relative hrefs to https", () => {
+    const html = renderRichText('<p><a href="//example.com/a">x</a></p>');
+    expect(html).toContain('href="https://example.com/a"');
   });
 
   it("returns empty for blank input", () => {

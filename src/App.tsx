@@ -11,6 +11,11 @@ import {
   type AssistQueueEntry,
   type AssistQueueState,
 } from "./downloads";
+import {
+  catalogFilterMismatchMessage,
+  clampCatalogSourceFilter,
+  type CatalogSourceFilter,
+} from "./catalogSources";
 import { RichText } from "./RichText";
 import type {
   BrowseMeta,
@@ -23,6 +28,7 @@ import type {
   DetectedGame,
   DownloadItem,
   GameInfo,
+  InstalledCollection,
   ManagedGame,
   ModDetail,
   ModFileInfo,
@@ -43,12 +49,24 @@ type ViewMode = "list" | "grid";
 type DetailTab = "info" | "files";
 type GameDetailTab = "info" | "mods";
 type BrowseTagMap = Record<string, TagFilterState>;
-type CatalogSourceFilter = "all" | "nexus" | "thunderstore" | "modio";
 
 type StatusNotice = {
   kind: "ok" | "warn";
   message: string;
 };
+
+const UNREAL_PLUGIN_IDS = new Set([
+  "unreal",
+  "stalker2heartofchornobyl",
+  "palworld",
+  "hogwartslegacy",
+  "readyornot",
+  "subnautica2",
+]);
+
+function isUnrealPlugin(pluginId: string): boolean {
+  return UNREAL_PLUGIN_IDS.has(pluginId);
+}
 
 function catalogHasHit(s: CatalogSuggestion | null | undefined): boolean {
   return Boolean(
@@ -209,6 +227,14 @@ const STAGED_MOD_SORTS = [
   { value: "nameDesc", label: "Name Z–A" },
 ] as const;
 
+function collectionHitSource(c: CollectionHit): "nexus" | "thunderstore" {
+  return c.source ?? "nexus";
+}
+
+function collectionHitKey(c: CollectionHit): string {
+  return c.id || `${collectionHitSource(c)}:${c.slug}`;
+}
+
 function stagedModSource(m: StagedMod): "nexus" | "thunderstore" | "modio" {
   return m.source ?? "nexus";
 }
@@ -235,6 +261,7 @@ function filterAndSortStagedMods(
     query: string;
     status: ModsStatusFilter;
     source: CatalogSourceFilter;
+    collectionId: string;
     sort: ModsSort;
   },
 ): StagedMod[] {
@@ -250,6 +277,11 @@ function filterAndSortStagedMods(
   }
   if (opts.source !== "all") {
     filtered = filtered.filter((m) => stagedModSource(m) === opts.source);
+  }
+  if (opts.collectionId) {
+    filtered = filtered.filter((m) =>
+      (m.collection_ids ?? []).includes(opts.collectionId),
+    );
   }
 
   const sortPartition = (partition: StagedMod[]) => {
@@ -488,6 +520,12 @@ function App() {
   const [modsSourceFilter, setModsSourceFilter] =
     useState<CatalogSourceFilter>("all");
   const [modsSort, setModsSort] = useState<ModsSort>("loadOrder");
+  const [modsCollectionFilter, setModsCollectionFilter] = useState("");
+  const [installedCollections, setInstalledCollections] = useState<
+    InstalledCollection[]
+  >([]);
+  const [profileImportOpen, setProfileImportOpen] = useState(false);
+  const [profileCode, setProfileCode] = useState("");
   const [orphanScan, setOrphanScan] = useState<OrphanScan | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -598,22 +636,25 @@ function App() {
         query: modsQuery,
         status: modsStatusFilter,
         source: modsSourceFilter,
+        collectionId: modsCollectionFilter,
         sort: modsSort,
       }),
-    [mods, modsQuery, modsStatusFilter, modsSourceFilter, modsSort],
+    [mods, modsQuery, modsStatusFilter, modsSourceFilter, modsCollectionFilter, modsSort],
   );
 
   const modsFiltersActive =
     Boolean(modsQuery.trim()) ||
     modsStatusFilter !== "all" ||
     modsSourceFilter !== "all" ||
+    Boolean(modsCollectionFilter) ||
     modsSort !== "loadOrder";
 
   const canReorderMods =
     modsSort === "loadOrder" &&
     !modsQuery.trim() &&
     modsStatusFilter === "all" &&
-    modsSourceFilter === "all";
+    modsSourceFilter === "all" &&
+    !modsCollectionFilter;
 
   const modIndexById = useMemo(() => {
     const map = new Map<string, number>();
@@ -669,6 +710,11 @@ function App() {
   const refreshMods = useCallback(async (gameId: string) => {
     const list = await api.listMods(gameId);
     setMods(list);
+  }, []);
+
+  const refreshCollections = useCallback(async (gameId: string) => {
+    const list = await api.listInstalledCollections(gameId);
+    setInstalledCollections(list);
   }, []);
 
   const refreshOrphanScan = useCallback(async () => {
@@ -731,20 +777,28 @@ function App() {
   useEffect(() => {
     if (activeGame) {
       refreshMods(activeGame.id).catch((e) => setError(String(e)));
+      refreshCollections(activeGame.id).catch((e) => setError(String(e)));
       setBrowseDetail(null);
       setModDetail(null);
       setModFiles([]);
       setCollectionModFiles([]);
       setCollectionDetail(null);
     }
-  }, [activeGame, refreshMods]);
+  }, [activeGame, refreshMods, refreshCollections]);
 
   useEffect(() => {
     setModsQuery("");
     setModsStatusFilter("all");
     setModsSourceFilter("all");
     setModsSort("loadOrder");
+    setModsCollectionFilter("");
   }, [libraryDetail?.game.id]);
+
+  useEffect(() => {
+    setSourceFilter((prev) =>
+      clampCatalogSourceFilter(prev, activeGame, browseMode),
+    );
+  }, [activeGame, browseMode]);
 
   useEffect(() => {
     setLibraryDetail((prev) => {
@@ -976,7 +1030,11 @@ function App() {
               d.status === "paused"),
       );
       if (stillActive) {
-        setActiveBatch({ id: q.batchId, label: q.label });
+        setActiveBatch({
+          id: q.batchId,
+          label: q.label,
+          collection: q.collection,
+        });
       } else {
         setActiveBatch((prev) => (prev?.id === q.batchId ? null : prev));
       }
@@ -984,8 +1042,28 @@ function App() {
       setActiveBatch((prev) => (prev?.id === q.batchId ? null : prev));
     }
     const game = activeGameRef.current;
-    if (game) await refreshMods(game.id);
+    if (game) {
+      await refreshMods(game.id);
+      await refreshCollections(game.id);
+    }
     if (!q) return;
+    if (q.collection && !q.cancelled) {
+      try {
+        await api.recordNexusCollection({
+          gameId: q.entries[0]?.gameId ?? game?.id ?? "",
+          slug: q.collection.slug,
+          name: q.collection.name,
+          revision: q.collection.revision,
+          files: q.collection.files,
+          existingModIds: q.collection.existingModIds,
+        });
+        if (game) await refreshCollections(game.id);
+      } catch (e) {
+        if (!String(e).includes("No staged mods matched")) {
+          setError(String(e));
+        }
+      }
+    }
     if (q.cancelled) {
       setError(`Download queue cancelled after ${q.completed}/${q.entries.length} mods.`);
       return;
@@ -1003,7 +1081,7 @@ function App() {
     } else if (q.completed > 0) {
       setError(null);
     }
-  }, [refreshMods, setAssistQueueState]);
+  }, [refreshMods, refreshCollections, setAssistQueueState]);
 
   const openAssistAtHead = useCallback(
     async (q: AssistQueueState) => {
@@ -1198,7 +1276,11 @@ function App() {
   );
 
   const enqueueAssistEntries = useCallback(
-    async (entries: AssistQueueEntry[], label: string | null = null) => {
+    async (
+      entries: AssistQueueEntry[],
+      label: string | null = null,
+      collection: AssistQueueState["collection"] = null,
+    ) => {
       if (entries.length === 0) {
         throw new Error("Nothing to queue.");
       }
@@ -1213,6 +1295,7 @@ function App() {
         completed: 0,
         failures: [],
         cancelled: false,
+        collection,
       };
       setActiveBatch(null);
       setAssistQueueState(q);
@@ -1338,12 +1421,30 @@ function App() {
               d.status === "extracting" ||
               d.status === "paused"),
           );
-          if (!still) setActiveBatch(null);
+          if (!still) {
+            if (batch.collection) {
+              try {
+                await api.recordNexusCollection({
+                  gameId:
+                    event.payload.game_id ?? activeGameRef.current?.id ?? "",
+                  slug: batch.collection.slug,
+                  name: batch.collection.name,
+                  revision: batch.collection.revision,
+                  files: batch.collection.files,
+                  existingModIds: batch.collection.existingModIds,
+                });
+              } catch {
+                /* ignore incomplete match */
+              }
+            }
+            setActiveBatch(null);
+          }
         }
         const gameId = event.payload.game_id ?? activeGameRef.current?.id;
         if (gameId) {
           try {
             await refreshMods(gameId);
+            await refreshCollections(gameId);
           } catch {
             /* ignore */
           }
@@ -1439,7 +1540,7 @@ function App() {
       unlistenProgress.then((f) => f());
       unlistenStarted.then((f) => f());
     };
-  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods]);
+  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections]);
 
   async function withBusy<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
     setBusy(label);
@@ -1483,14 +1584,17 @@ function App() {
       return;
     }
     await withBusy(`Managing ${game.title}…`, async () => {
+      const suggestion = catalogSuggestions[game.id];
       await api.manageGame({
         id: game.id,
         title: game.title,
-        nexusDomain: game.nexus_domain ?? "",
+        nexusDomain: game.nexus_domain || suggestion?.nexus_domain || "",
         installPath: game.install_path!,
         launcher: game.launcher,
         pluginId: game.plugin_id!,
         coverPath: game.cover_path,
+        thunderstoreCommunity: suggestion?.thunderstore_community ?? null,
+        modioGameId: suggestion?.modio_game_id ?? null,
       });
       const list = await refreshManaged();
       const managedGame = list.find((g) => g.id === game.id);
@@ -1782,8 +1886,8 @@ function App() {
   browseOptsRef.current = browseOpts;
 
   useEffect(() => {
-    if (tab !== "browse" || browseMode !== "mods" || !browseSearched) return;
-    void runSearch("mods", searchQuery, { ...browseOpts, offset: 0 });
+    if (tab !== "browse" || !browseSearched) return;
+    void runSearch(browseMode, searchQuery, { ...browseOpts, offset: 0 });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceFilter]);
 
@@ -1822,14 +1926,26 @@ function App() {
     const hasNexus = Boolean(activeGame.nexus_domain);
     const hasTs = Boolean(activeGame.thunderstore_community);
     const hasModio = Boolean(activeGame.modio_game_id);
-    if (mode === "collections" && !hasNexus) {
-      setError("Collections require a Nexus Mods domain for this game.");
+    if (mode === "collections" && !hasNexus && !hasTs) {
+      setError(
+        "Collections require a Nexus Mods domain or Thunderstore community for this game.",
+      );
       return;
     }
     if (mode === "mods" && !hasNexus && !hasTs && !hasModio) {
       setError(
         "Set a Nexus domain, Thunderstore community, and/or mod.io game ID for this game.",
       );
+      return;
+    }
+    const effectiveFilter = clampCatalogSourceFilter(
+      sourceFilter,
+      activeGame,
+      mode,
+    );
+    if (effectiveFilter !== sourceFilter) {
+      setError(catalogFilterMismatchMessage(sourceFilter, activeGame));
+      setSourceFilter(effectiveFilter);
       return;
     }
     if (append) {
@@ -1893,11 +2009,12 @@ function App() {
         setBrowseSearched(true);
       } else {
         setCollectionHits((prev) => {
-          const seen = new Set(prev.map((c) => c.slug));
+          const seen = new Set(prev.map((c) => collectionHitKey(c)));
           const merged = [...prev];
           for (const item of items) {
-            if (!seen.has(item.slug)) {
-              seen.add(item.slug);
+            const key = collectionHitKey(item);
+            if (!seen.has(key)) {
+              seen.add(key);
               merged.push(item);
             }
           }
@@ -1911,7 +2028,7 @@ function App() {
         browseNextOffsetRef.current = 0;
         browseAppendFailedRef.current = false;
         await withBusy(
-          mode === "mods" ? "Searching mods…" : "Searching Nexus…",
+          mode === "mods" ? "Searching mods…" : "Searching collections…",
           async () => {
             if (mode === "mods") {
               const page = await api.searchCatalog(activeGame.id, query, {
@@ -1927,13 +2044,20 @@ function App() {
                 "replace",
               );
             } else {
-              const page = await api.searchCollections(
-                activeGame.nexus_domain,
-                query,
-                requestOpts,
-              );
+              const page = await api.searchCollectionCatalog(activeGame.id, query, {
+                ...requestOpts,
+                sourceFilter:
+                  sourceFilter === "modio" ? "all" : sourceFilter,
+              });
               if (requestId !== browseRequestIdRef.current) return;
               applyCollectionPage(page.items, page.total_count, "replace");
+              if (page.has_more != null) {
+                browseHasMoreRef.current = page.has_more;
+                setBrowseHasMore(page.has_more);
+              }
+              if (page.next_offset != null) {
+                browseNextOffsetRef.current = page.next_offset;
+              }
             }
           },
         );
@@ -1953,13 +2077,19 @@ function App() {
         appendOk = true;
         browseAppendFailedRef.current = false;
       } else {
-        const page = await api.searchCollections(
-          activeGame.nexus_domain,
-          query,
-          requestOpts,
-        );
+        const page = await api.searchCollectionCatalog(activeGame.id, query, {
+          ...requestOpts,
+          sourceFilter: sourceFilter === "modio" ? "all" : sourceFilter,
+        });
         if (requestId !== browseRequestIdRef.current) return;
         applyCollectionPage(page.items, page.total_count, "append");
+        if (page.has_more != null) {
+          browseHasMoreRef.current = page.has_more;
+          setBrowseHasMore(page.has_more);
+        }
+        if (page.next_offset != null) {
+          browseNextOffsetRef.current = page.next_offset;
+        }
         appendOk = true;
         browseAppendFailedRef.current = false;
       }
@@ -2098,6 +2228,20 @@ function App() {
     setModFiles([]);
     setCollectionModFiles([]);
     setCollectionDetail(null);
+    setTsDetail(null);
+    if (collectionHitSource(hit) === "thunderstore") {
+      if (!hit.community || !hit.namespace || !hit.package_name) return;
+      await withBusy("Loading modpack…", async () => {
+        const detail = await api.getThunderstorePackage(
+          hit.community!,
+          hit.namespace!,
+          hit.package_name!,
+        );
+        setTsDetail(detail);
+        setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+      });
+      return;
+    }
     const domain = hit.domain_name || activeGame.nexus_domain;
     await withBusy(
       detailTab === "files" ? "Loading collection mods…" : "Loading collection…",
@@ -2179,6 +2323,27 @@ function App() {
           );
         });
       }
+    } else if (
+      collectionHitSource(next.hit) === "thunderstore"
+    ) {
+      if (
+        !tsDetail &&
+        next.hit.community &&
+        next.hit.namespace &&
+        next.hit.package_name
+      ) {
+        await withBusy("Loading modpack…", async () => {
+          const detail = await api.getThunderstorePackage(
+            next.hit.community!,
+            next.hit.namespace!,
+            next.hit.package_name!,
+          );
+          setTsDetail(detail);
+          setTsVersion(
+            detail.latest_version ?? detail.versions[0]?.version_number ?? "",
+          );
+        });
+      }
     } else if (detailTab === "files" && collectionModFiles.length === 0) {
       await withBusy("Loading collection mods…", async () => {
         setCollectionModFiles(
@@ -2215,6 +2380,9 @@ function App() {
   async function openGame(game: ManagedGame, detailTab: GameDetailTab = "info") {
     await api.setActiveGame(game.id);
     setActiveId(game.id);
+    setSourceFilter((prev) =>
+      clampCatalogSourceFilter(prev, game, browseMode),
+    );
     setLibraryDetail({ game, tab: detailTab });
     setUeDomainEdit(game.nexus_domain);
     setUeProjectEdit(game.project_name ?? "");
@@ -2253,6 +2421,7 @@ function App() {
         version: tsVersion || null,
       });
       await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
       await refreshDownloads();
       setNotice({ kind: "ok", message: `Installed ${hit.name} (with dependencies).` });
     } catch (e) {
@@ -2292,6 +2461,7 @@ function App() {
         installDeps: true,
       });
       await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
       await refreshDownloads();
       setNotice({ kind: "ok", message: `Installed ${hit.name}.` });
     } catch (e) {
@@ -2357,6 +2527,32 @@ function App() {
 
   async function installCollection(c: CollectionHit) {
     if (!activeGame) return;
+    if (collectionHitSource(c) === "thunderstore") {
+      if (!c.community || !c.namespace || !c.package_name) return;
+      goToDownloadsOnInstall();
+      setBusy(`Installing modpack ${c.name}…`);
+      setError(null);
+      try {
+        await api.downloadThunderstoreMod({
+          gameId: activeGame.id,
+          community: c.community,
+          namespace: c.namespace,
+          name: c.package_name,
+          version: c.latest_version || tsVersion || null,
+          recordAsModpack: true,
+        });
+        await refreshMods(activeGame.id);
+        await refreshCollections(activeGame.id);
+        await refreshDownloads();
+        setNotice({ kind: "ok", message: `Installed ${c.name}.` });
+      } catch (e) {
+        setError(String(e));
+        await refreshDownloads();
+      } finally {
+        setBusy(null);
+      }
+      return;
+    }
     if (isPremium) {
       goToDownloadsOnInstall();
       setBusy(`Installing collection ${c.name}…`);
@@ -2367,8 +2563,10 @@ function App() {
           slug: c.slug,
           revision: c.revision_number,
           includeOptional,
+          name: c.name,
         });
         await refreshMods(activeGame.id);
+        await refreshCollections(activeGame.id);
         await refreshDownloads();
       } catch (e) {
         setError(String(e));
@@ -2381,6 +2579,7 @@ function App() {
     setBusy(`Loading collection ${c.name}…`);
     setError(null);
     try {
+      const existingModIds = mods.map((m) => m.id);
       const allFiles = await api.collectionFiles({
         slug: c.slug,
         revision: c.revision_number,
@@ -2399,12 +2598,64 @@ function App() {
           f.version,
         ),
       );
-      await enqueueAssistEntries(entries, c.name);
+      await enqueueAssistEntries(entries, c.name, {
+        slug: c.slug,
+        name: c.name,
+        revision: c.revision_number,
+        existingModIds,
+        files: filesToInstall.map((f) => ({ modId: f.mod_id, fileId: f.file_id })),
+      });
     } catch (e) {
       setAssistQueueState(null);
       setBusy(null);
       setError(String(e));
     }
+  }
+
+  async function importThunderstoreProfileCode() {
+    if (!activeGame) return;
+    const code = profileCode.trim();
+    if (!code) {
+      setError("Paste a Thunderstore / r2modman profile code.");
+      return;
+    }
+    goToDownloadsOnInstall();
+    setBusy("Importing Thunderstore profile…");
+    setError(null);
+    try {
+      const installed = await api.importThunderstoreProfile(activeGame.id, code);
+      await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      await refreshDownloads();
+      setProfileImportOpen(false);
+      setProfileCode("");
+      setNotice({
+        kind: "ok",
+        message: `Imported profile ${installed.name} (${installed.mod_ids.length} mods).`,
+      });
+    } catch (e) {
+      setError(String(e));
+      await refreshDownloads();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function uninstallInstalledCollection(c: InstalledCollection) {
+    if (!activeGame) return;
+    if (
+      !window.confirm(
+        `Uninstall ${c.name}? Mods only used by this collection will be removed. Shared requirements stay.`,
+      )
+    ) {
+      return;
+    }
+    await withBusy(`Uninstalling ${c.name}…`, async () => {
+      await api.uninstallCollection(activeGame.id, c.id);
+      await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      if (modsCollectionFilter === c.id) setModsCollectionFilter("");
+    });
   }
 
   async function importArchive() {
@@ -2418,6 +2669,7 @@ function App() {
     await withBusy("Importing archive…", async () => {
       await api.importModArchive({ gameId: activeGame.id, path: selected });
       await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
     });
   }
 
@@ -2474,6 +2726,8 @@ function App() {
     await withBusy("Removing all mods…", async () => {
       await api.removeAllMods(activeGame.id);
       await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      setModsCollectionFilter("");
     });
   }
 
@@ -2904,10 +3158,7 @@ function App() {
                             inputMode="numeric"
                           />
                         </label>
-                        {(libraryDetail.game.plugin_id === "unreal" ||
-                          libraryDetail.game.plugin_id === "stalker2heartofchornobyl" ||
-                          libraryDetail.game.plugin_id === "palworld" ||
-                          libraryDetail.game.plugin_id === "hogwartslegacy") && (
+                        {isUnrealPlugin(libraryDetail.game.plugin_id) && (
                           <label>
                             Project folder
                             <input
@@ -2924,6 +3175,54 @@ function App() {
                   </div>
                 ) : (
                   <div className="detail-body">
+                    {installedCollections.length > 0 && (
+                      <div className="installed-collections">
+                        <h2>Installed collections</h2>
+                        <ul className="list">
+                          {installedCollections.map((c) => (
+                            <li key={c.id}>
+                              <div>
+                                <strong>{c.name}</strong>
+                                <small>
+                                  {c.source === "thunderstore"
+                                    ? c.kind === "profile"
+                                      ? "Thunderstore profile"
+                                      : "Thunderstore modpack"
+                                    : "Nexus collection"}
+                                  {` · ${c.mod_ids.length} mods`}
+                                </small>
+                              </div>
+                              <div className="actions">
+                                <button
+                                  type="button"
+                                  className={
+                                    modsCollectionFilter === c.id ? "active" : ""
+                                  }
+                                  onClick={() =>
+                                    setModsCollectionFilter((prev) =>
+                                      prev === c.id ? "" : c.id,
+                                    )
+                                  }
+                                >
+                                  {modsCollectionFilter === c.id
+                                    ? "Showing"
+                                    : "Filter"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="danger"
+                                  onClick={() =>
+                                    void uninstallInstalledCollection(c)
+                                  }
+                                >
+                                  Uninstall
+                                </button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                     <div className="mods-toolbar">
                       <div className="row">
                         <input
@@ -2960,6 +3259,20 @@ function App() {
                             ))}
                           </select>
                         </label>
+                        <label>
+                          Collection
+                          <select
+                            value={modsCollectionFilter}
+                            onChange={(e) => setModsCollectionFilter(e.target.value)}
+                          >
+                            <option value="">All</option>
+                            {installedCollections.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                         <div className="segment source-filter">
                           {(
                             [
@@ -2988,6 +3301,7 @@ function App() {
                               setModsStatusFilter("all");
                               setModsSourceFilter("all");
                               setModsSort("loadOrder");
+                              setModsCollectionFilter("");
                             }}
                           >
                             Clear filters
@@ -3068,6 +3382,7 @@ function App() {
                                     if (!activeGame) return;
                                     await api.removeMod(activeGame.id, m.id);
                                     await refreshMods(activeGame.id);
+                                    await refreshCollections(activeGame.id);
                                   })
                                 }
                               >
@@ -3899,17 +4214,22 @@ function App() {
                         </dl>
                         <div className="actions">
                           <button onClick={() => installCollection(browseDetail.hit)}>
-                            {isPremium ? "Install" : "Download Assist"}
+                            {collectionHitSource(browseDetail.hit) === "thunderstore" ||
+                            isPremium
+                              ? "Install"
+                              : "Download Assist"}
                           </button>
                         </div>
-                        <label className="inline">
-                          <input
-                            type="checkbox"
-                            checked={includeOptional}
-                            onChange={(e) => setIncludeOptional(e.target.checked)}
-                          />
-                          Include optional collection mods
-                        </label>
+                        {collectionHitSource(browseDetail.hit) !== "thunderstore" && (
+                          <label className="inline">
+                            <input
+                              type="checkbox"
+                              checked={includeOptional}
+                              onChange={(e) => setIncludeOptional(e.target.checked)}
+                            />
+                            Include optional collection mods
+                          </label>
+                        )}
                       </div>
                     </div>
 
@@ -3919,11 +4239,36 @@ function App() {
                         <RichText
                           className="detail-description detail-description-html"
                           text={
-                            collectionDetail?.description ??
-                            collectionDetail?.summary ??
-                            browseDetail.hit.summary
+                            collectionHitSource(browseDetail.hit) === "thunderstore"
+                              ? (tsDetail?.description ?? browseDetail.hit.summary)
+                              : (collectionDetail?.description ??
+                                collectionDetail?.summary ??
+                                browseDetail.hit.summary)
                           }
                         />
+                      </div>
+                    ) : collectionHitSource(browseDetail.hit) === "thunderstore" ? (
+                      <div className="detail-body">
+                        <h2>
+                          Included mods (
+                          {(tsDetail?.versions[0]?.dependencies.length ?? 0) + 1})
+                        </h2>
+                        <ul className="list">
+                          <li>
+                            <div>
+                              <strong>{browseDetail.hit.name}</strong>
+                              <small>modpack</small>
+                            </div>
+                          </li>
+                          {(tsDetail?.versions[0]?.dependencies ?? []).map((dep) => (
+                            <li key={dep}>
+                              <div>
+                                <strong>{dep}</strong>
+                                <small>dependency</small>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
                       </div>
                     ) : (
                       <div className="detail-body">
@@ -4040,6 +4385,7 @@ function App() {
                           setBrowseVersion("");
                           setBrowseTags({});
                           setBrowseDetail(null);
+                          if (sourceFilter === "modio") setSourceFilter("all");
                           runSearch("collections", searchQuery, {
                             ...browseOpts,
                             sort: "endorsements",
@@ -4054,12 +4400,17 @@ function App() {
                         Collections
                       </button>
                     </div>
-                    {browseMode === "mods" &&
-                      [
-                        Boolean(activeGame?.nexus_domain),
-                        Boolean(activeGame?.thunderstore_community),
-                        Boolean(activeGame?.modio_game_id),
-                      ].filter(Boolean).length > 1 && (
+                    {(browseMode === "mods"
+                      ? [
+                          Boolean(activeGame?.nexus_domain),
+                          Boolean(activeGame?.thunderstore_community),
+                          Boolean(activeGame?.modio_game_id),
+                        ]
+                      : [
+                          Boolean(activeGame?.nexus_domain),
+                          Boolean(activeGame?.thunderstore_community),
+                        ]
+                    ).filter(Boolean).length > 1 && (
                         <div className="segment source-filter">
                           {(
                             [
@@ -4070,7 +4421,7 @@ function App() {
                               ...(activeGame?.thunderstore_community
                                 ? ([["thunderstore", "Thunderstore"]] as const)
                                 : []),
-                              ...(activeGame?.modio_game_id
+                              ...(browseMode === "mods" && activeGame?.modio_game_id
                                 ? ([["modio", "mod.io"]] as const)
                                 : []),
                             ]
@@ -4085,6 +4436,15 @@ function App() {
                             </button>
                           ))}
                         </div>
+                      )}
+                    {browseMode === "collections" &&
+                      Boolean(activeGame?.thunderstore_community) && (
+                        <button
+                          type="button"
+                          onClick={() => setProfileImportOpen((v) => !v)}
+                        >
+                          Import profile
+                        </button>
                       )}
                     <div className="segment">
                       <button
@@ -4108,13 +4468,52 @@ function App() {
                   <>
                     <div className="row">
                       <input
-                        placeholder={`Search ${activeGame.nexus_domain}…`}
+                        placeholder={
+                          browseMode === "collections"
+                            ? "Search collections and modpacks…"
+                            : `Search ${activeGame.nexus_domain || activeGame.thunderstore_community || "mods"}…`
+                        }
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         onKeyDown={(e) => e.key === "Enter" && search()}
                       />
                       <button onClick={search}>Search</button>
                     </div>
+                    {profileImportOpen && browseMode === "collections" && (
+                      <div className="profile-import">
+                        <label>
+                          Thunderstore profile code
+                          <input
+                            value={profileCode}
+                            onChange={(e) => setProfileCode(e.target.value)}
+                            placeholder="Paste r2modman / Gale code"
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                void importThunderstoreProfileCode();
+                              }
+                            }}
+                          />
+                        </label>
+                        <div className="actions">
+                          <button
+                            type="button"
+                            onClick={() => void importThunderstoreProfileCode()}
+                          >
+                            Import
+                          </button>
+                          <button
+                            type="button"
+                            className="linkish"
+                            onClick={() => {
+                              setProfileImportOpen(false);
+                              setProfileCode("");
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     <div className="filters">
                       <label>
                         Sort
@@ -4267,7 +4666,9 @@ function App() {
                         Clear filters
                       </button>
                     </div>
-                    {browseMode === "collections" && (
+                    {browseMode === "collections" &&
+                      Boolean(activeGame.nexus_domain) &&
+                      sourceFilter !== "thunderstore" && (
                       <label className="inline">
                         <input
                           type="checkbox"
@@ -4388,6 +4789,9 @@ function App() {
                       <div className="media-grid">
                         {collectionHits.map((c) => {
                           const tags = [
+                            collectionHitSource(c) === "thunderstore"
+                              ? "Thunderstore"
+                              : "Nexus",
                             ...(c.mod_count != null
                               ? [`${c.mod_count.toLocaleString()} mods`]
                               : []),
@@ -4397,14 +4801,19 @@ function App() {
                             ...(c.revision_number != null
                               ? [`rev ${c.revision_number}`]
                               : []),
+                            ...(c.latest_version ? [`v${c.latest_version}`] : []),
                             ...(c.domain_name ? [c.domain_name] : []),
                           ];
                           return (
                             <MediaCard
-                              key={c.slug}
+                              key={collectionHitKey(c)}
                               title={c.name}
                               imageSrc={mediaSrc(null, c.tile_image_url)}
-                              badge="Collection"
+                              badge={
+                                collectionHitSource(c) === "thunderstore"
+                                  ? "Modpack"
+                                  : "Collection"
+                              }
                               overlay={
                                 c.endorsements != null
                                   ? `${c.endorsements.toLocaleString()} endorsements`
@@ -4438,7 +4847,7 @@ function App() {
                     ) : (
                       <ul className="list">
                         {collectionHits.map((c) => (
-                          <li key={c.slug} className="list-row-clickable">
+                          <li key={collectionHitKey(c)} className="list-row-clickable">
                             <div
                               className="list-row-main"
                               onClick={() => openCollection(c, "info")}
@@ -4453,6 +4862,10 @@ function App() {
                             >
                               <strong>{c.name}</strong>
                               <small>
+                                {collectionHitSource(c) === "thunderstore"
+                                  ? "Thunderstore"
+                                  : "Nexus"}
+                                {" · "}
                                 {c.author ?? c.slug}
                                 {c.mod_count != null
                                   ? ` · ${c.mod_count.toLocaleString()} mods`
