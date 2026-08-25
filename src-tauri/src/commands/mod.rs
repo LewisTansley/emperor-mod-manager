@@ -24,6 +24,11 @@ use crate::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
         ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
     },
+    share::{
+        self, DetectImportResult, ExportShareResult, ImportCodeKind, SavedCollectionDetail,
+        SavedCollectionEntry, ShareAssistFile, ShareDecodePreview, ShareImportResult,
+        ShareModSource,
+    },
     thunderstore::{self, ThunderstoreClient, TsPackageDetail, TsDependency},
 };
 
@@ -3489,6 +3494,540 @@ pub fn record_nexus_collection(
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
+}
+
+fn managed_game(state: &AppState, game_id: &str) -> Result<ManagedGame, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.managed_games
+        .iter()
+        .find(|g| g.id == game_id)
+        .cloned()
+        .ok_or_else(|| "Managed game not found".to_string())
+}
+
+#[tauri::command]
+pub fn export_share_code(
+    state: State<'_, AppState>,
+    game_id: String,
+    name: Option<String>,
+) -> Result<ExportShareResult, String> {
+    let game = managed_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let (manifest, skipped) =
+        share::build_manifest_from_loadorder(&order, &game, name.clone());
+    if manifest.mods.is_empty() {
+        return Err(if skipped.is_empty() {
+            "No enabled mods to share.".into()
+        } else {
+            format!(
+                "No portable enabled mods to share. Skipped: {}",
+                skipped.join("; ")
+            )
+        });
+    }
+    let code = share::encode_share_manifest(&manifest).map_err(|e| e.to_string())?;
+    let mut warnings = Vec::new();
+    if !skipped.is_empty() {
+        warnings.push(format!(
+            "Skipped {} non-portable mod(s): {}",
+            skipped.len(),
+            skipped.join("; ")
+        ));
+    }
+    if code.len() > 100 * 1024 {
+        warnings.push(format!(
+            "Share code is large ({:.1} KB); some chat apps may truncate it.",
+            code.len() as f64 / 1024.0
+        ));
+    }
+    let saved = share::entry_from_code(&code, name, Some(game_id))
+        .map_err(|e| e.to_string())?;
+    let saved = share::add_saved_collection(&state.paths, saved).map_err(|e| e.to_string())?;
+    Ok(ExportShareResult {
+        code,
+        warnings,
+        skipped,
+        mod_count: manifest.mods.len(),
+        saved,
+    })
+}
+
+#[tauri::command]
+pub fn decode_share_code(code: String) -> Result<ShareDecodePreview, String> {
+    let code = code.trim().to_string();
+    let manifest = share::decode_share_code(&code).map_err(|e| e.to_string())?;
+    Ok(share::preview_from_manifest(&manifest, code.len()))
+}
+
+#[tauri::command]
+pub fn detect_import_code(code: String) -> Result<DetectImportResult, String> {
+    let code = code.trim().to_string();
+    let kind = share::detect_code_kind(&code);
+    match kind {
+        ImportCodeKind::Emperor => {
+            let manifest = share::decode_share_code(&code).map_err(|e| e.to_string())?;
+            let preview = share::preview_from_manifest(&manifest, code.len());
+            Ok(DetectImportResult {
+                kind,
+                message: format!(
+                    "Emperor share: {} mod(s)",
+                    preview.mods.len()
+                ),
+                preview: Some(preview),
+            })
+        }
+        ImportCodeKind::ThunderstoreProfile => Ok(DetectImportResult {
+            kind,
+            message: "Thunderstore / r2modman profile code".into(),
+            preview: None,
+        }),
+        ImportCodeKind::Unknown => Ok(DetectImportResult {
+            kind,
+            message: "Unrecognized code. Paste an Emperor share (#emperor1) or r2modman / Gale profile code.".into(),
+            preview: None,
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImportCodeResult {
+    Emperor {
+        result: ShareImportResult,
+    },
+    ThunderstoreProfile {
+        collection: InstalledCollection,
+    },
+}
+
+#[tauri::command]
+pub async fn import_code(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    code: String,
+    name: Option<String>,
+) -> Result<ImportCodeResult, String> {
+    let code = code.trim().to_string();
+    match share::detect_code_kind(&code) {
+        ImportCodeKind::Emperor => {
+            let result = import_share_code(app, state, game_id, code, name).await?;
+            Ok(ImportCodeResult::Emperor { result })
+        }
+        ImportCodeKind::ThunderstoreProfile => {
+            let collection = import_thunderstore_profile(app, state, game_id, code).await?;
+            Ok(ImportCodeResult::ThunderstoreProfile { collection })
+        }
+        ImportCodeKind::Unknown => Err(
+            "Unrecognized code. Paste an Emperor share (#emperor1) or r2modman / Gale profile code."
+                .into(),
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn import_share_code(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    code: String,
+    name: Option<String>,
+) -> Result<ShareImportResult, String> {
+    let game = managed_game(&state, &game_id)?;
+    let code = code.trim().to_string();
+    let manifest = share::decode_share_code(&code).map_err(|e| e.to_string())?;
+    share::catalogs_overlap(&manifest.game, &game)?;
+    let mut warnings = Vec::new();
+    if let Some(w) = share::plugin_mismatch_warning(&manifest.game, &game) {
+        warnings.push(w);
+    }
+
+    let collection_name = name
+        .or(manifest.name.clone())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Shared loadout".into());
+    let collection_id = share::emperor_share_id(&code);
+    let before = snapshot_mod_ids(&state.paths, &game_id)?;
+    let is_premium = state.ensure_premium_status().await;
+    let modio_key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+
+    let mut member_ids = Vec::new();
+    let mut needs_assist = Vec::new();
+    let mut modio_failures = 0usize;
+    let ts_client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+
+    for entry in &manifest.mods {
+        match entry.s {
+            ShareModSource::Nexus => {
+                let domain = entry
+                    .domain
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(game.nexus_domain.as_str());
+                let mod_id = entry.mod_id.unwrap_or(0);
+                let file_id = entry.file_id.unwrap_or(0);
+                if mod_id == 0 || file_id == 0 {
+                    warnings.push(format!(
+                        "Skipped invalid Nexus entry {}",
+                        share::mod_label(entry)
+                    ));
+                    continue;
+                }
+                let order =
+                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+                if let Some(existing) = mods::find_nexus_file(&order, mod_id, file_id) {
+                    member_ids.push(existing.id.clone());
+                    continue;
+                }
+                let label = share::mod_label(entry);
+                if is_premium {
+                    match download_and_stage_inner(
+                        Some(&app),
+                        &*state,
+                        &game_id,
+                        domain,
+                        mod_id,
+                        file_id,
+                        &label,
+                        entry.version.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(staged) => member_ids.push(staged.id),
+                        Err(e) => {
+                            warnings.push(format!("{label}: {e}"));
+                        }
+                    }
+                } else {
+                    needs_assist.push(ShareAssistFile {
+                        domain: domain.to_string(),
+                        mod_id,
+                        file_id,
+                        name: label,
+                        version: entry.version.clone(),
+                    });
+                }
+            }
+            ShareModSource::Thunderstore => {
+                let community = entry
+                    .community
+                    .as_deref()
+                    .or(game.thunderstore_community.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "Share includes Thunderstore mods but this game has no community set."
+                            .to_string()
+                    })?;
+                let ns = entry
+                    .namespace
+                    .as_deref()
+                    .ok_or_else(|| "Thunderstore entry missing namespace".to_string())?;
+                let pkg_name = entry
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| "Thunderstore entry missing package name".to_string())?;
+                let order =
+                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+                if let Some(existing) = mods::find_thunderstore_package(&order, ns, pkg_name) {
+                    member_ids.push(existing.id.clone());
+                    continue;
+                }
+                let mut detail = ts_client
+                    .get_package(community, ns, pkg_name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(ver) = entry.version.as_deref().filter(|s| !s.is_empty()) {
+                    if let Some(pos) = detail
+                        .versions
+                        .iter()
+                        .position(|v| v.version_number == ver)
+                    {
+                        let selected = detail.versions.remove(pos);
+                        detail.versions.insert(0, selected);
+                        detail.latest_version = Some(ver.to_string());
+                    }
+                }
+                let label = share::mod_label(entry);
+                match stage_thunderstore_package_newest(
+                    &app,
+                    &state,
+                    &ts_client,
+                    &game_id,
+                    community,
+                    &detail,
+                    &label,
+                    None,
+                )
+                .await
+                {
+                    Ok(staged) => member_ids.push(staged.id),
+                    Err(e) => warnings.push(format!("{label}: {e}")),
+                }
+            }
+            ShareModSource::Modio => {
+                let Some(key) = modio_key.as_deref() else {
+                    modio_failures += 1;
+                    warnings.push(format!(
+                        "{}: mod.io API key required",
+                        share::mod_label(entry)
+                    ));
+                    continue;
+                };
+                let gid = entry.game_id.or(game.modio_game_id).unwrap_or(0);
+                let mid = entry.mod_id.unwrap_or(0);
+                if gid == 0 || mid == 0 {
+                    warnings.push(format!(
+                        "Skipped invalid mod.io entry {}",
+                        share::mod_label(entry)
+                    ));
+                    continue;
+                }
+                let order =
+                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+                if let Some(existing) = mods::find_modio_mod(&order, gid, mid) {
+                    member_ids.push(existing.id.clone());
+                    continue;
+                }
+                let client = ModioClient::new(key).map_err(|e| e.to_string())?;
+                let detail = client.get_mod(gid, mid).await.map_err(|e| e.to_string())?;
+                let resolved_file = entry
+                    .file_id
+                    .or(detail.primary_file_id)
+                    .ok_or_else(|| format!("No downloadable file for mod.io mod {mid}"))?;
+                let label = share::mod_label(entry);
+                let dl_id = uuid::Uuid::new_v4().to_string();
+                let dest = state.paths.downloads_dir().join(format!(
+                    "modio_{}_{}_{}.zip",
+                    dl_id,
+                    sanitize_filename::sanitize(&detail.name_id),
+                    resolved_file
+                ));
+                {
+                    let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+                    downloads.insert(
+                        0,
+                        DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+                    );
+                }
+                let _ = app.emit("downloads-changed", ());
+                match client
+                    .download_file(gid, mid, Some(resolved_file), &dest)
+                    .await
+                {
+                    Ok(()) => {
+                        let staged = mods::stage_modio_mod(
+                            &state.paths,
+                            &game_id,
+                            gid,
+                            mid,
+                            resolved_file,
+                            &detail.name,
+                            entry.version.clone(),
+                            &dest,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        member_ids.push(staged.id);
+                        if let Ok(mut downloads) = state.downloads.lock() {
+                            if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                                d.status = "done".into();
+                            }
+                        }
+                        clear_download_job(&state, &dl_id);
+                        let _ = app.emit("downloads-changed", ());
+                    }
+                    Err(e) => {
+                        modio_failures += 1;
+                        let msg = e.to_string();
+                        if let Ok(mut downloads) = state.downloads.lock() {
+                            if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                                d.status = "failed".into();
+                                d.error = Some(msg.clone());
+                            }
+                        }
+                        clear_download_job(&state, &dl_id);
+                        let _ = app.emit("downloads-changed", ());
+                        warnings.push(format!("{label}: {msg}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if member_ids.is_empty() && needs_assist.is_empty() {
+        if modio_failures > 0 {
+            return Err(
+                "Could not install any mods. Set a mod.io API key in Setup and try again.".into(),
+            );
+        }
+        return Err(if warnings.is_empty() {
+            "No mods could be installed from this share code.".into()
+        } else {
+            format!("No mods installed. {}", warnings.join("; "))
+        });
+    }
+
+    // Deduplicate member ids while preserving order.
+    let mut seen = HashSet::new();
+    member_ids.retain(|id| seen.insert(id.clone()));
+
+    let collection = if needs_assist.is_empty() {
+        let new_ids: Vec<String> = member_ids
+            .iter()
+            .filter(|id| !before.contains(*id))
+            .cloned()
+            .collect();
+        let col = InstalledCollection {
+            id: collection_id.clone(),
+            source: CollectionSource::Emperor,
+            kind: CollectionKind::Share,
+            name: collection_name.clone(),
+            slug: Some(content_slug_from_id(&collection_id)),
+            namespace: None,
+            package_name: None,
+            community: None,
+            revision: None,
+            version: None,
+            profile_code: Some(code),
+            mod_ids: member_ids.clone(),
+            installed_at: String::new(),
+        };
+        Some(
+            mods::record_installed_collection(&state.paths, &game_id, col, &new_ids)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    Ok(ShareImportResult {
+        collection_id,
+        name: collection_name,
+        member_ids,
+        needs_assist,
+        warnings,
+        collection,
+    })
+}
+
+fn content_slug_from_id(collection_id: &str) -> String {
+    collection_id
+        .strip_prefix("emperor-share:")
+        .unwrap_or(collection_id)
+        .to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmperorShareFileRef {
+    pub domain: String,
+    pub mod_id: u64,
+    pub file_id: u64,
+}
+
+#[tauri::command]
+pub fn record_emperor_share(
+    state: State<'_, AppState>,
+    game_id: String,
+    collection_id: String,
+    name: String,
+    code: Option<String>,
+    files: Vec<EmperorShareFileRef>,
+    member_ids: Option<Vec<String>>,
+    existing_mod_ids: Option<Vec<String>>,
+) -> Result<InstalledCollection, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mut ids = member_ids.unwrap_or_default();
+    for file in &files {
+        if let Some(staged) = mods::find_nexus_file(&order, file.mod_id, file.file_id) {
+            if !ids.iter().any(|id| id == &staged.id) {
+                ids.push(staged.id.clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Err("No staged mods matched this share yet.".into());
+    }
+    let preexisting: HashSet<String> = existing_mod_ids.unwrap_or_default().into_iter().collect();
+    let new_ids: Vec<String> = ids
+        .iter()
+        .filter(|id| !preexisting.contains(*id))
+        .cloned()
+        .collect();
+    let collection = InstalledCollection {
+        id: collection_id.clone(),
+        source: CollectionSource::Emperor,
+        kind: CollectionKind::Share,
+        name,
+        slug: Some(content_slug_from_id(&collection_id)),
+        namespace: None,
+        package_name: None,
+        community: None,
+        revision: None,
+        version: None,
+        profile_code: code,
+        mod_ids: ids,
+        installed_at: String::new(),
+    };
+    mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_saved_collections(
+    state: State<'_, AppState>,
+) -> Result<Vec<SavedCollectionEntry>, String> {
+    Ok(share::load_saved_collections(&state.paths)
+        .map_err(|e| e.to_string())?
+        .collections)
+}
+
+#[tauri::command]
+pub fn save_collection_code(
+    state: State<'_, AppState>,
+    code: String,
+    name: Option<String>,
+    source_game_id: Option<String>,
+) -> Result<SavedCollectionEntry, String> {
+    let kind = share::detect_code_kind(code.trim());
+    if kind != ImportCodeKind::Emperor {
+        return Err("Only Emperor share codes (#emperor1) can be saved to the local library.".into());
+    }
+    let entry = share::entry_from_code(code.trim(), name, source_game_id)
+        .map_err(|e| e.to_string())?;
+    share::add_saved_collection(&state.paths, entry).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_saved_collection(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<SavedCollectionDetail, String> {
+    share::get_saved_collection(&state.paths, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn rename_saved_collection(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<SavedCollectionEntry, String> {
+    if name.trim().is_empty() {
+        return Err("Name cannot be empty.".into());
+    }
+    share::rename_saved_collection(&state.paths, &id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_saved_collection(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    share::delete_saved_collection(&state.paths, &id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

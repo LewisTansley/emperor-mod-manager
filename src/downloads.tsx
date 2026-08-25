@@ -26,6 +26,14 @@ export type AssistQueueState = {
     existingModIds: string[];
     files: { modId: number; fileId: number }[];
   } | null;
+  emperorShare?: {
+    collectionId: string;
+    name: string;
+    code?: string | null;
+    existingModIds: string[];
+    memberIds: string[];
+    files: { domain: string; modId: number; fileId: number }[];
+  } | null;
 };
 
 /** Batch still has in-flight downloads after Assist sequencing finished. */
@@ -33,6 +41,7 @@ export type ActiveDownloadBatch = {
   id: string;
   label: string | null;
   collection?: AssistQueueState["collection"];
+  emperorShare?: AssistQueueState["emperorShare"];
 };
 
 export function createQueueEntry(

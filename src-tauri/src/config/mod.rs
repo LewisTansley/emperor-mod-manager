@@ -142,6 +142,11 @@ impl Paths {
     pub fn deploy_manifest(&self, game_id: &str) -> PathBuf {
         self.game_data_dir(game_id).join("deployed.json")
     }
+
+    /// Local library of Emperor share codes (not per-game staging).
+    pub fn saved_collections_file(&self) -> PathBuf {
+        self.data_dir.join("saved_collections.json")
+    }
 }
 
 pub fn load_config(paths: &Paths) -> Result<AppConfig> {

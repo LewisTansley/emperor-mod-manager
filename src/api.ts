@@ -28,6 +28,13 @@ import type {
   InstallClickBehavior,
   TsPackageDetail,
   UeLayoutInfo,
+  ExportShareResult,
+  ShareDecodePreview,
+  DetectImportResult,
+  ImportCodeResult,
+  ShareImportResult,
+  SavedCollectionEntry,
+  SavedCollectionDetail,
 } from "./types";
 
 export const api = {
@@ -233,6 +240,63 @@ export const api = {
   }) => invoke<number>("install_collection", args),
   importThunderstoreProfile: (gameId: string, code: string) =>
     invoke<InstalledCollection>("import_thunderstore_profile", { gameId, code }),
+  exportShareCode: (gameId: string, name?: string | null) =>
+    invoke<ExportShareResult>("export_share_code", {
+      gameId,
+      name: name ?? null,
+    }),
+  decodeShareCode: (code: string) =>
+    invoke<ShareDecodePreview>("decode_share_code", { code }),
+  detectImportCode: (code: string) =>
+    invoke<DetectImportResult>("detect_import_code", { code }),
+  importCode: (gameId: string, code: string, name?: string | null) =>
+    invoke<ImportCodeResult>("import_code", {
+      gameId,
+      code,
+      name: name ?? null,
+    }),
+  importShareCode: (gameId: string, code: string, name?: string | null) =>
+    invoke<ShareImportResult>("import_share_code", {
+      gameId,
+      code,
+      name: name ?? null,
+    }),
+  recordEmperorShare: (args: {
+    gameId: string;
+    collectionId: string;
+    name: string;
+    code?: string | null;
+    files: { domain: string; modId: number; fileId: number }[];
+    memberIds?: string[] | null;
+    existingModIds?: string[] | null;
+  }) =>
+    invoke<InstalledCollection>("record_emperor_share", {
+      gameId: args.gameId,
+      collectionId: args.collectionId,
+      name: args.name,
+      code: args.code ?? null,
+      files: args.files,
+      memberIds: args.memberIds ?? null,
+      existingModIds: args.existingModIds ?? null,
+    }),
+  listSavedCollections: () =>
+    invoke<SavedCollectionEntry[]>("list_saved_collections"),
+  saveCollectionCode: (args: {
+    code: string;
+    name?: string | null;
+    sourceGameId?: string | null;
+  }) =>
+    invoke<SavedCollectionEntry>("save_collection_code", {
+      code: args.code,
+      name: args.name ?? null,
+      sourceGameId: args.sourceGameId ?? null,
+    }),
+  getSavedCollection: (id: string) =>
+    invoke<SavedCollectionDetail>("get_saved_collection", { id }),
+  renameSavedCollection: (id: string, name: string) =>
+    invoke<SavedCollectionEntry>("rename_saved_collection", { id, name }),
+  deleteSavedCollection: (id: string) =>
+    invoke<void>("delete_saved_collection", { id }),
   listInstalledCollections: (gameId: string) =>
     invoke<InstalledCollection[]>("list_installed_collections", { gameId }),
   uninstallCollection: (gameId: string, collectionId: string) =>

@@ -41,10 +41,14 @@ import type {
   ModioModDetail,
   ModioFileInfo,
   OrphanScan,
+  SavedCollectionEntry,
+  SavedCollectionDetail,
+  ShareImportResult,
+  ShareModEntry,
 } from "./types";
 import "./App.css";
 
-type Tab = "setup" | "library" | "browse" | "downloads" | "settings";
+type Tab = "setup" | "library" | "collections" | "browse" | "downloads" | "settings";
 type ViewMode = "list" | "grid";
 type DetailTab = "info" | "files";
 type GameDetailTab = "info" | "mods";
@@ -526,6 +530,19 @@ function App() {
   >([]);
   const [profileImportOpen, setProfileImportOpen] = useState(false);
   const [profileCode, setProfileCode] = useState("");
+  const [shareExportOpen, setShareExportOpen] = useState(false);
+  const [shareExportName, setShareExportName] = useState("");
+  const [shareImportOpen, setShareImportOpen] = useState(false);
+  const [shareImportCode, setShareImportCode] = useState("");
+  const [lastShareCode, setLastShareCode] = useState<string | null>(null);
+  const [savedCollections, setSavedCollections] = useState<SavedCollectionEntry[]>(
+    [],
+  );
+  const [savedDetail, setSavedDetail] = useState<SavedCollectionDetail | null>(
+    null,
+  );
+  const [savedRename, setSavedRename] = useState("");
+  const [savedInstallGameId, setSavedInstallGameId] = useState("");
   const [orphanScan, setOrphanScan] = useState<OrphanScan | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -1034,6 +1051,7 @@ function App() {
           id: q.batchId,
           label: q.label,
           collection: q.collection,
+          emperorShare: q.emperorShare,
         });
       } else {
         setActiveBatch((prev) => (prev?.id === q.batchId ? null : prev));
@@ -1056,6 +1074,24 @@ function App() {
           revision: q.collection.revision,
           files: q.collection.files,
           existingModIds: q.collection.existingModIds,
+        });
+        if (game) await refreshCollections(game.id);
+      } catch (e) {
+        if (!String(e).includes("No staged mods matched")) {
+          setError(String(e));
+        }
+      }
+    }
+    if (q.emperorShare && !q.cancelled) {
+      try {
+        await api.recordEmperorShare({
+          gameId: q.entries[0]?.gameId ?? game?.id ?? "",
+          collectionId: q.emperorShare.collectionId,
+          name: q.emperorShare.name,
+          code: q.emperorShare.code,
+          files: q.emperorShare.files,
+          memberIds: q.emperorShare.memberIds,
+          existingModIds: q.emperorShare.existingModIds,
         });
         if (game) await refreshCollections(game.id);
       } catch (e) {
@@ -1280,6 +1316,7 @@ function App() {
       entries: AssistQueueEntry[],
       label: string | null = null,
       collection: AssistQueueState["collection"] = null,
+      emperorShare: AssistQueueState["emperorShare"] = null,
     ) => {
       if (entries.length === 0) {
         throw new Error("Nothing to queue.");
@@ -1296,6 +1333,7 @@ function App() {
         failures: [],
         cancelled: false,
         collection,
+        emperorShare,
       };
       setActiveBatch(null);
       setAssistQueueState(q);
@@ -1432,6 +1470,22 @@ function App() {
                   revision: batch.collection.revision,
                   files: batch.collection.files,
                   existingModIds: batch.collection.existingModIds,
+                });
+              } catch {
+                /* ignore incomplete match */
+              }
+            }
+            if (batch.emperorShare) {
+              try {
+                await api.recordEmperorShare({
+                  gameId:
+                    event.payload.game_id ?? activeGameRef.current?.id ?? "",
+                  collectionId: batch.emperorShare.collectionId,
+                  name: batch.emperorShare.name,
+                  code: batch.emperorShare.code,
+                  files: batch.emperorShare.files,
+                  memberIds: batch.emperorShare.memberIds,
+                  existingModIds: batch.emperorShare.existingModIds,
                 });
               } catch {
                 /* ignore incomplete match */
@@ -2614,31 +2668,224 @@ function App() {
 
   async function importThunderstoreProfileCode() {
     if (!activeGame) return;
-    const code = profileCode.trim();
+    const code = profileCode.trim() || shareImportCode.trim();
     if (!code) {
-      setError("Paste a Thunderstore / r2modman profile code.");
+      setError("Paste an Emperor share code or r2modman / Gale profile code.");
       return;
     }
+    await runUnifiedImport(activeGame.id, code);
+  }
+
+  async function handleShareImportResult(
+    gameId: string,
+    code: string,
+    result: ShareImportResult,
+  ) {
+    if (result.warnings.length > 0) {
+      setNotice({
+        kind: "warn",
+        message: result.warnings.slice(0, 3).join(" · "),
+      });
+    }
+    if (result.needs_assist.length > 0) {
+      const existingModIds = mods.map((m) => m.id);
+      const entries = result.needs_assist.map((f) =>
+        createQueueEntry(
+          gameId,
+          f.domain,
+          f.mod_id,
+          f.file_id,
+          f.name,
+          f.version,
+        ),
+      );
+      await enqueueAssistEntries(entries, result.name, null, {
+        collectionId: result.collection_id,
+        name: result.name,
+        code,
+        existingModIds,
+        memberIds: result.member_ids,
+        files: result.needs_assist.map((f) => ({
+          domain: f.domain,
+          modId: f.mod_id,
+          fileId: f.file_id,
+        })),
+      });
+      return;
+    }
+    await refreshMods(gameId);
+    await refreshCollections(gameId);
+    await refreshDownloads();
+    setNotice({
+      kind: "ok",
+      message: `Installed ${result.name} (${result.member_ids.length} mods).`,
+    });
+  }
+
+  async function runUnifiedImport(
+    gameId: string,
+    code: string,
+    name?: string | null,
+  ) {
     goToDownloadsOnInstall();
-    setBusy("Importing Thunderstore profile…");
+    setBusy("Importing code…");
     setError(null);
     try {
-      const installed = await api.importThunderstoreProfile(activeGame.id, code);
-      await refreshMods(activeGame.id);
-      await refreshCollections(activeGame.id);
-      await refreshDownloads();
-      setProfileImportOpen(false);
-      setProfileCode("");
-      setNotice({
-        kind: "ok",
-        message: `Imported profile ${installed.name} (${installed.mod_ids.length} mods).`,
-      });
+      const imported = await api.importCode(gameId, code, name);
+      if (imported.kind === "thunderstore_profile") {
+        await refreshMods(gameId);
+        await refreshCollections(gameId);
+        await refreshDownloads();
+        setNotice({
+          kind: "ok",
+          message: `Imported profile ${imported.collection.name}.`,
+        });
+        setProfileCode("");
+        setShareImportCode("");
+        setProfileImportOpen(false);
+        setShareImportOpen(false);
+      } else {
+        await handleShareImportResult(gameId, code, imported.result);
+        setShareImportCode("");
+        setProfileCode("");
+        setShareImportOpen(false);
+        setProfileImportOpen(false);
+      }
     } catch (e) {
       setError(String(e));
       await refreshDownloads();
     } finally {
       setBusy(null);
     }
+  }
+
+  async function exportShareLoadout() {
+    if (!activeGame) return;
+    setBusy("Creating share code…");
+    setError(null);
+    try {
+      const result = await api.exportShareCode(
+        activeGame.id,
+        shareExportName.trim() || null,
+      );
+      setLastShareCode(result.code);
+      try {
+        await navigator.clipboard.writeText(result.code);
+        setNotice({
+          kind: "ok",
+          message: `Copied share code for ${result.mod_count} mod(s). Saved to Collections.`,
+        });
+      } catch {
+        setNotice({
+          kind: "ok",
+          message: `Share code ready for ${result.mod_count} mod(s). Saved to Collections (copy from the box below).`,
+        });
+      }
+      if (result.warnings.length > 0) {
+        setNotice({
+          kind: "warn",
+          message: result.warnings[0],
+        });
+      }
+      setShareExportOpen(false);
+      setShareExportName("");
+      await refreshSavedCollections();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function refreshSavedCollections() {
+    try {
+      const list = await api.listSavedCollections();
+      setSavedCollections(list);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function openSavedCollection(id: string) {
+    setBusy("Loading collection…");
+    setError(null);
+    try {
+      const detail = await api.getSavedCollection(id);
+      setSavedDetail(detail);
+      setSavedRename(detail.entry.name);
+      const matches = managed.filter((g) =>
+        savedCollectionMatchesGame(detail.entry, g),
+      );
+      setSavedInstallGameId(
+        matches[0]?.id ??
+          detail.entry.source_game_id ??
+          activeGame?.id ??
+          managed[0]?.id ??
+          "",
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function savedCollectionMatchesGame(
+    entry: SavedCollectionEntry,
+    game: ManagedGame,
+  ): boolean {
+    const h = entry.game;
+    if (
+      h.nexus_domain &&
+      game.nexus_domain &&
+      h.nexus_domain.toLowerCase() === game.nexus_domain.toLowerCase()
+    ) {
+      return true;
+    }
+    if (
+      h.thunderstore_community &&
+      game.thunderstore_community &&
+      h.thunderstore_community.toLowerCase() ===
+        game.thunderstore_community.toLowerCase()
+    ) {
+      return true;
+    }
+    if (
+      h.modio_game_id != null &&
+      h.modio_game_id > 0 &&
+      game.modio_game_id === h.modio_game_id
+    ) {
+      return true;
+    }
+    if (entry.source_game_id && entry.source_game_id === game.id) return true;
+    return false;
+  }
+
+  function shareModLabel(m: ShareModEntry): string {
+    return (
+      m.display_name ||
+      m.name ||
+      (m.s === "nexus"
+        ? `Nexus ${m.mod_id}/${m.file_id}`
+        : m.s === "thunderstore"
+          ? `${m.namespace}-${m.name}`
+          : `mod.io ${m.mod_id}`) ||
+      "Mod"
+    );
+  }
+
+  async function installSavedCollection() {
+    if (!savedDetail) return;
+    const gameId = savedInstallGameId;
+    if (!gameId) {
+      setError("Select a managed game to install into.");
+      return;
+    }
+    await runUnifiedImport(
+      gameId,
+      savedDetail.entry.code,
+      savedDetail.entry.name,
+    );
   }
 
   async function uninstallInstalledCollection(c: InstalledCollection) {
@@ -2793,6 +3040,7 @@ function App() {
             [
               ["setup", "Setup"],
               ["library", "Library"],
+              ["collections", "Collections"],
               ["browse", "Browse"],
               ["downloads", "Downloads"],
               ["settings", "Settings"],
@@ -2805,6 +3053,10 @@ function App() {
                 setTab(id);
                 if (id === "downloads") refreshDownloads();
                 if (id === "library" && detected.length === 0) scan();
+                if (id === "collections") {
+                  void refreshSavedCollections();
+                  setSavedDetail(null);
+                }
               }}
             >
               {label}
@@ -3054,6 +3306,24 @@ function App() {
                       )}
                       {libraryDetail.tab === "mods" && (
                         <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShareExportOpen((v) => !v);
+                              setShareImportOpen(false);
+                            }}
+                          >
+                            Share loadout
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShareImportOpen((v) => !v);
+                              setShareExportOpen(false);
+                            }}
+                          >
+                            Import code
+                          </button>
                           <button onClick={importArchive}>Import archive</button>
                           <button onClick={deploy}>Deploy</button>
                           <button onClick={purge}>Purge</button>
@@ -3175,6 +3445,120 @@ function App() {
                   </div>
                 ) : (
                   <div className="detail-body">
+                    {(shareExportOpen || shareImportOpen || lastShareCode) && (
+                      <div className="profile-import share-panel">
+                        {shareExportOpen && (
+                          <>
+                            <h2>Share loadout</h2>
+                            <p className="note">
+                              Encodes enabled portable mods (Nexus, Thunderstore, mod.io) into a
+                              pasteable code. Saved under Collections.
+                            </p>
+                            <label>
+                              Name (optional)
+                              <input
+                                value={shareExportName}
+                                onChange={(e) => setShareExportName(e.target.value)}
+                                placeholder="My loadout"
+                              />
+                            </label>
+                            <div className="actions">
+                              <button
+                                type="button"
+                                onClick={() => void exportShareLoadout()}
+                              >
+                                Create &amp; copy code
+                              </button>
+                              <button
+                                type="button"
+                                className="linkish"
+                                onClick={() => setShareExportOpen(false)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        {shareImportOpen && (
+                          <>
+                            <h2>Import code</h2>
+                            <label>
+                              Code
+                              <textarea
+                                rows={4}
+                                value={shareImportCode}
+                                onChange={(e) => setShareImportCode(e.target.value)}
+                                placeholder="Paste Emperor share code or r2modman / Gale profile code"
+                              />
+                            </label>
+                            <div className="actions">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const code = shareImportCode.trim();
+                                  if (!code || !activeGame) return;
+                                  void runUnifiedImport(activeGame.id, code);
+                                }}
+                              >
+                                Import
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const code = shareImportCode.trim();
+                                  if (!code) return;
+                                  void (async () => {
+                                    try {
+                                      await api.saveCollectionCode({
+                                        code,
+                                        sourceGameId: activeGame?.id,
+                                      });
+                                      setNotice({
+                                        kind: "ok",
+                                        message: "Saved to Collections.",
+                                      });
+                                      await refreshSavedCollections();
+                                    } catch (e) {
+                                      setError(String(e));
+                                    }
+                                  })();
+                                }}
+                              >
+                                Save only
+                              </button>
+                              <button
+                                type="button"
+                                className="linkish"
+                                onClick={() => setShareImportOpen(false)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        {lastShareCode && !shareExportOpen && (
+                          <>
+                            <h2>Last share code</h2>
+                            <textarea
+                              rows={3}
+                              readOnly
+                              value={lastShareCode}
+                              onFocus={(e) => e.target.select()}
+                            />
+                            <div className="actions">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void navigator.clipboard.writeText(lastShareCode)
+                                }
+                              >
+                                Copy again
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
                     {installedCollections.length > 0 && (
                       <div className="installed-collections">
                         <h2>Installed collections</h2>
@@ -3184,11 +3568,13 @@ function App() {
                               <div>
                                 <strong>{c.name}</strong>
                                 <small>
-                                  {c.source === "thunderstore"
-                                    ? c.kind === "profile"
-                                      ? "Thunderstore profile"
-                                      : "Thunderstore modpack"
-                                    : "Nexus collection"}
+                                  {c.source === "emperor"
+                                    ? "Emperor share"
+                                    : c.source === "thunderstore"
+                                      ? c.kind === "profile"
+                                        ? "Thunderstore profile"
+                                        : "Thunderstore modpack"
+                                      : "Nexus collection"}
                                   {` · ${c.mod_ids.length} mods`}
                                 </small>
                               </div>
@@ -4437,13 +4823,12 @@ function App() {
                           ))}
                         </div>
                       )}
-                    {browseMode === "collections" &&
-                      Boolean(activeGame?.thunderstore_community) && (
+                    {browseMode === "collections" && activeGame && (
                         <button
                           type="button"
                           onClick={() => setProfileImportOpen((v) => !v)}
                         >
-                          Import profile
+                          Import code
                         </button>
                       )}
                     <div className="segment">
@@ -4482,13 +4867,14 @@ function App() {
                     {profileImportOpen && browseMode === "collections" && (
                       <div className="profile-import">
                         <label>
-                          Thunderstore profile code
-                          <input
+                          Share or profile code
+                          <textarea
+                            rows={3}
                             value={profileCode}
                             onChange={(e) => setProfileCode(e.target.value)}
-                            placeholder="Paste r2modman / Gale code"
+                            placeholder="Paste Emperor share code or r2modman / Gale profile code"
                             onKeyDown={(e) => {
-                              if (e.key === "Enter") {
+                              if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                                 void importThunderstoreProfileCode();
                               }
                             }}
@@ -4902,6 +5288,211 @@ function App() {
                     )}
                   </>
                 )}
+              </>
+            )}
+          </section>
+        )}
+
+        {tab === "collections" && (
+          <section className="panel">
+            {savedDetail ? (
+              <>
+                <div className="panel-head">
+                  <button
+                    type="button"
+                    className="linkish"
+                    onClick={() => setSavedDetail(null)}
+                  >
+                    ← Back
+                  </button>
+                  <h1>{savedDetail.entry.name}</h1>
+                </div>
+                <div className="detail-body">
+                  <p className="note">
+                    {savedDetail.entry.mod_count} mods
+                    {savedDetail.entry.nexus_count
+                      ? ` · ${savedDetail.entry.nexus_count} Nexus`
+                      : ""}
+                    {savedDetail.entry.thunderstore_count
+                      ? ` · ${savedDetail.entry.thunderstore_count} Thunderstore`
+                      : ""}
+                    {savedDetail.entry.modio_count
+                      ? ` · ${savedDetail.entry.modio_count} mod.io`
+                      : ""}
+                  </p>
+                  <label>
+                    Name
+                    <div className="row">
+                      <input
+                        value={savedRename}
+                        onChange={(e) => setSavedRename(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void (async () => {
+                            try {
+                              const updated = await api.renameSavedCollection(
+                                savedDetail.entry.id,
+                                savedRename,
+                              );
+                              setSavedDetail({ ...savedDetail, entry: updated });
+                              await refreshSavedCollections();
+                            } catch (e) {
+                              setError(String(e));
+                            }
+                          })()
+                        }
+                      >
+                        Rename
+                      </button>
+                    </div>
+                  </label>
+                  <label>
+                    Install into
+                    <select
+                      value={savedInstallGameId}
+                      onChange={(e) => setSavedInstallGameId(e.target.value)}
+                    >
+                      <option value="">Select managed game…</option>
+                      {managed.map((g) => (
+                        <option key={g.id} value={g.id}>
+                          {g.title}
+                          {savedCollectionMatchesGame(savedDetail.entry, g)
+                            ? " (match)"
+                            : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="actions" style={{ marginBottom: "1rem" }}>
+                    <button type="button" onClick={() => void installSavedCollection()}>
+                      Install
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void navigator.clipboard.writeText(savedDetail.entry.code)
+                      }
+                    >
+                      Copy code
+                    </button>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() =>
+                        void (async () => {
+                          if (!window.confirm(`Delete ${savedDetail.entry.name}?`)) {
+                            return;
+                          }
+                          try {
+                            await api.deleteSavedCollection(savedDetail.entry.id);
+                            setSavedDetail(null);
+                            await refreshSavedCollections();
+                          } catch (e) {
+                            setError(String(e));
+                          }
+                        })()
+                      }
+                    >
+                      Delete
+                    </button>
+                  </div>
+                  <h2>Contained mods</h2>
+                  <ul className="list">
+                    {savedDetail.mods.map((m, i) => (
+                      <li key={`${m.s}-${i}`}>
+                        <div>
+                          <strong>{shareModLabel(m)}</strong>
+                          <small>
+                            {m.s}
+                            {m.version ? ` · v${m.version}` : ""}
+                            {m.s === "nexus" && m.mod_id != null
+                              ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
+                              : ""}
+                            {m.s === "thunderstore"
+                              ? ` · ${m.community}/${m.namespace}-${m.name}`
+                              : ""}
+                            {m.s === "modio"
+                              ? ` · game ${m.game_id} mod ${m.mod_id}`
+                              : ""}
+                          </small>
+                        </div>
+                      </li>
+                    ))}
+                    {savedDetail.mods.length === 0 && (
+                      <li className="empty">No mods in this share.</li>
+                    )}
+                  </ul>
+                  <h2>Code</h2>
+                  <textarea rows={4} readOnly value={savedDetail.entry.code} />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="panel-head">
+                  <h1>Saved Collections</h1>
+                </div>
+                <p className="note">
+                  Local Emperor share codes. Create one from Library → game → Mods → Share
+                  loadout, or paste a code there and choose Save only.
+                </p>
+                <ul className="list">
+                  {savedCollections.map((c) => (
+                    <li
+                      key={c.id}
+                      className="list-row-clickable"
+                      onClick={() => void openSavedCollection(c.id)}
+                    >
+                      <div className="list-row-main">
+                        <strong>{c.name}</strong>
+                        <small>
+                          {c.mod_count} mods
+                          {c.game.nexus_domain
+                            ? ` · ${c.game.nexus_domain}`
+                            : ""}
+                          {c.game.thunderstore_community
+                            ? ` · ${c.game.thunderstore_community}`
+                            : ""}
+                          {c.game.modio_game_id
+                            ? ` · mod.io ${c.game.modio_game_id}`
+                            : ""}
+                          {` · ${new Date(c.created_at).toLocaleString()}`}
+                        </small>
+                      </div>
+                      <div className="actions" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          onClick={() => void navigator.clipboard.writeText(c.code)}
+                        >
+                          Copy
+                        </button>
+                        <button
+                          type="button"
+                          className="danger"
+                          onClick={() =>
+                            void (async () => {
+                              if (!window.confirm(`Delete ${c.name}?`)) return;
+                              try {
+                                await api.deleteSavedCollection(c.id);
+                                await refreshSavedCollections();
+                              } catch (err) {
+                                setError(String(err));
+                              }
+                            })()
+                          }
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                  {savedCollections.length === 0 && (
+                    <li className="empty">
+                      No saved share codes yet. Share a loadout from a managed game.
+                    </li>
+                  )}
+                </ul>
               </>
             )}
           </section>

@@ -105,6 +105,7 @@ pub enum CollectionSource {
     #[default]
     Nexus,
     Thunderstore,
+    Emperor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -114,6 +115,7 @@ pub enum CollectionKind {
     Collection,
     Modpack,
     Profile,
+    Share,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -17,6 +17,7 @@ mod migration;
 mod mods;
 mod modio_api;
 mod nexus;
+mod share;
 mod thunderstore;
 
 use commands::AppState;
@@ -93,6 +94,17 @@ pub fn run() {
             commands::download_mod,
             commands::install_collection,
             commands::import_thunderstore_profile,
+            commands::export_share_code,
+            commands::decode_share_code,
+            commands::detect_import_code,
+            commands::import_code,
+            commands::import_share_code,
+            commands::record_emperor_share,
+            commands::list_saved_collections,
+            commands::save_collection_code,
+            commands::get_saved_collection,
+            commands::rename_saved_collection,
+            commands::delete_saved_collection,
             commands::handle_nxm,
             commands::import_mod_archive,
             commands::import_assist_download,

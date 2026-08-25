@@ -272,8 +272,8 @@ export type CollectionSearchPage = {
 
 export type InstalledCollection = {
   id: string;
-  source: "nexus" | "thunderstore";
-  kind: "collection" | "modpack" | "profile";
+  source: "nexus" | "thunderstore" | "emperor";
+  kind: "collection" | "modpack" | "profile" | "share";
   name: string;
   slug?: string | null;
   namespace?: string | null;
@@ -285,6 +285,92 @@ export type InstalledCollection = {
   mod_ids: string[];
   installed_at: string;
 };
+
+export type ShareGameHint = {
+  id?: string | null;
+  plugin_id?: string | null;
+  nexus_domain?: string | null;
+  thunderstore_community?: string | null;
+  modio_game_id?: number | null;
+};
+
+export type ShareModEntry = {
+  s: "nexus" | "thunderstore" | "modio";
+  domain?: string | null;
+  mod_id?: number | null;
+  file_id?: number | null;
+  community?: string | null;
+  namespace?: string | null;
+  name?: string | null;
+  game_id?: number | null;
+  display_name?: string | null;
+  version?: string | null;
+};
+
+export type SavedCollectionEntry = {
+  id: string;
+  name: string;
+  code: string;
+  created_at: string;
+  updated_at: string;
+  source_game_id?: string | null;
+  game: ShareGameHint;
+  mod_count: number;
+  nexus_count: number;
+  thunderstore_count: number;
+  modio_count: number;
+};
+
+export type SavedCollectionDetail = {
+  entry: SavedCollectionEntry;
+  mods: ShareModEntry[];
+};
+
+export type ShareDecodePreview = {
+  name?: string | null;
+  game: ShareGameHint;
+  mods: ShareModEntry[];
+  nexus_count: number;
+  thunderstore_count: number;
+  modio_count: number;
+  code_len: number;
+  size_warning: boolean;
+};
+
+export type ExportShareResult = {
+  code: string;
+  warnings: string[];
+  skipped: string[];
+  mod_count: number;
+  saved: SavedCollectionEntry;
+};
+
+export type ShareAssistFile = {
+  domain: string;
+  mod_id: number;
+  file_id: number;
+  name: string;
+  version?: string | null;
+};
+
+export type ShareImportResult = {
+  collection_id: string;
+  name: string;
+  member_ids: string[];
+  needs_assist: ShareAssistFile[];
+  warnings: string[];
+  collection?: InstalledCollection | null;
+};
+
+export type DetectImportResult = {
+  kind: "emperor" | "thunderstoreprofile" | "unknown";
+  preview?: ShareDecodePreview | null;
+  message: string;
+};
+
+export type ImportCodeResult =
+  | { kind: "emperor"; result: ShareImportResult }
+  | { kind: "thunderstore_profile"; collection: InstalledCollection };
 
 export type StagedMod = {
   id: string;

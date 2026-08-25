@@ -574,6 +574,17 @@ button.tag-picker-trigger[aria-expanded="true"] {
   gap: 0.4rem;
 }
 
+.share-panel {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.share-panel textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
 .list.mods li.mod-disabled {
   opacity: 0.72;
 }
