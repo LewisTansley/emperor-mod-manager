@@ -285,6 +285,101 @@ pub fn incoming_is_newer(existing: Option<&str>, incoming: &str) -> bool {
     }
 }
 
+/// Minimal Nexus file metadata for update candidate selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NexusFileMeta {
+    pub file_id: u64,
+    pub version: Option<String>,
+    pub category_name: Option<String>,
+    pub uploaded_timestamp: Option<u64>,
+    pub is_primary: bool,
+}
+
+/// Available remote update for a staged mod.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedModUpdate {
+    pub staged_id: String,
+    pub available_version: Option<String>,
+    pub source: ModSource,
+    #[serde(default)]
+    pub nexus_file_id: Option<u64>,
+    #[serde(default)]
+    pub ts_version: Option<String>,
+    #[serde(default)]
+    pub modio_file_id: Option<u64>,
+}
+
+fn category_key(name: Option<&str>) -> String {
+    name.unwrap_or("").trim().to_lowercase()
+}
+
+fn is_main_category(name: Option<&str>) -> bool {
+    let k = category_key(name);
+    k.is_empty() || k.contains("main")
+}
+
+fn nexus_file_is_newer(candidate: &NexusFileMeta, baseline: &NexusFileMeta) -> bool {
+    match (candidate.uploaded_timestamp, baseline.uploaded_timestamp) {
+        (Some(ta), Some(tb)) if ta != tb => ta > tb,
+        _ => candidate.file_id > baseline.file_id,
+    }
+}
+
+fn newest_nexus_file<'a, F>(files: &'a [NexusFileMeta], pred: F) -> Option<&'a NexusFileMeta>
+where
+    F: Fn(&NexusFileMeta) -> bool,
+{
+    files
+        .iter()
+        .filter(|f| pred(f))
+        .max_by(|a, b| {
+            a.uploaded_timestamp
+                .cmp(&b.uploaded_timestamp)
+                .then_with(|| a.file_id.cmp(&b.file_id))
+        })
+}
+
+/// Pick a newer Nexus file that should replace the staged file, if any.
+pub fn nexus_update_candidate<'a>(
+    staged_file_id: u64,
+    staged_version: Option<&str>,
+    files: &'a [NexusFileMeta],
+) -> Option<&'a NexusFileMeta> {
+    if files.is_empty() {
+        return None;
+    }
+    let staged = files.iter().find(|f| f.file_id == staged_file_id);
+    let candidate = if let Some(staged) = staged {
+        let cat = category_key(staged.category_name.as_deref());
+        newest_nexus_file(files, |f| category_key(f.category_name.as_deref()) == cat)
+            .or_else(|| newest_nexus_file(files, |f| f.is_primary))
+    } else {
+        newest_nexus_file(files, |f| f.is_primary)
+            .or_else(|| newest_nexus_file(files, |f| is_main_category(f.category_name.as_deref())))
+            .or_else(|| newest_nexus_file(files, |_| true))
+    }?;
+
+    if candidate.file_id == staged_file_id {
+        return None;
+    }
+
+    let version_newer = candidate
+        .version
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(|v| incoming_is_newer(staged_version, v))
+        .unwrap_or(false);
+    let upload_newer = match staged {
+        Some(s) => nexus_file_is_newer(candidate, s),
+        None => true,
+    };
+    if version_newer || upload_newer {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 fn push_unique(list: &mut Vec<String>, value: String) {
     if !list.iter().any(|s| s == &value) {
         list.push(value);
@@ -697,6 +792,55 @@ pub fn stage_mod(
     version: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
+    stage_mod_inner(
+        paths,
+        game_id,
+        None,
+        name,
+        domain,
+        mod_id,
+        file_id,
+        version,
+        archive,
+    )
+}
+
+/// Stage a Nexus archive, replacing a specific staged row (e.g. updating to a new file id).
+pub fn stage_mod_replacing(
+    paths: &Paths,
+    game_id: &str,
+    replace_id: &str,
+    name: &str,
+    domain: &str,
+    mod_id: u64,
+    file_id: u64,
+    version: Option<String>,
+    archive: &Path,
+) -> Result<StagedMod> {
+    stage_mod_inner(
+        paths,
+        game_id,
+        Some(replace_id),
+        name,
+        domain,
+        mod_id,
+        file_id,
+        version,
+        archive,
+    )
+}
+
+fn stage_mod_inner(
+    paths: &Paths,
+    game_id: &str,
+    replace_id: Option<&str>,
+    name: &str,
+    domain: &str,
+    mod_id: u64,
+    file_id: u64,
+    version: Option<String>,
+    archive: &Path,
+) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
     let safe = sanitize_filename::sanitize(name);
     let staging = paths
@@ -705,13 +849,22 @@ pub fn stage_mod(
     extract_archive(archive, &staging)?;
 
     let mut order = load_loadorder(paths, game_id)?;
-    let old = take_nexus_row(&mut order, mod_id, file_id);
+    let old = if let Some(id) = replace_id {
+        take_row_by_id(&mut order, id)
+    } else {
+        take_nexus_row(&mut order, mod_id, file_id)
+    };
+    let old_id = old.as_ref().map(|m| m.id.clone());
     let provenance = provenance_from_removed(old, &staging);
+    let new_id = format!("{mod_id}_{file_id}");
+    if let Some(old_id) = old_id {
+        rewrite_depends_on(&mut order, &old_id, &new_id);
+    }
     let next_order = provenance
         .order
         .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
     let staged = StagedMod {
-        id: format!("{mod_id}_{file_id}"),
+        id: new_id,
         name: name.to_string(),
         source: ModSource::Nexus,
         nexus_mod_id: mod_id,
@@ -1675,6 +1828,60 @@ mod tests {
         assert!(incoming_is_newer(Some("build"), "other"));
         assert!(!incoming_is_newer(Some("1.0.0"), "weird"));
         assert!(incoming_is_newer(Some("weird"), "1.0.0"));
+    }
+
+    fn nexus_file(
+        file_id: u64,
+        version: &str,
+        category: &str,
+        uploaded: u64,
+        is_primary: bool,
+    ) -> NexusFileMeta {
+        NexusFileMeta {
+            file_id,
+            version: Some(version.into()),
+            category_name: Some(category.into()),
+            uploaded_timestamp: Some(uploaded),
+            is_primary,
+        }
+    }
+
+    #[test]
+    fn nexus_same_file_no_update() {
+        let files = vec![nexus_file(10, "1.0.0", "MAIN", 100, true)];
+        assert!(nexus_update_candidate(10, Some("1.0.0"), &files).is_none());
+    }
+
+    #[test]
+    fn nexus_newer_same_category_is_update() {
+        let files = vec![
+            nexus_file(10, "1.0.0", "MAIN", 100, false),
+            nexus_file(20, "1.1.0", "MAIN", 200, true),
+        ];
+        let c = nexus_update_candidate(10, Some("1.0.0"), &files).unwrap();
+        assert_eq!(c.file_id, 20);
+        assert_eq!(c.version.as_deref(), Some("1.1.0"));
+    }
+
+    #[test]
+    fn nexus_optional_not_replaced_by_main() {
+        let files = vec![
+            nexus_file(10, "1.0.0", "OPTIONAL", 100, false),
+            nexus_file(20, "2.0.0", "MAIN", 200, true),
+            nexus_file(11, "1.0.1", "OPTIONAL", 150, false),
+        ];
+        let c = nexus_update_candidate(10, Some("1.0.0"), &files).unwrap();
+        assert_eq!(c.file_id, 11);
+    }
+
+    #[test]
+    fn nexus_missing_staged_falls_back_to_primary() {
+        let files = vec![
+            nexus_file(20, "2.0.0", "MAIN", 200, true),
+            nexus_file(30, "1.0.0", "OPTIONAL", 300, false),
+        ];
+        let c = nexus_update_candidate(99, Some("1.0.0"), &files).unwrap();
+        assert_eq!(c.file_id, 20);
     }
 
     #[test]

@@ -34,6 +34,7 @@ import type {
   ModFileInfo,
   Settings,
   StagedMod,
+  StagedModUpdate,
   TagFilterState,
   ThemePreference,
   InstallClickBehavior,
@@ -518,6 +519,9 @@ function App() {
   const [managed, setManaged] = useState<ManagedGame[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [mods, setMods] = useState<StagedMod[]>([]);
+  const [modUpdates, setModUpdates] = useState<Record<string, StagedModUpdate>>(
+    {},
+  );
   const [modsQuery, setModsQuery] = useState("");
   const [modsStatusFilter, setModsStatusFilter] =
     useState<ModsStatusFilter>("all");
@@ -583,6 +587,7 @@ function App() {
   const [activeBatch, setActiveBatch] = useState<ActiveDownloadBatch | null>(null);
   const [assistHint, setAssistHint] = useState<string | null>(null);
   const [assistActive, setAssistActive] = useState(false);
+  const [assistLoginBanner, setAssistLoginBanner] = useState(false);
   const [unrealManage, setUnrealManage] = useState<DetectedGame | null>(null);
   const [unrealDomain, setUnrealDomain] = useState("");
   const [unrealCommunity, setUnrealCommunity] = useState("");
@@ -729,6 +734,19 @@ function App() {
     setMods(list);
   }, []);
 
+  const refreshModUpdates = useCallback(async (gameId: string) => {
+    try {
+      const updates = await api.checkStagedModUpdates(gameId);
+      const map: Record<string, StagedModUpdate> = {};
+      for (const u of updates) {
+        map[u.staged_id] = u;
+      }
+      setModUpdates(map);
+    } catch (e) {
+      console.warn("check_staged_mod_updates failed", e);
+    }
+  }, []);
+
   const refreshCollections = useCallback(async (gameId: string) => {
     const list = await api.listInstalledCollections(gameId);
     setInstalledCollections(list);
@@ -800,8 +818,27 @@ function App() {
       setModFiles([]);
       setCollectionModFiles([]);
       setCollectionDetail(null);
+      setModUpdates({});
+    } else {
+      setModUpdates({});
     }
   }, [activeGame, refreshMods, refreshCollections]);
+
+  useEffect(() => {
+    if (!activeGame || libraryDetail?.tab !== "mods") return;
+    const gameId = activeGame.id;
+    let cancelled = false;
+    const poll = () => {
+      if (cancelled) return;
+      void refreshModUpdates(gameId);
+    };
+    poll();
+    const id = window.setInterval(poll, 15 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [activeGame, libraryDetail?.tab, refreshModUpdates]);
 
   useEffect(() => {
     setModsQuery("");
@@ -1035,6 +1072,7 @@ function App() {
     setAssistQueueState(null);
     setAssistActive(false);
     setAssistHint(null);
+    setAssistLoginBanner(false);
     setBusy(null);
     const list = await api.listDownloads();
     setDownloads(list);
@@ -1141,6 +1179,7 @@ function App() {
         fileId: entry.fileId,
         name: entry.name,
         batchId: q.batchId,
+        replaceStagedId: entry.replaceStagedId ?? null,
       });
     },
     [finishAssistQueue, syncAssistHost],
@@ -1321,9 +1360,38 @@ function App() {
       if (entries.length === 0) {
         throw new Error("Nothing to queue.");
       }
-      if (assistQueueRef.current && !assistQueueRef.current.cancelled) {
-        throw new Error("A download queue is already in progress.");
+
+      const isDup = (existing: AssistQueueEntry[], e: AssistQueueEntry) =>
+        existing.some(
+          (x) =>
+            (e.replaceStagedId &&
+              x.replaceStagedId &&
+              x.replaceStagedId === e.replaceStagedId) ||
+            (x.gameId === e.gameId &&
+              x.domain === e.domain &&
+              x.modId === e.modId &&
+              x.fileId === e.fileId),
+        );
+
+      const existing = assistQueueRef.current;
+      if (existing && !existing.cancelled) {
+        const toAdd = entries.filter((e) => !isDup(existing.entries, e));
+        if (toAdd.length === 0) {
+          setError(null);
+          return;
+        }
+        const next: AssistQueueState = {
+          ...existing,
+          entries: [...existing.entries, ...toAdd],
+          label: existing.label ?? label,
+          collection: existing.collection ?? collection,
+          emperorShare: existing.emperorShare ?? emperorShare,
+        };
+        setAssistQueueState(next);
+        setError(null);
+        return;
       }
+
       const q: AssistQueueState = {
         batchId: crypto.randomUUID(),
         label,
@@ -1337,7 +1405,6 @@ function App() {
       };
       setActiveBatch(null);
       setAssistQueueState(q);
-      setTab("downloads");
       setError(null);
       await openAssistAtHead(q);
     },
@@ -1407,6 +1474,7 @@ function App() {
     });
     const unlistenOpened = listen<{ autoclick: boolean }>("assist-opened", (event) => {
       setAssistActive(true);
+      setAssistLoginBanner(false);
       const q = assistQueueRef.current;
       const entry = q?.entries[q.head];
       setAssistHint(
@@ -1433,6 +1501,7 @@ function App() {
         "Sign in to Nexus in Download Assist once (use Stay signed in). Session is saved separately from your API key.",
       );
       setBusy("Waiting for Nexus sign-in in Download Assist…");
+      setAssistLoginBanner(true);
     });
     const unlistenClosed = listen("assist-closed", async () => {
       if (Date.now() - downloadStartedAtRef.current < 2500) {
@@ -1499,6 +1568,7 @@ function App() {
           try {
             await refreshMods(gameId);
             await refreshCollections(gameId);
+            await refreshModUpdates(gameId);
           } catch {
             /* ignore */
           }
@@ -1570,6 +1640,7 @@ function App() {
       downloadStartedAtRef.current = Date.now();
       setAssistActive(false);
       setAssistHint(null);
+      setAssistLoginBanner(false);
       await refreshDownloads();
       const q = assistQueueRef.current;
       if (q && !q.cancelled && q.head + 1 < q.entries.length) {
@@ -1594,7 +1665,7 @@ function App() {
       unlistenProgress.then((f) => f());
       unlistenStarted.then((f) => f());
     };
-  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections]);
+  }, [advanceAssistAfterFailure, advanceAssistAfterStart, refreshDownloads, refreshMods, refreshCollections, refreshModUpdates]);
 
   async function withBusy<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
     setBusy(label);
@@ -2905,6 +2976,122 @@ function App() {
     });
   }
 
+  async function updateOneStagedMod(stagedId: string) {
+    if (!activeGame) return;
+    const m = mods.find((x) => x.id === stagedId);
+    const upd = modUpdates[stagedId];
+    if (!m || !upd) return;
+
+    const clearUpdateBadge = () => {
+      setModUpdates((prev) => {
+        const next = { ...prev };
+        delete next[stagedId];
+        return next;
+      });
+    };
+
+    if (
+      m.source === "nexus" &&
+      !isPremium &&
+      upd.nexus_file_id != null
+    ) {
+      clearUpdateBadge();
+      await enqueueAssistEntries(
+        [
+          createQueueEntry(
+            activeGame.id,
+            m.domain || activeGame.nexus_domain,
+            m.nexus_mod_id,
+            upd.nexus_file_id,
+            m.name,
+            upd.available_version,
+            m.id,
+          ),
+        ],
+        `Update ${m.name}`,
+      );
+      return;
+    }
+
+    await withBusy("Updating mod…", async () => {
+      await api.updateStagedMod(activeGame.id, stagedId);
+      await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      clearUpdateBadge();
+      void refreshModUpdates(activeGame.id);
+    });
+  }
+
+  async function updateAllStagedMods() {
+    if (!activeGame) return;
+    const pending = Object.entries(modUpdates);
+    if (pending.length === 0) return;
+
+    const assistEntries: AssistQueueEntry[] = [];
+    const apiIds: string[] = [];
+
+    for (const [stagedId, upd] of pending) {
+      const m = mods.find((x) => x.id === stagedId);
+      if (!m) continue;
+      if (
+        m.source === "nexus" &&
+        !isPremium &&
+        upd.nexus_file_id != null
+      ) {
+        assistEntries.push(
+          createQueueEntry(
+            activeGame.id,
+            m.domain || activeGame.nexus_domain,
+            m.nexus_mod_id,
+            upd.nexus_file_id,
+            m.name,
+            upd.available_version,
+            m.id,
+          ),
+        );
+      } else {
+        apiIds.push(stagedId);
+      }
+    }
+
+    if (assistEntries.length > 0) {
+      setModUpdates((prev) => {
+        const next = { ...prev };
+        for (const e of assistEntries) {
+          if (e.replaceStagedId) delete next[e.replaceStagedId];
+        }
+        return next;
+      });
+      try {
+        await enqueueAssistEntries(
+          assistEntries,
+          `Update ${assistEntries.length} mod${assistEntries.length === 1 ? "" : "s"}`,
+        );
+      } catch (e) {
+        setError(String(e));
+      }
+    }
+
+    if (apiIds.length > 0) {
+      await withBusy(
+        `Updating ${apiIds.length} mod${apiIds.length === 1 ? "" : "s"}…`,
+        async () => {
+          for (const id of apiIds) {
+            await api.updateStagedMod(activeGame.id, id);
+          }
+          await refreshMods(activeGame.id);
+          await refreshCollections(activeGame.id);
+          setModUpdates((prev) => {
+            const next = { ...prev };
+            for (const id of apiIds) delete next[id];
+            return next;
+          });
+          void refreshModUpdates(activeGame.id);
+        },
+      );
+    }
+  }
+
   async function importArchive() {
     if (!activeGame) return;
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -3109,7 +3296,31 @@ function App() {
             </span>
           </div>
         )}
-        {notice && !error && (
+        {assistLoginBanner && !error && (
+          <div className="banner warn">
+            <span>
+              Nexus website sign-in is required for Download Assist. Open Downloads to
+              sign in (use Stay signed in), then the queue continues.
+            </span>
+            <span className="banner-actions">
+              <button
+                className="linkish"
+                type="button"
+                onClick={() => openDownloadsTab()}
+              >
+                Open Downloads
+              </button>
+              <button
+                className="linkish"
+                type="button"
+                onClick={() => setAssistLoginBanner(false)}
+              >
+                dismiss
+              </button>
+            </span>
+          </div>
+        )}
+        {notice && !error && !assistLoginBanner && (
           <div className={`banner ${notice.kind === "ok" ? "info" : "warn"}`}>
             <span>{notice.message}</span>
             <span className="banner-actions">
@@ -3284,7 +3495,7 @@ function App() {
                       )}
                       <span>{libraryDetail.game.nexus_domain}</span>
                     </div>
-                    <div className="detail-mod-actions">
+                    <div className="detail-external-links">
                       <button
                         type="button"
                         onClick={() =>
@@ -3304,6 +3515,8 @@ function App() {
                           Forum
                         </button>
                       )}
+                    </div>
+                    <div className="detail-mod-actions">
                       {libraryDetail.tab === "mods" && (
                         <>
                           <button
@@ -3325,15 +3538,6 @@ function App() {
                             Import code
                           </button>
                           <button onClick={importArchive}>Import archive</button>
-                          <button onClick={deploy}>Deploy</button>
-                          <button onClick={purge}>Purge</button>
-                          <button
-                            className="danger"
-                            onClick={removeAllMods}
-                            disabled={mods.length === 0}
-                          >
-                            Remove all mods
-                          </button>
                         </>
                       )}
                     </div>
@@ -3693,6 +3897,30 @@ function App() {
                             Clear filters
                           </button>
                         )}
+                        <div className="mods-toolbar-actions">
+                          {Object.keys(modUpdates).length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => void updateAllStagedMods()}
+                            >
+                              Update all ({Object.keys(modUpdates).length})
+                            </button>
+                          )}
+                          <button type="button" onClick={deploy}>
+                            Deploy
+                          </button>
+                          <button type="button" onClick={purge}>
+                            Purge
+                          </button>
+                          <button
+                            type="button"
+                            className="danger"
+                            onClick={removeAllMods}
+                            disabled={mods.length === 0}
+                          >
+                            Remove all mods
+                          </button>
+                        </div>
                       </div>
                       {!canReorderMods && mods.length > 0 && (
                         <p className="note mods-reorder-hint">
@@ -3737,6 +3965,21 @@ function App() {
                               </div>
                             </label>
                             <div className="actions">
+                              {modUpdates[m.id] && (
+                                <button
+                                  type="button"
+                                  title={
+                                    modUpdates[m.id].available_version
+                                      ? `Update to v${modUpdates[m.id].available_version}`
+                                      : "Update available"
+                                  }
+                                  onClick={() => void updateOneStagedMod(m.id)}
+                                >
+                                  {modUpdates[m.id].available_version
+                                    ? `Update to v${modUpdates[m.id].available_version}`
+                                    : "Update"}
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => moveMod(m.id, -1)}
@@ -3769,6 +4012,11 @@ function App() {
                                     await api.removeMod(activeGame.id, m.id);
                                     await refreshMods(activeGame.id);
                                     await refreshCollections(activeGame.id);
+                                    setModUpdates((prev) => {
+                                      const next = { ...prev };
+                                      delete next[m.id];
+                                      return next;
+                                    });
                                   })
                                 }
                               >

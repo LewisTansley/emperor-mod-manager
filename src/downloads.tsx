@@ -9,6 +9,8 @@ export type AssistQueueEntry = {
   fileId: number;
   name: string;
   version?: string | null;
+  /** When set, staging replaces this existing staged mod (e.g. free-account update). */
+  replaceStagedId?: string | null;
 };
 
 export type AssistQueueState = {
@@ -51,6 +53,7 @@ export function createQueueEntry(
   fileId: number,
   name: string,
   version?: string | null,
+  replaceStagedId?: string | null,
 ): AssistQueueEntry {
   return {
     id: crypto.randomUUID(),
@@ -60,6 +63,7 @@ export function createQueueEntry(
     fileId,
     name,
     version,
+    replaceStagedId: replaceStagedId ?? null,
   };
 }
 

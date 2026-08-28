@@ -589,6 +589,8 @@ pub struct AssistContext {
     pub file_id: u64,
     pub generation: u64,
     pub batch_id: Option<String>,
+    /// When set, staging replaces this existing staged mod (e.g. free-account update).
+    pub replace_staged_id: Option<String>,
 }
 
 pub fn set_assist_context(state: &AppState, ctx: AssistContext) {
@@ -988,6 +990,7 @@ pub async fn open_download_assist(
     file_id: u64,
     name: String,
     batch_id: Option<String>,
+    replace_staged_id: Option<String>,
 ) -> Result<(), String> {
     // Close → wait → open next so SPA state / autoclick flags cannot leak across mods.
     if app.get_webview(ASSIST_LABEL).is_some() {
@@ -1014,6 +1017,7 @@ pub async fn open_download_assist(
             file_id,
             generation,
             batch_id,
+            replace_staged_id,
         },
     );
 

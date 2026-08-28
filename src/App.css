@@ -528,6 +528,14 @@ button.tag-picker-trigger[aria-expanded="true"] {
   align-self: flex-end;
 }
 
+.mods-toolbar-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-left: auto;
+  align-self: flex-end;
+  flex-shrink: 0;
+}
+
 .mods-reorder-hint {
   margin: 0.35rem 0 0;
 }
@@ -866,6 +874,12 @@ button.danger {
   flex-wrap: wrap;
   justify-content: flex-end;
   margin-top: auto;
+}
+
+.detail-external-links {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
 }
 
 .detail-author {

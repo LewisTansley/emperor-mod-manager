@@ -24,6 +24,7 @@ import type {
   RecoveryReport,
   Settings,
   StagedMod,
+  StagedModUpdate,
   ThemePreference,
   InstallClickBehavior,
   TsPackageDetail,
@@ -207,6 +208,7 @@ export const api = {
     fileId: number;
     name: string;
     batchId?: string | null;
+    replaceStagedId?: string | null;
   }) =>
     invoke<void>("open_download_assist", {
       gameId: args.gameId,
@@ -215,6 +217,7 @@ export const api = {
       fileId: args.fileId,
       name: args.name,
       batchId: args.batchId ?? null,
+      replaceStagedId: args.replaceStagedId ?? null,
     }),
   setAssistBounds: (bounds: {
     x: number;
@@ -329,6 +332,10 @@ export const api = {
   importAssistDownload: (path: string) =>
     invoke<StagedMod>("import_assist_download", { path }),
   listMods: (gameId: string) => invoke<StagedMod[]>("list_mods", { gameId }),
+  checkStagedModUpdates: (gameId: string) =>
+    invoke<StagedModUpdate[]>("check_staged_mod_updates", { gameId }),
+  updateStagedMod: (gameId: string, stagedId: string) =>
+    invoke<StagedMod>("update_staged_mod", { gameId, stagedId }),
   setModEnabled: (gameId: string, modId: string, enabled: boolean) =>
     invoke<void>("set_mod_enabled", { gameId, modId, enabled }),
   setLoadOrder: (gameId: string, orderedIds: string[]) =>

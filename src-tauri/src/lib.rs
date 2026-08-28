@@ -111,6 +111,8 @@ pub fn run() {
             commands::scan_mod_orphans,
             commands::recover_legacy_mod_data,
             commands::list_mods,
+            commands::check_staged_mod_updates,
+            commands::update_staged_mod,
             commands::list_installed_collections,
             commands::uninstall_collection,
             commands::record_nexus_collection,

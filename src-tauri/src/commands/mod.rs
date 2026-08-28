@@ -19,7 +19,7 @@ use crate::{
     detection::{self, DetectedGame},
     games, migration,
     modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
-    mods::{self, CollectionKind, CollectionSource, InstalledCollection, StagedMod},
+    mods::{self, CollectionKind, CollectionSource, InstalledCollection, ModSource, StagedMod, StagedModUpdate},
     nexus::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
         ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
@@ -42,6 +42,7 @@ pub enum DownloadResumeSource {
         version: Option<String>,
         nxm_key: Option<String>,
         nxm_expires: Option<u64>,
+        replace_staged_id: Option<String>,
     },
     Cdn {
         url: String,
@@ -51,6 +52,7 @@ pub enum DownloadResumeSource {
         mod_id: u64,
         file_id: u64,
         label: String,
+        replace_staged_id: Option<String>,
     },
 }
 
@@ -2486,6 +2488,7 @@ async fn download_and_stage_inner(
     nxm_expires: Option<u64>,
     existing_dl_id: Option<String>,
     batch_id: Option<String>,
+    replace_staged_id: Option<String>,
 ) -> Result<StagedMod, String> {
     let client = state.client()?;
     let is_premium = state.ensure_premium_status().await;
@@ -2541,6 +2544,7 @@ async fn download_and_stage_inner(
             version: version.clone(),
             nxm_key: nxm_key.clone(),
             nxm_expires,
+            replace_staged_id: replace_staged_id.clone(),
         },
     );
 
@@ -2614,16 +2618,30 @@ async fn download_and_stage_inner(
         );
     }
 
-    match mods::stage_mod(
-        &state.paths,
-        game_id,
-        label,
-        domain,
-        mod_id,
-        file_id,
-        version,
-        &dest,
-    ) {
+    match if let Some(replace_id) = replace_staged_id.as_deref() {
+        mods::stage_mod_replacing(
+            &state.paths,
+            game_id,
+            replace_id,
+            label,
+            domain,
+            mod_id,
+            file_id,
+            version,
+            &dest,
+        )
+    } else {
+        mods::stage_mod(
+            &state.paths,
+            game_id,
+            label,
+            domain,
+            mod_id,
+            file_id,
+            version,
+            &dest,
+        )
+    } {
         Ok(staged) => {
             if cancel.load(Ordering::SeqCst) {
                 mark_cancelled(state, &dl_id);
@@ -2679,6 +2697,7 @@ pub async fn download_mod(
         file_id,
         &name,
         version,
+        None,
         None,
         None,
         None,
@@ -2749,6 +2768,7 @@ pub async fn install_collection(
             None,
             None,
             Some(batch_id.clone()),
+            None,
         )
         .await
         {
@@ -2810,6 +2830,7 @@ pub async fn handle_nxm(
     let link = nexus::parse_nxm(&url).map_err(|e| e.to_string())?;
     let assist = crate::assist::peek_assist_context(&state);
     let batch_id = assist.as_ref().and_then(|a| a.batch_id.clone());
+    let replace_staged_id = assist.as_ref().and_then(|a| a.replace_staged_id.clone());
     let game = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
         cfg.managed_games
@@ -2889,6 +2910,7 @@ pub async fn handle_nxm(
     let label = name.clone();
     let queued_id = dl_id.clone();
     let batch_id_bg = batch_id.clone();
+    let replace_staged_id_bg = replace_staged_id;
 
     tauri::async_runtime::spawn(async move {
         let state = app_bg.state::<AppState>();
@@ -2905,6 +2927,7 @@ pub async fn handle_nxm(
             expires,
             Some(queued_id.clone()),
             batch_id_bg,
+            replace_staged_id_bg,
         )
         .await;
         match result {
@@ -3091,6 +3114,7 @@ pub async fn start_assist_cdn_download(
     let domain = ctx.domain.clone();
     let mod_id = ctx.mod_id;
     let file_id = ctx.file_id;
+    let replace_staged_id = ctx.replace_staged_id.clone();
     let queued_id = dl_id.clone();
     let cdn_url = cdn_url.to_string();
     let cookie_header = cookie_header;
@@ -3110,6 +3134,7 @@ pub async fn start_assist_cdn_download(
             file_id,
             &queued_id,
             batch_id_bg,
+            replace_staged_id,
         )
         .await;
         match result {
@@ -3167,6 +3192,7 @@ async fn fetch_and_stage_cdn(
     file_id: u64,
     dl_id: &str,
     batch_id: Option<String>,
+    replace_staged_id: Option<String>,
 ) -> Result<StagedMod, String> {
     let (cancel, pause) = ensure_download_job(state, dl_id, batch_id.clone());
     if cancel.load(Ordering::SeqCst) {
@@ -3209,6 +3235,7 @@ async fn fetch_and_stage_cdn(
             mod_id,
             file_id,
             label: label.to_string(),
+            replace_staged_id: replace_staged_id.clone(),
         },
     );
 
@@ -3306,16 +3333,30 @@ async fn fetch_and_stage_cdn(
 
     update_download(state, dl_id, "extracting", None);
     report_download_progress(app, state, dl_id, bytes_downloaded, bytes_total, 0);
-    match mods::stage_mod(
-        &state.paths,
-        game_id,
-        label,
-        domain,
-        mod_id,
-        file_id,
-        None,
-        &dest,
-    ) {
+    match if let Some(replace_id) = replace_staged_id.as_deref() {
+        mods::stage_mod_replacing(
+            &state.paths,
+            game_id,
+            replace_id,
+            label,
+            domain,
+            mod_id,
+            file_id,
+            None,
+            &dest,
+        )
+    } else {
+        mods::stage_mod(
+            &state.paths,
+            game_id,
+            label,
+            domain,
+            mod_id,
+            file_id,
+            None,
+            &dest,
+        )
+    } {
         Ok(staged) => {
             if cancel.load(Ordering::SeqCst) {
                 mark_cancelled(state, dl_id);
@@ -3368,16 +3409,30 @@ pub fn import_assist_download(
         clear_download_job(&state, &dl_id);
         return Err("Cancelled".into());
     }
-    match mods::stage_mod(
-        &state.paths,
-        &ctx.game_id,
-        &ctx.label,
-        &ctx.domain,
-        ctx.mod_id,
-        ctx.file_id,
-        None,
-        &PathBuf::from(&path),
-    ) {
+    match if let Some(replace_id) = ctx.replace_staged_id.as_deref() {
+        mods::stage_mod_replacing(
+            &state.paths,
+            &ctx.game_id,
+            replace_id,
+            &ctx.label,
+            &ctx.domain,
+            ctx.mod_id,
+            ctx.file_id,
+            None,
+            &PathBuf::from(&path),
+        )
+    } else {
+        mods::stage_mod(
+            &state.paths,
+            &ctx.game_id,
+            &ctx.label,
+            &ctx.domain,
+            ctx.mod_id,
+            ctx.file_id,
+            None,
+            &PathBuf::from(&path),
+        )
+    } {
         Ok(staged) => {
             if cancel.load(Ordering::SeqCst) {
                 mark_cancelled(&state, &dl_id);
@@ -3426,6 +3481,217 @@ pub fn list_mods(state: State<'_, AppState>, game_id: String) -> Result<Vec<Stag
     let mut order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
     order.mods.sort_by_key(|m| m.order);
     Ok(order.mods)
+}
+
+async fn detect_update_for_staged(
+    state: &AppState,
+    staged: &StagedMod,
+) -> Option<StagedModUpdate> {
+    match staged.source {
+        ModSource::Nexus => {
+            if staged.nexus_mod_id == 0 || staged.domain.is_empty() {
+                return None;
+            }
+            let client = state.client().ok()?;
+            let files = client
+                .list_mod_files(&staged.domain, staged.nexus_mod_id)
+                .await
+                .ok()?;
+            let metas: Vec<_> = files
+                .into_iter()
+                .map(|f| mods::NexusFileMeta {
+                    file_id: f.file_id,
+                    version: f.version,
+                    category_name: f.category_name,
+                    uploaded_timestamp: f.uploaded_timestamp,
+                    is_primary: f.is_primary,
+                })
+                .collect();
+            let candidate =
+                mods::nexus_update_candidate(staged.nexus_file_id, staged.version.as_deref(), &metas)?;
+            Some(StagedModUpdate {
+                staged_id: staged.id.clone(),
+                available_version: candidate.version.clone(),
+                source: ModSource::Nexus,
+                nexus_file_id: Some(candidate.file_id),
+                ts_version: None,
+                modio_file_id: None,
+            })
+        }
+        ModSource::Thunderstore => {
+            let ns = staged.ts_namespace.as_deref()?;
+            let name = staged.ts_name.as_deref()?;
+            if staged.domain.is_empty() {
+                return None;
+            }
+            let client = ThunderstoreClient::new().ok()?;
+            let detail = client
+                .get_package(&staged.domain, ns, name)
+                .await
+                .ok()?;
+            let latest = detail
+                .latest_version
+                .or_else(|| detail.versions.first().map(|v| v.version_number.clone()))?;
+            if !mods::incoming_is_newer(staged.version.as_deref(), &latest) {
+                return None;
+            }
+            Some(StagedModUpdate {
+                staged_id: staged.id.clone(),
+                available_version: Some(latest.clone()),
+                source: ModSource::Thunderstore,
+                nexus_file_id: None,
+                ts_version: Some(latest),
+                modio_file_id: None,
+            })
+        }
+        ModSource::Modio => {
+            let game_id = staged.modio_game_id?;
+            let mod_id = staged.modio_mod_id?;
+            let key = state.modio_api_key.lock().ok()?.clone()?;
+            let client = ModioClient::new(&key).ok()?;
+            let detail = client.get_mod(game_id, mod_id).await.ok()?;
+            let primary = detail.primary_file_id?;
+            if staged.modio_file_id == Some(primary) {
+                return None;
+            }
+            let files = client.list_files(game_id, mod_id, Some(primary)).await.ok();
+            let available_version = files
+                .as_ref()
+                .and_then(|fs| fs.iter().find(|f| f.file_id == primary))
+                .and_then(|f| f.version.clone());
+            Some(StagedModUpdate {
+                staged_id: staged.id.clone(),
+                available_version,
+                source: ModSource::Modio,
+                nexus_file_id: None,
+                ts_version: None,
+                modio_file_id: Some(primary),
+            })
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn check_staged_mod_updates(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<StagedModUpdate>, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mods_list = order.mods;
+    let mut out = Vec::new();
+    const CONCURRENCY: usize = 3;
+    for chunk in mods_list.chunks(CONCURRENCY) {
+        let futs: Vec<_> = chunk
+            .iter()
+            .map(|m| detect_update_for_staged(&state, m))
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+        for upd in results.into_iter().flatten() {
+            out.push(upd);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn update_staged_mod(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    game_id: String,
+    staged_id: String,
+) -> Result<StagedMod, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == staged_id)
+        .cloned()
+        .ok_or_else(|| format!("Staged mod not found: {staged_id}"))?;
+    let update = detect_update_for_staged(&state, &staged)
+        .await
+        .ok_or_else(|| "No update available for this mod".to_string())?;
+
+    match staged.source {
+        ModSource::Nexus => {
+            let file_id = update
+                .nexus_file_id
+                .ok_or_else(|| "Missing Nexus update file id".to_string())?;
+            if !state.ensure_premium_status().await {
+                return Err(
+                    "NEEDS_NXM: Free account — open Download Assist to use Mod Manager Download \
+                     (or enable autoclick), or import a local archive."
+                        .into(),
+                );
+            }
+            download_and_stage_inner(
+                Some(&app),
+                &*state,
+                &game_id,
+                &staged.domain,
+                staged.nexus_mod_id,
+                file_id,
+                &staged.name,
+                update.available_version.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(staged.id.clone()),
+            )
+            .await
+        }
+        ModSource::Thunderstore => {
+            let ns = staged
+                .ts_namespace
+                .clone()
+                .ok_or_else(|| "Missing Thunderstore namespace".to_string())?;
+            let name = staged
+                .ts_name
+                .clone()
+                .ok_or_else(|| "Missing Thunderstore package name".to_string())?;
+            let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+            let pkg = client
+                .get_package(&staged.domain, &ns, &name)
+                .await
+                .map_err(|e| e.to_string())?;
+            stage_thunderstore_package_newest(
+                &app,
+                &*state,
+                &client,
+                &game_id,
+                &staged.domain,
+                &pkg,
+                &staged.name,
+                Some(staged.enabled),
+            )
+            .await
+        }
+        ModSource::Modio => {
+            let modio_game_id = staged
+                .modio_game_id
+                .ok_or_else(|| "Missing mod.io game id".to_string())?;
+            let mod_id = staged
+                .modio_mod_id
+                .ok_or_else(|| "Missing mod.io mod id".to_string())?;
+            let file_id = update.modio_file_id;
+            let staged_all = download_modio_mod(
+                app,
+                state,
+                game_id,
+                modio_game_id,
+                mod_id,
+                file_id,
+                staged.name.clone(),
+                update.available_version.clone(),
+                Some(false),
+            )
+            .await?;
+            staged_all
+                .into_iter()
+                .find(|m| m.modio_mod_id == Some(mod_id))
+                .ok_or_else(|| "mod.io update staged nothing".to_string())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3694,6 +3960,7 @@ pub async fn import_share_code(
                         file_id,
                         &label,
                         entry.version.clone(),
+                        None,
                         None,
                         None,
                         None,
@@ -4206,6 +4473,7 @@ pub fn resume_download(
                 version,
                 nxm_key,
                 nxm_expires,
+                replace_staged_id,
             } => DownloadResumeSource::Api {
                 game_id: game_id.clone(),
                 domain: domain.clone(),
@@ -4215,6 +4483,7 @@ pub fn resume_download(
                 version: version.clone(),
                 nxm_key: nxm_key.clone(),
                 nxm_expires: *nxm_expires,
+                replace_staged_id: replace_staged_id.clone(),
             },
             DownloadResumeSource::Cdn {
                 url,
@@ -4224,6 +4493,7 @@ pub fn resume_download(
                 mod_id,
                 file_id,
                 label,
+                replace_staged_id,
             } => DownloadResumeSource::Cdn {
                 url: url.clone(),
                 cookie_header: cookie_header.clone(),
@@ -4232,6 +4502,7 @@ pub fn resume_download(
                 mod_id: *mod_id,
                 file_id: *file_id,
                 label: label.clone(),
+                replace_staged_id: replace_staged_id.clone(),
             },
         };
         let dest = job
@@ -4272,6 +4543,7 @@ pub fn resume_download(
                 version,
                 nxm_key,
                 nxm_expires,
+                replace_staged_id,
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
@@ -4288,6 +4560,7 @@ pub fn resume_download(
                     nxm_expires,
                     Some(queued_id.clone()),
                     batch_id,
+                    replace_staged_id,
                 )
                 .await;
                 (res, label_clone, game_id_clone)
@@ -4300,6 +4573,7 @@ pub fn resume_download(
                 mod_id,
                 file_id,
                 label,
+                replace_staged_id,
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
@@ -4315,6 +4589,7 @@ pub fn resume_download(
                     file_id,
                     &queued_id,
                     batch_id,
+                    replace_staged_id,
                 )
                 .await;
                 (res, label_clone, game_id_clone)

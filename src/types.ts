@@ -394,6 +394,15 @@ export type StagedMod = {
   depends_on?: string[];
 };
 
+export type StagedModUpdate = {
+  staged_id: string;
+  available_version: string | null;
+  source: "nexus" | "thunderstore" | "modio";
+  nexus_file_id?: number | null;
+  ts_version?: string | null;
+  modio_file_id?: number | null;
+};
+
 export type ModioModDetail = {
   game_id: number;
   mod_id: number;
