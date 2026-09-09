@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.3.0"
+version = "0.4.0"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -44,6 +44,8 @@ regex = "1"
 log = "0.4"
 env_logger = "0.11"
 modio = "0.14.2"
+tar = "0.4"
+xz2 = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lib_game_detector = { version = "0.0.35", features = ["bundled_sqlite"] }

@@ -32,6 +32,7 @@ use crate::{
     thunderstore::{self, ThunderstoreClient, TsPackageDetail, TsDependency},
 };
 
+#[derive(Clone)]
 pub enum DownloadResumeSource {
     Api {
         game_id: String,
@@ -54,6 +55,24 @@ pub enum DownloadResumeSource {
         label: String,
         replace_staged_id: Option<String>,
     },
+    Thunderstore {
+        game_id: String,
+        community: String,
+        namespace: String,
+        name: String,
+        version: Option<String>,
+        display_name: String,
+        enabled: Option<bool>,
+    },
+    Modio {
+        game_id: String,
+        modio_game_id: u32,
+        mod_id: u64,
+        file_id: u64,
+        name: String,
+        version: Option<String>,
+        name_id: String,
+    },
 }
 
 pub struct DownloadJob {
@@ -72,6 +91,8 @@ pub struct AppState {
     pub user: Mutex<Option<NexusUser>>,
     pub downloads: Mutex<Vec<DownloadItem>>,
     pub download_jobs: Mutex<HashMap<String, DownloadJob>>,
+    /// Restart metadata kept after failure so Retry can re-run without re-browsing.
+    pub download_restart_meta: Mutex<HashMap<String, DownloadResumeSource>>,
     pub assist: Mutex<Option<AssistContext>>,
     /// Monotonic Assist window id (captured in Destroyed handlers).
     pub assist_window_gen: AtomicU64,
@@ -107,6 +128,7 @@ pub struct DownloadItem {
     pub bytes_total: Option<u64>,
     pub speed_bps: u64,
     pub batch_id: Option<String>,
+    pub can_restart: bool,
 }
 
 impl DownloadItem {
@@ -120,6 +142,7 @@ impl DownloadItem {
             bytes_total: None,
             speed_bps: 0,
             batch_id,
+            can_restart: false,
         }
     }
 }
@@ -149,6 +172,7 @@ impl AppState {
             user: Mutex::new(None),
             downloads: Mutex::new(Vec::new()),
             download_jobs: Mutex::new(HashMap::new()),
+            download_restart_meta: Mutex::new(HashMap::new()),
             assist: Mutex::new(None),
             assist_window_gen: AtomicU64::new(0),
             assist_closed_gen: AtomicU64::new(0),
@@ -238,6 +262,10 @@ fn load_modio_key_with_fallback(paths: &Paths) -> anyhow::Result<Option<String>>
     modio_api::load_api_key_file(&file)
 }
 
+fn is_active_download_status(status: &str) -> bool {
+    status == "downloading" || status == "extracting" || status == "paused"
+}
+
 fn push_download(state: &AppState, item: DownloadItem) {
     if let Ok(mut q) = state.downloads.lock() {
         q.insert(0, item);
@@ -293,12 +321,61 @@ fn ensure_download_job(
 }
 
 fn set_download_resume(state: &AppState, id: &str, dest: PathBuf, source: DownloadResumeSource) {
+    store_restart_meta(state, id, source.clone());
     if let Ok(mut jobs) = state.download_jobs.lock() {
         if let Some(job) = jobs.get_mut(id) {
             job.dest = Some(dest);
             job.source = Some(source);
         }
     }
+}
+
+fn store_restart_meta(state: &AppState, id: &str, source: DownloadResumeSource) {
+    if let Ok(mut m) = state.download_restart_meta.lock() {
+        m.insert(id.to_string(), source);
+    }
+    set_download_can_restart(state, id, true);
+}
+
+fn clear_restart_meta(state: &AppState, id: &str) {
+    if let Ok(mut m) = state.download_restart_meta.lock() {
+        m.remove(id);
+    }
+    set_download_can_restart(state, id, false);
+}
+
+fn set_download_can_restart(state: &AppState, id: &str, can: bool) {
+    if let Ok(mut q) = state.downloads.lock() {
+        if let Some(item) = q.iter_mut().find(|d| d.id == id) {
+            item.can_restart = can;
+        }
+    }
+}
+
+fn reset_download_row(state: &AppState, id: &str) {
+    if let Ok(mut q) = state.downloads.lock() {
+        if let Some(item) = q.iter_mut().find(|d| d.id == id) {
+            item.status = "downloading".into();
+            item.error = None;
+            item.bytes_downloaded = 0;
+            item.bytes_total = None;
+            item.speed_bps = 0;
+        }
+    }
+}
+
+fn finish_download_success(state: &AppState, id: &str) {
+    clear_restart_meta(state, id);
+    clear_download_job(state, id);
+}
+
+fn download_label(state: &AppState, id: &str) -> String {
+    state
+        .downloads
+        .lock()
+        .ok()
+        .and_then(|q| q.iter().find(|d| d.id == id).map(|d| d.label.clone()))
+        .unwrap_or_else(|| "Download".to_string())
 }
 
 fn clear_download_job(state: &AppState, id: &str) {
@@ -384,7 +461,7 @@ fn is_pause_err(msg: &str) -> bool {
     msg.contains(PAUSED_MSG) || msg == "Paused"
 }
 
-fn request_cancel_ids(state: &AppState, ids: &[String]) {
+fn request_cancel_ids(state: &AppState, ids: &[String], app: Option<&tauri::AppHandle>) {
     let paused_ids: Vec<String> = {
         let downloads = state.downloads.lock().ok();
         ids.iter()
@@ -412,10 +489,30 @@ fn request_cancel_ids(state: &AppState, ids: &[String]) {
             if paused_ids.iter().any(|p| p == id) {
                 jobs.remove(id);
             }
+            if let Some(handle) = app {
+                let label = download_label(state, id);
+                let _ = handle.emit(
+                    "download-cancelled",
+                    serde_json::json!({
+                        "id": id,
+                        "label": label,
+                    }),
+                );
+            }
         }
     } else {
         for id in ids {
             mark_cancelled(state, id);
+            if let Some(handle) = app {
+                let label = download_label(state, id);
+                let _ = handle.emit(
+                    "download-cancelled",
+                    serde_json::json!({
+                        "id": id,
+                        "label": label,
+                    }),
+                );
+            }
         }
     }
 }
@@ -541,18 +638,32 @@ pub fn manage_game(
     });
     let managed = ManagedGame {
         id: id.clone(),
-        title,
+        title: title.clone(),
         nexus_domain: domain,
-        install_path,
-        launcher,
+        install_path: install_path.clone(),
+        launcher: launcher.clone(),
         plugin_id,
         cover_path,
         project_name,
         thunderstore_community: ts_community,
         modio_game_id: modio_id,
+        tool_overrides: None,
     };
+    let install_exists = Path::new(&install_path).is_dir();
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
-    cfg.managed_games.retain(|g| g.id != id);
+    if install_exists {
+        cfg.managed_games.retain(|g| {
+            g.id == id
+                || !detection::reconcile::games_match(
+                    &g.title,
+                    &g.launcher,
+                    &managed.title,
+                    &managed.launcher,
+                )
+        });
+    } else {
+        cfg.managed_games.retain(|g| g.id != id);
+    }
     cfg.managed_games.push(managed.clone());
     cfg.last_active_game_id = Some(id);
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
@@ -910,6 +1021,28 @@ pub async fn suggest_catalog_ids_batch(
 }
 
 #[tauri::command]
+pub fn get_game_health(state: State<'_, AppState>) -> Result<Vec<detection::reconcile::GameHealth>, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let detected = detection::scan_games();
+    Ok(detection::reconcile::compute_game_health(
+        &cfg.managed_games,
+        &detected,
+    ))
+}
+
+#[tauri::command]
+pub fn relink_managed_game(
+    state: State<'_, AppState>,
+    old_id: String,
+    new_id: String,
+) -> Result<ManagedGame, String> {
+    let detected = detection::scan_games();
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    detection::reconcile::relink_managed_game(&state.paths, &mut cfg, &old_id, &new_id, &detected)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn unmanage_game(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.managed_games.retain(|g| g.id != id);
@@ -917,6 +1050,7 @@ pub fn unmanage_game(state: State<'_, AppState>, id: String) -> Result<(), Strin
         cfg.last_active_game_id = cfg.managed_games.first().map(|g| g.id.clone());
     }
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    migration::remove_game_from_legacy_config(&id).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -942,6 +1076,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
         "cache_dir": state.paths.cache_dir,
+        "platform_linux": cfg!(target_os = "linux"),
     }))
 }
 
@@ -1675,6 +1810,7 @@ async fn stage_thunderstore_package_newest(
     pkg: &TsPackageDetail,
     display_name: &str,
     enabled: Option<bool>,
+    reuse_dl_id: Option<String>,
 ) -> Result<StagedMod, String> {
     let ns = pkg.namespace.clone();
     let pkg_name = pkg.name.clone();
@@ -1706,24 +1842,36 @@ async fn stage_thunderstore_package_newest(
     }
 
     let label = format!("{}-{}", pkg.full_name, incoming_ver);
-    let dl_id = uuid::Uuid::new_v4().to_string();
+    let is_new = reuse_dl_id.is_none();
+    let dl_id = reuse_dl_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let dest = state.paths.downloads_dir().join(format!(
         "ts_{}_{}.zip",
         dl_id,
         sanitize_filename::sanitize(&pkg_name)
     ));
 
-    {
+    if is_new {
         let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
         downloads.insert(
             0,
             DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
         );
+    } else {
+        reset_download_row(state, &dl_id);
     }
     let _ = app.emit("downloads-changed", ());
 
     let cancel = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(AtomicBool::new(false));
+    let ts_source = DownloadResumeSource::Thunderstore {
+        game_id: game_id.to_string(),
+        community: community.to_string(),
+        namespace: ns.clone(),
+        name: pkg_name.clone(),
+        version: Some(incoming_ver.clone()),
+        display_name: display_name.to_string(),
+        enabled,
+    };
     {
         let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
         jobs.insert(
@@ -1733,10 +1881,11 @@ async fn stage_thunderstore_package_newest(
                 pause: pause.clone(),
                 batch_id: None,
                 dest: Some(dest.clone()),
-                source: None,
+                source: Some(ts_source.clone()),
             },
         );
     }
+    store_restart_meta(state, &dl_id, ts_source);
 
     let control = TransferControl {
         cancel: cancel.clone(),
@@ -1772,7 +1921,7 @@ async fn stage_thunderstore_package_newest(
                     d.status = "done".into();
                 }
             }
-            clear_download_job(state, &dl_id);
+            finish_download_success(state, &dl_id);
             let _ = app.emit("downloads-changed", ());
             Ok(staged)
         }
@@ -1804,6 +1953,54 @@ pub async fn get_thunderstore_package(
         .map_err(|e| e.to_string())
 }
 
+/// Resolve and stage a Thunderstore package plus its full dependency closure.
+/// Returns staged mods (deps first) and the resolved package details for `depends_on` wiring.
+async fn stage_thunderstore_with_deps(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    client: &ThunderstoreClient,
+    game_id: &str,
+    community: &str,
+    namespace: &str,
+    name: &str,
+    version: Option<&str>,
+    root_enabled: Option<bool>,
+    root_display: Option<&str>,
+) -> Result<(Vec<StagedMod>, Vec<TsPackageDetail>), String> {
+    let order = client
+        .resolve_install_order(community, namespace, name, version)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut staged_all = Vec::new();
+    for pkg in &order {
+        let is_root = pkg.name == name && pkg.namespace == namespace;
+        let display = if is_root {
+            root_display
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| pkg.name.clone())
+        } else {
+            format!("{} (dependency)", pkg.name)
+        };
+        let enabled = if is_root { root_enabled } else { None };
+        let staged = stage_thunderstore_package_newest(
+            app,
+            state,
+            client,
+            game_id,
+            community,
+            pkg,
+            &display,
+            enabled,
+            None,
+        )
+        .await?;
+        staged_all.push(staged);
+    }
+    apply_ts_depends_on(&state.paths, game_id, &order)?;
+    Ok((staged_all, order))
+}
+
 #[tauri::command]
 pub async fn download_thunderstore_mod(
     app: tauri::AppHandle,
@@ -1816,33 +2013,20 @@ pub async fn download_thunderstore_mod(
     record_as_modpack: Option<bool>,
 ) -> Result<Vec<StagedMod>, String> {
     let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
-    let order = client
-        .resolve_install_order(&community, &namespace, &name, version.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
-    let mut staged_all = Vec::new();
-    for pkg in &order {
-        let display = if pkg.name == name && pkg.namespace == namespace {
-            pkg.name.clone()
-        } else {
-            format!("{} (dependency)", pkg.name)
-        };
-        let staged = stage_thunderstore_package_newest(
-            &app,
-            &state,
-            &client,
-            &game_id,
-            &community,
-            pkg,
-            &display,
-            None,
-        )
-        .await?;
-        staged_all.push(staged);
-    }
-    apply_ts_depends_on(&state.paths, &game_id, &order)?;
+    let (staged_all, order) = stage_thunderstore_with_deps(
+        &app,
+        &state,
+        &client,
+        &game_id,
+        &community,
+        &namespace,
+        &name,
+        version.as_deref(),
+        None,
+        None,
+    )
+    .await?;
 
     if record_as_modpack.unwrap_or(false) {
         let member_ids: Vec<String> = order
@@ -1931,6 +2115,7 @@ pub async fn import_thunderstore_profile(
 
     let before = snapshot_mod_ids(&state.paths, &game_id)?;
     let mut member_ids = Vec::new();
+    let mut seen_pkg_ids: HashSet<String> = HashSet::new();
     let mut details_for_deps = Vec::new();
 
     for m in &manifest.mods {
@@ -1939,37 +2124,45 @@ pub async fn import_thunderstore_profile(
             continue;
         };
         let key = format!("{ns}-{pkg_name}").to_lowercase();
-        let Some(pkg) = by_key.get(&key) else {
+        if !by_key.contains_key(&key) {
             log::warn!("Profile package {ns}-{pkg_name} not found in {community}");
             continue;
-        };
-        let mut detail = thunderstore::detail_from_package(&community, pkg.clone());
-        let ver = m.version.as_string();
-        if let Some(pos) = detail
-            .versions
-            .iter()
-            .position(|v| v.version_number == ver)
-        {
-            let selected = detail.versions.remove(pos);
-            detail.versions.insert(0, selected);
-            detail.latest_version = Some(ver);
-        } else {
-            detail.latest_version = detail.versions.first().map(|v| v.version_number.clone());
         }
+        let ver = m.version.as_string();
         let enabled = if m.enabled { None } else { Some(false) };
-        let staged = stage_thunderstore_package_newest(
+        match stage_thunderstore_with_deps(
             &app,
             &state,
             &client,
             &game_id,
             &community,
-            &detail,
+            &ns,
             &pkg_name,
+            Some(&ver),
             enabled,
+            Some(&pkg_name),
         )
-        .await?;
-        member_ids.push(staged.id.clone());
-        details_for_deps.push(detail);
+        .await
+        {
+            Ok((staged, order)) => {
+                for s in staged {
+                    if seen_pkg_ids.insert(s.id.clone()) {
+                        member_ids.push(s.id);
+                    }
+                }
+                for detail in order {
+                    let id = mods::thunderstore_mod_id(&detail.namespace, &detail.name);
+                    if details_for_deps.iter().all(|d: &TsPackageDetail| {
+                        mods::thunderstore_mod_id(&d.namespace, &d.name) != id
+                    }) {
+                        details_for_deps.push(detail);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to stage profile package {ns}-{pkg_name}: {e}");
+            }
+        }
     }
 
     apply_ts_depends_on(&state.paths, &game_id, &details_for_deps)?;
@@ -2143,6 +2336,31 @@ pub async fn download_modio_mod(
                 DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
             );
         }
+        let modio_source = DownloadResumeSource::Modio {
+            game_id: game_id.clone(),
+            modio_game_id,
+            mod_id: mid,
+            file_id: resolved_file,
+            name: label.clone(),
+            version: ver.clone(),
+            name_id: detail.name_id.clone(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        {
+            let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
+            jobs.insert(
+                dl_id.clone(),
+                DownloadJob {
+                    cancel: cancel.clone(),
+                    pause: pause.clone(),
+                    batch_id: None,
+                    dest: Some(dest.clone()),
+                    source: Some(modio_source.clone()),
+                },
+            );
+        }
+        store_restart_meta(&state, &dl_id, modio_source);
         let _ = app.emit("downloads-changed", ());
         match client
             .download_file(modio_game_id, mid, Some(resolved_file), &dest)
@@ -2166,7 +2384,7 @@ pub async fn download_modio_mod(
                         d.status = "done".into();
                     }
                 }
-                clear_download_job(&state, &dl_id);
+                finish_download_success(&state, &dl_id);
                 let _ = app.emit("downloads-changed", ());
             }
             Err(e) => {
@@ -2650,7 +2868,7 @@ async fn download_and_stage_inner(
             }
             update_download(state, &dl_id, "staged", None);
             let _ = std::fs::remove_file(&dest);
-            clear_download_job(state, &dl_id);
+            finish_download_success(state, &dl_id);
             Ok(staged)
         }
         Err(e) => {
@@ -3365,7 +3583,7 @@ async fn fetch_and_stage_cdn(
             }
             update_download(state, dl_id, "staged", None);
             let _ = std::fs::remove_file(&dest);
-            clear_download_job(state, dl_id);
+            finish_download_success(state, dl_id);
             Ok(staged)
         }
         Err(e) => {
@@ -3663,6 +3881,7 @@ pub async fn update_staged_mod(
                 &pkg,
                 &staged.name,
                 Some(staged.enabled),
+                None,
             )
             .await
         }
@@ -4001,41 +4220,29 @@ pub async fn import_share_code(
                     .name
                     .as_deref()
                     .ok_or_else(|| "Thunderstore entry missing package name".to_string())?;
-                let order =
-                    mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-                if let Some(existing) = mods::find_thunderstore_package(&order, ns, pkg_name) {
-                    member_ids.push(existing.id.clone());
-                    continue;
-                }
-                let mut detail = ts_client
-                    .get_package(community, ns, pkg_name)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if let Some(ver) = entry.version.as_deref().filter(|s| !s.is_empty()) {
-                    if let Some(pos) = detail
-                        .versions
-                        .iter()
-                        .position(|v| v.version_number == ver)
-                    {
-                        let selected = detail.versions.remove(pos);
-                        detail.versions.insert(0, selected);
-                        detail.latest_version = Some(ver.to_string());
-                    }
-                }
                 let label = share::mod_label(entry);
-                match stage_thunderstore_package_newest(
+                let version = entry.version.as_deref().filter(|s| !s.is_empty());
+                match stage_thunderstore_with_deps(
                     &app,
                     &state,
                     &ts_client,
                     &game_id,
                     community,
-                    &detail,
-                    &label,
+                    ns,
+                    pkg_name,
+                    version,
                     None,
+                    Some(&label),
                 )
                 .await
                 {
-                    Ok(staged) => member_ids.push(staged.id),
+                    Ok((staged, _)) => {
+                        for s in staged {
+                            if !member_ids.contains(&s.id) {
+                                member_ids.push(s.id);
+                            }
+                        }
+                    }
                     Err(e) => warnings.push(format!("{label}: {e}")),
                 }
             }
@@ -4327,7 +4534,19 @@ pub fn remove_mod(
 
 #[tauri::command]
 pub fn remove_all_mods(state: State<'_, AppState>, game_id: String) -> Result<(), String> {
-    mods::remove_all_mods(&state.paths, &game_id).map_err(|e| e.to_string())
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let install_path = cfg
+        .managed_games
+        .iter()
+        .find(|g| g.id == game_id)
+        .map(|g| g.install_path.clone());
+    drop(cfg);
+    mods::remove_all_mods(
+        &state.paths,
+        &game_id,
+        install_path.as_deref().map(Path::new),
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4355,7 +4574,19 @@ pub fn deploy_mods(
 
 #[tauri::command]
 pub fn purge_mods(state: State<'_, AppState>, game_id: String) -> Result<(), String> {
-    mods::purge_deploy(&state.paths, &game_id).map_err(|e| e.to_string())
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let install_path = cfg
+        .managed_games
+        .iter()
+        .find(|g| g.id == game_id)
+        .map(|g| g.install_path.clone());
+    drop(cfg);
+    mods::purge_deploy(
+        &state.paths,
+        &game_id,
+        install_path.as_deref().map(Path::new),
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4364,7 +4595,44 @@ pub fn list_downloads(state: State<'_, AppState>) -> Result<Vec<DownloadItem>, S
 }
 
 #[tauri::command]
-pub fn cancel_download(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub fn clear_recent_downloads(state: State<'_, AppState>) -> Result<(), String> {
+    let removed_ids: Vec<String> = {
+        let downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+        downloads
+            .iter()
+            .filter(|d| !is_active_download_status(&d.status))
+            .map(|d| d.id.clone())
+            .collect()
+    };
+    for id in removed_ids {
+        clear_restart_meta(&state, &id);
+        clear_download_job(&state, &id);
+    }
+    let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+    downloads.retain(|d| is_active_download_status(&d.status));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_download(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
+    if let Some(item) = downloads.iter().find(|d| d.id == id) {
+        if is_active_download_status(&item.status) {
+            return Err("Cannot remove an active download".into());
+        }
+    }
+    downloads.retain(|d| d.id != id);
+    clear_restart_meta(&state, &id);
+    clear_download_job(&state, &id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let active = state
         .downloads
         .lock()
@@ -4385,12 +4653,16 @@ pub fn cancel_download(state: State<'_, AppState>, id: String) -> Result<(), Str
     {
         return Ok(());
     }
-    request_cancel_ids(&state, &[id]);
+    request_cancel_ids(&state, &[id], Some(&app));
     Ok(())
 }
 
 #[tauri::command]
-pub fn cancel_download_batch(state: State<'_, AppState>, batch_id: String) -> Result<(), String> {
+pub fn cancel_download_batch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    batch_id: String,
+) -> Result<(), String> {
     let ids: Vec<String> = {
         let downloads = state.downloads.lock().map_err(|e| e.to_string())?;
         let jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
@@ -4411,7 +4683,7 @@ pub fn cancel_download_batch(state: State<'_, AppState>, batch_id: String) -> Re
         }
         ids
     };
-    request_cancel_ids(&state, &ids);
+    request_cancel_ids(&state, &ids, Some(&app));
     Ok(())
 }
 
@@ -4504,6 +4776,9 @@ pub fn resume_download(
                 label: label.clone(),
                 replace_staged_id: replace_staged_id.clone(),
             },
+            DownloadResumeSource::Thunderstore { .. } | DownloadResumeSource::Modio { .. } => {
+                return Err("Cannot resume this download — use Restart instead.".into());
+            }
         };
         let dest = job
             .dest
@@ -4594,6 +4869,11 @@ pub fn resume_download(
                 .await;
                 (res, label_clone, game_id_clone)
             }
+            DownloadResumeSource::Thunderstore { .. } | DownloadResumeSource::Modio { .. } => (
+                Err("Cannot resume this download — use Restart instead.".into()),
+                String::new(),
+                String::new(),
+            ),
         };
 
         match result {
@@ -4636,6 +4916,369 @@ pub fn resume_download(
         }
     });
 
+    Ok(())
+}
+
+fn take_restart_source(state: &AppState, id: &str) -> Option<DownloadResumeSource> {
+    state
+        .download_restart_meta
+        .lock()
+        .ok()
+        .and_then(|m| m.get(id).cloned())
+        .or_else(|| {
+            state
+                .download_jobs
+                .lock()
+                .ok()
+                .and_then(|j| j.get(id).and_then(|job| job.source.clone()))
+        })
+}
+
+async fn emit_download_outcome(
+    app: &tauri::AppHandle,
+    queued_id: &str,
+    label: &str,
+    game_id: &str,
+    result: Result<StagedMod, String>,
+) {
+    match result {
+        Ok(staged) => {
+            log::info!("download finished: {label}");
+            let _ = app.emit(
+                "download-finished",
+                serde_json::json!({
+                    "id": queued_id,
+                    "label": label,
+                    "game_id": game_id,
+                    "mod_id": staged.id,
+                }),
+            );
+        }
+        Err(e) => {
+            if is_pause_err(&e) {
+                log::info!("download paused: {label}");
+            } else if is_cancel_err(&e) {
+                log::info!("download cancelled: {label}");
+                let _ = app.emit(
+                    "download-cancelled",
+                    serde_json::json!({
+                        "id": queued_id,
+                        "label": label,
+                    }),
+                );
+            } else {
+                log::error!("download failed ({label}): {e}");
+                let _ = app.emit(
+                    "download-failed",
+                    serde_json::json!({
+                        "id": queued_id,
+                        "label": label,
+                        "error": e,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+async fn run_modio_download_restart(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    dl_id: &str,
+    game_id: &str,
+    modio_game_id: u32,
+    mod_id: u64,
+    file_id: u64,
+    label: &str,
+    version: Option<String>,
+    name_id: &str,
+) -> Result<StagedMod, String> {
+    let dest = state.paths.downloads_dir().join(format!(
+        "modio_{}_{}_{}.zip",
+        dl_id,
+        sanitize_filename::sanitize(name_id),
+        file_id
+    ));
+    let _ = std::fs::remove_file(&dest);
+    reset_download_row(state, dl_id);
+
+    let modio_source = DownloadResumeSource::Modio {
+        game_id: game_id.to_string(),
+        modio_game_id,
+        mod_id,
+        file_id,
+        name: label.to_string(),
+        version: version.clone(),
+        name_id: name_id.to_string(),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    {
+        let mut jobs = state.download_jobs.lock().map_err(|e| e.to_string())?;
+        jobs.insert(
+            dl_id.to_string(),
+            DownloadJob {
+                cancel: cancel.clone(),
+                pause: pause.clone(),
+                batch_id: None,
+                dest: Some(dest.clone()),
+                source: Some(modio_source.clone()),
+            },
+        );
+    }
+    store_restart_meta(state, dl_id, modio_source);
+
+    let key = state
+        .modio_api_key
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "mod.io API key required".to_string())?;
+    let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
+
+    match client
+        .download_file(modio_game_id, mod_id, Some(file_id), &dest)
+        .await
+    {
+        Ok(()) => {
+            let staged = mods::stage_modio_mod(
+                &state.paths,
+                game_id,
+                modio_game_id,
+                mod_id,
+                file_id,
+                label,
+                version,
+                &dest,
+            )
+            .map_err(|e| e.to_string())?;
+            if let Ok(mut downloads) = state.downloads.lock() {
+                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                    d.status = "done".into();
+                }
+            }
+            finish_download_success(state, dl_id);
+            let _ = app.emit("downloads-changed", ());
+            Ok(staged)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if let Ok(mut downloads) = state.downloads.lock() {
+                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
+                    d.status = "failed".into();
+                    d.error = Some(msg.clone());
+                }
+            }
+            clear_download_job(state, dl_id);
+            let _ = app.emit("downloads-changed", ());
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn restart_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let source = take_restart_source(&state, &id)
+        .ok_or_else(|| "No restart metadata for this download".to_string())?;
+
+    if let Ok(mut jobs) = state.download_jobs.lock() {
+        if let Some(job) = jobs.get_mut(&id) {
+            job.cancel.store(true, Ordering::SeqCst);
+            if let Some(dest) = &job.dest {
+                let _ = std::fs::remove_file(dest);
+            }
+        }
+    }
+
+    reset_download_row(&state, &id);
+    store_restart_meta(&state, &id, source.clone());
+
+    if let Ok(mut jobs) = state.download_jobs.lock() {
+        if let Some(job) = jobs.get_mut(&id) {
+            job.cancel.store(false, Ordering::SeqCst);
+            job.pause.store(false, Ordering::SeqCst);
+        }
+    }
+
+    let app_bg = app.clone();
+    let queued_id = id.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let state = app_bg.state::<AppState>();
+        let result = match source {
+            DownloadResumeSource::Api {
+                game_id,
+                domain,
+                mod_id,
+                file_id,
+                label,
+                version,
+                replace_staged_id,
+                ..
+            } => {
+                let label_clone = label.clone();
+                let game_id_clone = game_id.clone();
+                let batch_id = state
+                    .download_jobs
+                    .lock()
+                    .ok()
+                    .and_then(|j| j.get(&queued_id).and_then(|job| job.batch_id.clone()));
+                let res = download_and_stage_inner(
+                    Some(&app_bg),
+                    &*state,
+                    &game_id,
+                    &domain,
+                    mod_id,
+                    file_id,
+                    &label,
+                    version,
+                    None,
+                    None,
+                    Some(queued_id.clone()),
+                    batch_id,
+                    replace_staged_id,
+                )
+                .await;
+                (res, label_clone, game_id_clone)
+            }
+            DownloadResumeSource::Cdn {
+                url,
+                cookie_header,
+                game_id,
+                domain,
+                mod_id,
+                file_id,
+                label,
+                replace_staged_id,
+            } => {
+                let label_clone = label.clone();
+                let game_id_clone = game_id.clone();
+                let batch_id = state
+                    .download_jobs
+                    .lock()
+                    .ok()
+                    .and_then(|j| j.get(&queued_id).and_then(|job| job.batch_id.clone()));
+                let res = fetch_and_stage_cdn(
+                    &app_bg,
+                    &*state,
+                    &url,
+                    &cookie_header,
+                    &game_id,
+                    &label,
+                    &domain,
+                    mod_id,
+                    file_id,
+                    &queued_id,
+                    batch_id,
+                    replace_staged_id,
+                )
+                .await;
+                (res, label_clone, game_id_clone)
+            }
+            DownloadResumeSource::Thunderstore {
+                game_id,
+                community,
+                namespace,
+                name,
+                display_name,
+                enabled,
+                ..
+            } => {
+                let label_clone = display_name.clone();
+                let game_id_clone = game_id.clone();
+                let res = async {
+                    let client = ThunderstoreClient::new().map_err(|e| e.to_string())?;
+                    let pkg = client
+                        .get_package(&community, &namespace, &name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    stage_thunderstore_package_newest(
+                        &app_bg,
+                        &*state,
+                        &client,
+                        &game_id,
+                        &community,
+                        &pkg,
+                        &display_name,
+                        enabled,
+                        Some(queued_id.clone()),
+                    )
+                    .await
+                }
+                .await;
+                (res, label_clone, game_id_clone)
+            }
+            DownloadResumeSource::Modio {
+                game_id,
+                modio_game_id,
+                mod_id,
+                file_id,
+                name,
+                version,
+                name_id,
+            } => {
+                let label_clone = name.clone();
+                let game_id_clone = game_id.clone();
+                let res = run_modio_download_restart(
+                    &app_bg,
+                    &*state,
+                    &queued_id,
+                    &game_id,
+                    modio_game_id,
+                    mod_id,
+                    file_id,
+                    &name,
+                    version,
+                    &name_id,
+                )
+                .await;
+                (res, label_clone, game_id_clone)
+            }
+        };
+
+        emit_download_outcome(
+            &app_bg,
+            &queued_id,
+            &result.1,
+            &result.2,
+            result.0,
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn force_reset_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let label = download_label(&state, &id);
+    if let Ok(mut jobs) = state.download_jobs.lock() {
+        if let Some(job) = jobs.get_mut(&id) {
+            job.cancel.store(true, Ordering::SeqCst);
+            if let Some(dest) = &job.dest {
+                let _ = std::fs::remove_file(dest);
+            }
+        }
+        jobs.remove(&id);
+    }
+    update_download(&state, &id, "failed", Some("Reset by user".into()));
+    clear_restart_meta(&state, &id);
+    let _ = app.emit(
+        "download-failed",
+        serde_json::json!({
+            "id": id,
+            "label": label,
+            "error": "Reset by user",
+        }),
+    );
     Ok(())
 }
 

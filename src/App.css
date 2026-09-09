@@ -562,6 +562,23 @@ button.tag-picker-trigger[aria-expanded="true"] {
   flex-shrink: 0;
 }
 
+.game-saved-collections h2 {
+  margin: 0 0 0.45rem;
+  font-size: 1rem;
+}
+
+.game-saved-collections .panel-head-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.game-saved-collections .panel-head-inline h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
 .profile-import {
   display: flex;
   flex-wrap: wrap;
@@ -1073,6 +1090,16 @@ button.danger {
   word-break: break-all;
 }
 
+.path-link {
+  text-align: left;
+  word-break: break-all;
+  cursor: pointer;
+}
+
+.path-link:hover {
+  color: var(--accent);
+}
+
 .note {
   color: var(--muted);
   font-size: 0.9rem;
@@ -1278,10 +1305,41 @@ button.danger {
 
 .downloads-recent-heading {
   margin-top: 1rem !important;
+  margin-bottom: 0;
+}
+
+.downloads-recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 1rem;
 }
 
 .downloads-recent li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
   opacity: 0.85;
+}
+
+.downloads-recent-remove {
+  flex-shrink: 0;
+  font-size: 0.85rem;
+}
+
+.downloads-recent-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.downloads-stuck-hint {
+  display: block;
+  color: var(--warn, #c9a227);
+  margin-top: 0.15rem;
 }
 
 .downloads-right {
@@ -1439,4 +1497,48 @@ button.danger {
     min-height: 180px;
     max-height: 180px;
   }
+}
+
+.tools-workspace .tools-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.tool-card .detail-body p {
+  margin: 0.35rem 0;
+}
+
+.tool-settings {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.tool-settings label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.tool-settings label.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.tool-toggle-panel {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+}
+
+.game-tools .launch-options-preview {
+  word-break: break-all;
+  font-size: 0.85rem;
+}
+
+.error-banner {
+  color: var(--danger, #c44);
+  margin: 0.5rem 0;
 }

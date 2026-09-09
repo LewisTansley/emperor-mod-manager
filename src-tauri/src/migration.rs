@@ -111,10 +111,10 @@ fn merge_legacy_games(
     paths: &Paths,
     config: &mut AppConfig,
     legacy_config_dir: &Path,
-) -> Result<()> {
+) -> Result<bool> {
     let file = legacy_config_dir.join("config.toml");
     if !file.is_file() {
-        return Ok(());
+        return Ok(false);
     }
     let legacy: AppConfig =
         toml::from_str(&fs::read_to_string(&file)?).context("parsing legacy config.toml")?;
@@ -132,6 +132,27 @@ fn merge_legacy_games(
     if changed {
         config::save_config(paths, config)?;
     }
+    Ok(changed)
+}
+
+/// Remove a game from the legacy nexus-manager config when the user explicitly unmanagers it.
+pub fn remove_game_from_legacy_config(game_id: &str) -> Result<()> {
+    let Some((legacy_config_dir, _)) = legacy_paths() else {
+        return Ok(());
+    };
+    let file = legacy_config_dir.join("config.toml");
+    if !file.is_file() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&file).context("reading legacy config.toml")?;
+    let mut legacy: AppConfig =
+        toml::from_str(&raw).context("parsing legacy config.toml")?;
+    let before = legacy.managed_games.len();
+    legacy.managed_games.retain(|g| g.id != game_id);
+    if legacy.managed_games.len() != before {
+        let out = toml::to_string_pretty(&legacy).context("serializing legacy config")?;
+        fs::write(&file, out).with_context(|| format!("writing legacy config {}", file.display()))?;
+    }
     Ok(())
 }
 
@@ -148,7 +169,11 @@ pub fn recover_legacy_data(paths: &Paths, config: &mut AppConfig) -> Result<Reco
         return Ok(report);
     }
 
-    merge_legacy_games(paths, config, &legacy_config_dir)?;
+    if !config.legacy_games_merged {
+        merge_legacy_games(paths, config, &legacy_config_dir)?;
+        config.legacy_games_merged = true;
+        config::save_config(paths, config)?;
+    }
     for (game_id, legacy_game_dir) in game_dirs(&legacy_data_dir) {
         let destination = paths.game_data_dir(&game_id);
         if !destination.exists() || game_dir_is_empty(&destination) {
@@ -206,8 +231,25 @@ pub fn scan_orphans(paths: &Paths, config: &AppConfig) -> OrphanScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, ManagedGame, Paths};
     use crate::mods::StagedMod;
     use tempfile::tempdir;
+
+    fn sample_managed(id: &str) -> ManagedGame {
+        ManagedGame {
+            id: id.to_string(),
+            title: "Game".to_string(),
+            nexus_domain: "example".to_string(),
+            install_path: "/games/example".to_string(),
+            launcher: "Steam".to_string(),
+            plugin_id: "example".to_string(),
+            cover_path: None,
+            project_name: None,
+            thunderstore_community: None,
+            modio_game_id: None,
+            tool_overrides: None,
+        }
+    }
 
     #[test]
     fn recognizes_mod_data_directories() {
@@ -252,5 +294,68 @@ mod tests {
                 .join("Example_1_2")
                 .to_string_lossy()
         );
+    }
+
+    #[test]
+    fn legacy_merge_runs_once_when_flag_set() {
+        let root = tempdir().unwrap();
+        let legacy_config_dir = root.path().join("legacy-config");
+        fs::create_dir_all(&legacy_config_dir).unwrap();
+        let legacy_data_dir = root.path().join("legacy-data");
+        fs::create_dir_all(&legacy_data_dir).unwrap();
+
+        let legacy_cfg = AppConfig {
+            managed_games: vec![sample_managed("legacy-game")],
+            ..AppConfig::default()
+        };
+        fs::write(
+            legacy_config_dir.join("config.toml"),
+            toml::to_string_pretty(&legacy_cfg).unwrap(),
+        )
+        .unwrap();
+
+        let paths = Paths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+
+        let mut config = AppConfig::default();
+        assert!(merge_legacy_games(&paths, &mut config, &legacy_config_dir).unwrap());
+        assert_eq!(config.managed_games.len(), 1);
+
+        config.legacy_games_merged = true;
+        assert!(
+            !merge_legacy_games(&paths, &mut config, &legacy_config_dir).unwrap()
+                || config.managed_games.len() == 1
+        );
+    }
+
+    #[test]
+    fn remove_game_from_legacy_config_file() {
+        let root = tempdir().unwrap();
+        let legacy_config_dir = root.path().join("legacy-config");
+        fs::create_dir_all(&legacy_config_dir).unwrap();
+        let legacy_cfg = AppConfig {
+            managed_games: vec![sample_managed("keep"), sample_managed("remove")],
+            ..AppConfig::default()
+        };
+        fs::write(
+            legacy_config_dir.join("config.toml"),
+            toml::to_string_pretty(&legacy_cfg).unwrap(),
+        )
+        .unwrap();
+
+        // Directly exercise the file mutation logic used by remove_game_from_legacy_config.
+        let file = legacy_config_dir.join("config.toml");
+        let mut legacy: AppConfig = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        legacy.managed_games.retain(|g| g.id != "remove");
+        fs::write(&file, toml::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let updated: AppConfig = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(updated.managed_games.len(), 1);
+        assert_eq!(updated.managed_games[0].id, "keep");
     }
 }

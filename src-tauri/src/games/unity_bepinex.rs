@@ -2,13 +2,11 @@
 //!
 //! Typical layout:
 //! ```text
-//! <Install>/BepInEx/core/
+//! <Install>/BepInEx/core/                    # standard flat install
 //! <Install>/BepInEx/plugins/
-//! <Install>/BepInEx/patchers/
-//! <Install>/BepInEx/config/
-//! <Install>/winhttp.dll | version.dll | doorstop_libs/   # Doorstop
-//! <Install>/GameAssembly.dll                             # IL2CPP
-//! <Install>/*_Data/Managed/                              # Mono
+//! <Install>/BepInExPack/BepInEx/core/      # Thunderstore pack wrapper
+//! <Install>/BepInExPack/BepInEx/plugins/
+//! <Install>/winhttp.dll | version.dll        # Doorstop
 //! ```
 
 use std::path::{Component, Path, PathBuf};
@@ -20,6 +18,7 @@ use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePlugin
 /// Roots that must not be peeled as archive wrappers for BepInEx mods.
 pub const BEPINEX_PRESERVE_ROOTS: &[&str] = &[
     "BepInEx",
+    "BepInExPack",
     "plugins",
     "patchers",
     "config",
@@ -301,24 +300,93 @@ pub fn detect_unity_runtime(install_path: &Path) -> UnityRuntime {
     UnityRuntime::Unknown
 }
 
-pub fn bepinex_present(install_path: &Path) -> bool {
-    let core = install_path.join("BepInEx").join("core");
-    if core.is_dir() {
-        return true;
+fn is_bepinex_core_dir(path: &Path) -> bool {
+    path.join("core").is_dir()
+}
+
+/// Find the BepInEx tree that actually contains the loader (`core/`).
+pub fn detect_bepinex_root(install_path: &Path) -> Option<PathBuf> {
+    if !install_path.is_dir() {
+        return None;
     }
+    let standard = install_path.join("BepInEx");
+    if is_bepinex_core_dir(&standard) {
+        return Some(standard);
+    }
+    let pack = install_path.join("BepInExPack").join("BepInEx");
+    if is_bepinex_core_dir(&pack) {
+        return Some(pack);
+    }
+    let Ok(entries) = std::fs::read_dir(install_path) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry.path().join("BepInEx");
+        if is_bepinex_core_dir(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Plugins folder for the active BepInEx install, or the default when not installed yet.
+pub fn bepinex_plugins_dir(install_path: &Path) -> PathBuf {
+    detect_bepinex_root(install_path)
+        .map(|root| root.join("plugins"))
+        .unwrap_or_else(|| install_path.join("BepInEx").join("plugins"))
+}
+
+fn doorstop_present_in_dir(dir: &Path) -> bool {
     for name in DOORSTOP_FILES {
-        if name.ends_with(".dll") && install_path.join(name).is_file() {
+        if name.ends_with(".dll") && dir.join(name).is_file() {
             return true;
         }
     }
-    install_path.join("doorstop_libs").is_dir()
-        || install_path.join(".doorstop_version").is_file()
-        || install_path.join("doorstop_config.ini").is_file()
+    dir.join("doorstop_libs").is_dir()
+        || dir.join(".doorstop_version").is_file()
+        || dir.join("doorstop_config.ini").is_file()
+}
+
+pub fn bepinex_present(install_path: &Path) -> bool {
+    if detect_bepinex_root(install_path).is_some() {
+        return true;
+    }
+    if doorstop_present_in_dir(install_path) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(install_path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && doorstop_present_in_dir(&entry.path())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when staged content is a full BepInEx / Doorstop pack (deploy to install root).
+fn is_bepinex_pack_tree(content_root: &Path) -> bool {
+    content_root.join("BepInEx").join("core").is_dir()
+}
+
+fn nested_pack_dir(dir: &Path) -> bool {
+    if dir.join("BepInEx").join("core").is_dir() {
+        return true;
+    }
+    dir.join("BepInEx").is_dir()
+        && (dir.join("doorstop_config.ini").is_file()
+            || dir.join("winhttp.dll").is_file()
+            || dir.join("version.dll").is_file())
+}
+
 pub fn looks_like_bepinex_pack(content_root: &Path) -> bool {
-    if content_root.join("BepInEx").is_dir() {
+    if is_bepinex_pack_tree(content_root) {
         return true;
     }
     for name in DOORSTOP_FILES {
@@ -336,19 +404,28 @@ pub fn looks_like_bepinex_pack(content_root: &Path) -> bool {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name.starts_with("bepinexpack") && entry.path().join("BepInEx").is_dir() {
+            if name.starts_with("bepinexpack") && nested_pack_dir(&entry.path()) {
                 return true;
             }
-            if entry.path().join("BepInEx").is_dir()
-                && (entry.path().join("doorstop_config.ini").is_file()
-                    || entry.path().join("winhttp.dll").is_file()
-                    || entry.path().join("version.dll").is_file())
-            {
+            if nested_pack_dir(&entry.path()) {
                 return true;
             }
         }
     }
     false
+}
+
+fn is_bepinexpack_wrapper(dir: &Path) -> bool {
+    nested_pack_dir(dir) || dir.join("dotnet").is_dir()
+}
+
+/// When a Thunderstore pack nests under `BepInExPack/`, deploy its contents to the game root.
+pub fn bepinex_pack_deploy_root(content_root: &Path) -> PathBuf {
+    let wrapper = content_root.join("BepInExPack");
+    if wrapper.is_dir() && is_bepinexpack_wrapper(&wrapper) {
+        return wrapper;
+    }
+    content_root.to_path_buf()
 }
 
 /// True when content looks like a plugin (DLL / plugin folder) rather than a full pack.
@@ -409,6 +486,82 @@ fn dir_contains_dll(dir: &Path) -> bool {
     false
 }
 
+/// True when content is already laid out as `BepInEx/plugins/...`.
+pub fn looks_like_bepinex_plugin_tree(content_root: &Path) -> bool {
+    content_root.join("BepInEx").join("plugins").is_dir()
+}
+
+fn should_wrap_bepinex_mod(content_root: &Path) -> bool {
+    // Thunderstore layouts that already use plugins/ or patchers/ must map via
+    // resolve_bepinex_deploy (BepInEx/plugins/...) — wrapping would nest them as
+    // BepInEx/plugins/<mod>/plugins/...
+    if content_root.join("plugins").is_dir() || content_root.join("patchers").is_dir() {
+        return false;
+    }
+    !looks_like_bepinex_pack(content_root)
+        && looks_like_bepinex_plugin(content_root)
+        && !looks_like_bepinex_plugin_tree(content_root)
+}
+
+fn dir_has_entries(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+fn doorstop_dll_at_root(install_path: &Path) -> bool {
+    DOORSTOP_FILES.iter().any(|name| {
+        name.ends_with(".dll") && install_path.join(name).is_file()
+    })
+}
+
+fn nested_doorstop_dir(install_path: &Path) -> Option<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(install_path) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if DOORSTOP_FILES.iter().any(|name| name.ends_with(".dll") && path.join(name).is_file()) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn doorstop_config_path(install_path: &Path) -> Option<PathBuf> {
+    let root = install_path.join("doorstop_config.ini");
+    if root.is_file() {
+        return Some(root);
+    }
+    nested_doorstop_dir(install_path).map(|dir| dir.join("doorstop_config.ini"))
+}
+
+fn doorstop_target_assembly_warning(install_path: &Path, ini_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(ini_path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if !line.starts_with("target_assembly") {
+            continue;
+        }
+        let target = line.split('=').nth(1)?.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(target.replace('\\', "/"));
+        let resolved = install_path.join(relative);
+        if !resolved.is_file() {
+            return Some(format!(
+                "doorstop_config.ini points to {} but that file was not found. Purge and redeploy the BepInEx pack.",
+                resolved.display()
+            ));
+        }
+    }
+    None
+}
+
 pub fn bepinex_preflight_warnings(install_path: &Path) -> Vec<String> {
     let mut warnings = Vec::new();
     if !bepinex_present(install_path) {
@@ -416,6 +569,49 @@ pub fn bepinex_preflight_warnings(install_path: &Path) -> Vec<String> {
             "BepInEx not found in the game folder. Mods will not load until BepInEx (or a BepInExPack) is installed."
                 .into(),
         );
+    }
+    if let Some(root) = detect_bepinex_root(install_path) {
+        let default_root = install_path.join("BepInEx");
+        let stale_plugins = default_root.join("plugins");
+        if root != default_root && stale_plugins.is_dir() && dir_has_entries(&stale_plugins) {
+            warnings.push(format!(
+                "Mods appear under {} but BepInEx loads from {}. Purge and redeploy.",
+                stale_plugins.display(),
+                root.join("plugins").display(),
+            ));
+        }
+        if root == default_root {
+            let nested_plugins = install_path
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("plugins");
+            if nested_plugins.is_dir() && dir_has_entries(&nested_plugins) {
+                warnings.push(format!(
+                    "Mods appear under {} but BepInEx loads from {}. Purge and redeploy.",
+                    nested_plugins.display(),
+                    root.join("plugins").display(),
+                ));
+            }
+        }
+    }
+    if !doorstop_dll_at_root(install_path) {
+        if let Some(nested) = nested_doorstop_dir(install_path) {
+            warnings.push(format!(
+                "Doorstop injector is under {} but must be next to the game executable. Purge and redeploy the BepInEx pack.",
+                nested.display()
+            ));
+        }
+    }
+    if let Some(ini_path) = doorstop_config_path(install_path) {
+        if ini_path.parent() != Some(install_path) {
+            warnings.push(
+                "doorstop_config.ini must be next to the game executable. Purge and redeploy the BepInEx pack."
+                    .into(),
+            );
+        }
+        if let Some(msg) = doorstop_target_assembly_warning(install_path, &ini_path) {
+            warnings.push(msg);
+        }
     }
     match detect_unity_runtime(install_path) {
         UnityRuntime::Il2Cpp => warnings.push(
@@ -437,8 +633,12 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
         })
         .collect();
 
+    let bepinex_root = detect_bepinex_root(install_path)
+        .unwrap_or_else(|| install_path.join("BepInEx"));
+    let plugins_dir = bepinex_plugins_dir(install_path);
+
     if parts.is_empty() {
-        return Ok(install_path.join("BepInEx").join("plugins"));
+        return Ok(plugins_dir);
     }
 
     let first = parts[0].to_string_lossy();
@@ -446,8 +646,8 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
 
     // Already rooted at BepInEx/...
     if first_lower == "bepinex" {
-        let mut out = install_path.to_path_buf();
-        for p in &parts {
+        let mut out = bepinex_root;
+        for p in parts.iter().skip(1) {
             out.push(p);
         }
         return Ok(out);
@@ -470,15 +670,15 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
 
     // plugins/ or patchers/ without BepInEx prefix
     if first_lower == "plugins" || first_lower == "patchers" || first_lower == "config" {
-        let mut out = install_path.join("BepInEx");
+        let mut out = bepinex_root;
         for p in &parts {
             out.push(p);
         }
         return Ok(out);
     }
 
-    // Default: BepInEx/plugins/<relative>
-    let mut out = install_path.join("BepInEx").join("plugins");
+    // Default: <detected>/plugins/<relative>
+    let mut out = plugins_dir;
     for p in &parts {
         out.push(p);
     }
@@ -508,7 +708,7 @@ macro_rules! bepinex_title_plugin {
             }
 
             fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
-                !looks_like_bepinex_pack(content_root) && looks_like_bepinex_plugin(content_root)
+                should_wrap_bepinex_mod(content_root)
             }
 
             fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
@@ -714,7 +914,7 @@ impl GamePlugin for BepInExPlugin {
     }
 
     fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
-        !looks_like_bepinex_pack(content_root) && looks_like_bepinex_plugin(content_root)
+        should_wrap_bepinex_mod(content_root)
     }
 
     fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
@@ -828,6 +1028,269 @@ mod tests {
         assert_eq!(
             thunderstore_community_for_plugin("boneworks"),
             Some("boneworks")
+        );
+    }
+
+    #[test]
+    fn detect_bepinexpack_nested_root() {
+        let install = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            install
+                .path()
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_bepinex_root(install.path()),
+            Some(install.path().join("BepInExPack").join("BepInEx"))
+        );
+    }
+
+    #[test]
+    fn resolve_plugins_under_bepinexpack() {
+        let install = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            install
+                .path()
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
+        let dest = resolve_bepinex_deploy(install.path(), Path::new("CoolMod.dll")).unwrap();
+        assert_eq!(
+            dest,
+            install
+                .path()
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("plugins")
+                .join("CoolMod.dll")
+        );
+    }
+
+    #[test]
+    fn resolve_bepinex_prefixed_path_under_bepinexpack() {
+        let install = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            install
+                .path()
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
+        let dest = resolve_bepinex_deploy(
+            install.path(),
+            Path::new("BepInEx/plugins/MyMod/MyMod.dll"),
+        )
+        .unwrap();
+        assert_eq!(
+            dest,
+            install
+                .path()
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("plugins")
+                .join("MyMod")
+                .join("MyMod.dll")
+        );
+    }
+
+    #[test]
+    fn standard_layout_still_uses_root_bepinex() {
+        let install = tempfile::tempdir().unwrap();
+        fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+        let dest = resolve_bepinex_deploy(install.path(), Path::new("CoolMod.dll")).unwrap();
+        assert_eq!(
+            dest,
+            install.path().join("BepInEx").join("plugins").join("CoolMod.dll")
+        );
+    }
+
+    #[test]
+    fn plugin_tree_is_not_wrapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("BepInEx").join("plugins").join("MyMod")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("BepInEx")
+                .join("plugins")
+                .join("MyMod")
+                .join("MyMod.dll"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!should_wrap_bepinex_mod(tmp.path()));
+    }
+
+    #[test]
+    fn loose_dll_is_wrapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("CoolMod.dll"), b"x").unwrap();
+        assert!(should_wrap_bepinex_mod(tmp.path()));
+    }
+
+    #[test]
+    fn top_level_plugins_dir_is_not_wrapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("plugins").join("R2API.Legacy")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("plugins")
+                .join("R2API.Legacy")
+                .join("R2API.dll"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!should_wrap_bepinex_mod(tmp.path()));
+        let dest = resolve_bepinex_deploy(
+            Path::new("/game"),
+            Path::new("plugins/R2API.Legacy/R2API.dll"),
+        )
+        .unwrap();
+        assert_eq!(
+            dest,
+            PathBuf::from("/game/BepInEx/plugins/R2API.Legacy/R2API.dll")
+        );
+    }
+
+    #[test]
+    fn top_level_patchers_dir_is_not_wrapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("patchers").join("HookGen")).unwrap();
+        fs::write(
+            tmp.path().join("patchers").join("HookGen").join("HookGen.dll"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!should_wrap_bepinex_mod(tmp.path()));
+    }
+
+    #[test]
+    fn riskofrain2_plugins_prefix_deploys_flat() {
+        let dest = RiskOfRain2Plugin
+            .resolve_deploy_root(
+                Path::new("/ror2"),
+                Path::new("plugins/HAND_Overclocked/HAND_Overclocked.dll"),
+            )
+            .unwrap();
+        assert_eq!(
+            dest,
+            PathBuf::from("/ror2/BepInEx/plugins/HAND_Overclocked/HAND_Overclocked.dll")
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("plugins").join("HAND_Overclocked")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("plugins")
+                .join("HAND_Overclocked")
+                .join("HAND_Overclocked.dll"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!RiskOfRain2Plugin.should_wrap_as_mod_folder(tmp.path()));
+    }
+
+    #[test]
+    fn plugin_tree_is_not_a_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("BepInEx").join("plugins").join("MyMod")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("BepInEx")
+                .join("plugins")
+                .join("MyMod")
+                .join("MyMod.dll"),
+            b"x",
+        )
+        .unwrap();
+        assert!(!looks_like_bepinex_pack(tmp.path()));
+    }
+
+    #[test]
+    fn plugin_tree_does_not_deploy_to_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("BepInEx").join("plugins").join("MyMod")).unwrap();
+        fs::write(
+            tmp.path()
+                .join("BepInEx")
+                .join("plugins")
+                .join("MyMod")
+                .join("MyMod.dll"),
+            b"x",
+        )
+        .unwrap();
+        let plugin = BepInExPlugin;
+        assert!(!plugin.deploys_to_install_root(tmp.path()));
+    }
+
+    #[test]
+    fn pack_with_core_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("BepInEx").join("core")).unwrap();
+        fs::write(tmp.path().join("winhttp.dll"), b"x").unwrap();
+        assert!(looks_like_bepinex_pack(tmp.path()));
+    }
+
+    #[test]
+    fn bepinex_pack_deploy_root_flattens_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("BepInExPack").join("BepInEx").join("core")).unwrap();
+        fs::write(tmp.path().join("BepInExPack").join("winhttp.dll"), b"x").unwrap();
+        fs::write(tmp.path().join("manifest.json"), b"{}").unwrap();
+        assert_eq!(
+            bepinex_pack_deploy_root(tmp.path()),
+            tmp.path().join("BepInExPack")
+        );
+    }
+
+    #[test]
+    fn bepinex_pack_deploy_root_keeps_flat_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("BepInEx").join("core")).unwrap();
+        fs::write(tmp.path().join("winhttp.dll"), b"x").unwrap();
+        assert_eq!(bepinex_pack_deploy_root(tmp.path()), tmp.path());
+    }
+
+    #[test]
+    fn preflight_warns_when_doorstop_is_nested() {
+        let install = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            install
+                .path()
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
+        fs::write(
+            install.path().join("BepInExPack").join("winhttp.dll"),
+            b"x",
+        )
+        .unwrap();
+        fs::write(
+            install
+                .path()
+                .join("BepInExPack")
+                .join("doorstop_config.ini"),
+            "target_assembly = BepInEx\\core\\Missing.dll\n",
+        )
+        .unwrap();
+        let warnings = bepinex_preflight_warnings(install.path());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Doorstop injector is under")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("doorstop_config.ini must be next to the game executable")),
+            "{warnings:?}"
         );
     }
 }

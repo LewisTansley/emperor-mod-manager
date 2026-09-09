@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DownloadItem } from "./types";
 
 export type AssistQueueEntry = {
@@ -76,6 +76,7 @@ function statusLabel(status: string): string {
     case "paused":
       return "Paused";
     case "staged":
+    case "done":
       return "Complete";
     case "failed":
       return "Failed";
@@ -148,6 +149,12 @@ type DownloadsWorkspaceProps = {
   onCancel: () => void;
   onCancelRemaining: () => void;
   onCancelDownload: (id: string) => void;
+  onRestartDownload: (id: string) => void;
+  onForceResetDownload: (id: string) => void;
+  onRetryAssistOpening: () => void;
+  isDownloadStuck: (id: string, status: string) => boolean;
+  onClearRecent: () => void;
+  onRemoveDownload: (id: string) => void;
   onPauseDownload: (id: string) => void;
   onResumeDownload: (id: string) => void;
   onAssistHost: (el: HTMLDivElement | null) => void;
@@ -165,19 +172,37 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
     onCancel,
     onCancelRemaining,
     onCancelDownload,
+    onRestartDownload,
+    onForceResetDownload,
+    onRetryAssistOpening,
+    isDownloadStuck,
+    onClearRecent,
+    onRemoveDownload,
     onPauseDownload,
     onResumeDownload,
     onAssistHost,
   } = props;
 
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const [showAssistRetry, setShowAssistRetry] = useState(false);
 
   useEffect(() => {
     onAssistHost(hostRef.current);
     return () => onAssistHost(null);
   }, [onAssistHost]);
 
-  const current = queue && queue.head < queue.entries.length ? queue.entries[queue.head] : null;
+  const current =
+    queue && queue.head < queue.entries.length ? queue.entries[queue.head] : null;
+
+  useEffect(() => {
+    if (!current || assistActive || queue?.cancelled) {
+      setShowAssistRetry(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setShowAssistRetry(true), 30000);
+    return () => window.clearTimeout(timer);
+  }, [current, assistActive, queue?.cancelled, queue?.head]);
+
   const pending = queue ? queue.entries.slice(queue.head + 1) : [];
   const activeDownloads = downloads.filter(
     (d) => d.status === "downloading" || d.status === "extracting" || d.status === "paused",
@@ -209,6 +234,11 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
         <div className="panel-head-actions">
           {queue && !queue.cancelled && current ? (
             <>
+              {showAssistRetry ? (
+                <button type="button" onClick={onRetryAssistOpening}>
+                  Retry opening
+                </button>
+              ) : null}
               <button type="button" className="danger" onClick={onSkip}>
                 Skip current
               </button>
@@ -235,6 +265,7 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
             {activeDownloads.map((d) => {
               const pct = progressPercent(d);
               const detail = progressDetail(d);
+              const stuck = isDownloadStuck(d.id, d.status);
               return (
                 <li key={d.id} className="downloads-active-item">
                   <div className="downloads-active-row">
@@ -245,6 +276,11 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                         {pct != null ? ` · ${pct}%` : ""}
                         {detail ? ` · ${detail}` : ""}
                       </small>
+                      {stuck ? (
+                        <small className="downloads-stuck-hint">
+                          No progress — try Restart
+                        </small>
+                      ) : null}
                       <div
                         className={
                           pct != null
@@ -263,6 +299,13 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                       </div>
                     </div>
                     <div className="downloads-active-actions">
+                      <button
+                        type="button"
+                        className="downloads-control-one"
+                        onClick={() => onRestartDownload(d.id)}
+                      >
+                        Restart
+                      </button>
                       {d.status === "downloading" ? (
                         <button
                           type="button"
@@ -299,7 +342,12 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
           </ul>
           {recentDownloads.length > 0 && (
             <>
-              <h2 className="downloads-recent-heading">Recent</h2>
+              <div className="downloads-recent-head">
+                <h2 className="downloads-recent-heading">Recent</h2>
+                <button type="button" onClick={onClearRecent}>
+                  Clear
+                </button>
+              </div>
               <ul className="list downloads-recent">
                 {recentDownloads.slice(0, 8).map((d) => (
                   <li key={d.id}>
@@ -309,6 +357,34 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                         {statusLabel(d.status)}
                         {d.error ? ` · ${d.error}` : ""}
                       </small>
+                    </div>
+                    <div className="downloads-recent-actions">
+                      {d.status === "failed" && d.can_restart ? (
+                        <button
+                          type="button"
+                          className="downloads-control-one"
+                          onClick={() => onRestartDownload(d.id)}
+                        >
+                          Retry
+                        </button>
+                      ) : null}
+                      {d.status === "failed" && !d.can_restart ? (
+                        <button
+                          type="button"
+                          className="downloads-control-one"
+                          onClick={() => onForceResetDownload(d.id)}
+                        >
+                          Dismiss
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="downloads-recent-remove"
+                        onClick={() => onRemoveDownload(d.id)}
+                        aria-label={`Remove ${d.label}`}
+                      >
+                        Remove
+                      </button>
                     </div>
                   </li>
                 ))}

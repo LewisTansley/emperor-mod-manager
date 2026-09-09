@@ -1,6 +1,27 @@
 export type ThemePreference = "light" | "dark" | "system";
 export type InstallClickBehavior = "stay" | "downloads";
 
+export type AppInfo = {
+  name: string;
+  version: string;
+  platform: string;
+  linux_only: boolean;
+};
+
+export type AppUpdateStatus = {
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  asset_name: string | null;
+  release_url: string | null;
+};
+
+export type AppInstallResult = {
+  message: string;
+  path: string | null;
+  will_exit: boolean;
+};
+
 export type DetectedGame = {
   id: string;
   title: string;
@@ -24,6 +45,104 @@ export type ManagedGame = {
   project_name?: string | null;
   thunderstore_community?: string | null;
   modio_game_id?: number | null;
+  tool_overrides?: GameToolOverrides | null;
+};
+
+export type ToolGameState = {
+  enabled: boolean;
+  use_global_settings: boolean;
+};
+
+export type GameToolOverrides = {
+  lsfg_vk: ToolGameState;
+  autohdr_vk: ToolGameState;
+  executables: string[];
+};
+
+export type ToolStatus = {
+  installed: boolean;
+  version: string | null;
+  path: string | null;
+  latest_version: string | null;
+  update_available: boolean;
+  config_path: string;
+};
+
+export type ToolsStatusResponse = {
+  platform_linux: boolean;
+  lsfg_vk: ToolStatus;
+  autohdr_vk: ToolStatus;
+  lsfg_vk_repo: string;
+  autohdr_vk_repo: string;
+};
+
+export type ToolUpdatesResponse = {
+  lsfg_vk: ToolStatus;
+  autohdr_vk: ToolStatus;
+};
+
+export type LsfgVkGlobal = {
+  dll: string | null;
+  allow_fp16: boolean;
+};
+
+export type LsfgVkProfile = {
+  name: string;
+  active_in: string[];
+  multiplier: number;
+  target_fps: number;
+  flow_scale: number;
+  performance_mode: boolean;
+  pacing: string;
+  gpu: string | null;
+};
+
+export type LsfgVkConfig = {
+  global: LsfgVkGlobal;
+  profiles: LsfgVkProfile[];
+};
+
+export type AutoHdrVkGlobal = {
+  intensity: number;
+  color_intensity: number;
+  expansion_shape: number;
+  black_floor: number;
+  highlight_stretch: number;
+  encoding: string;
+  set_hdr_metadata: boolean;
+  prefer_hdr_swapchain: boolean;
+  enabled: boolean;
+};
+
+export type AutoHdrVkProfile = {
+  exe: string;
+  enabled: boolean;
+  intensity?: number | null;
+  color_intensity?: number | null;
+  expansion_shape?: number | null;
+  black_floor?: number | null;
+  highlight_stretch?: number | null;
+};
+
+export type AutoHdrVkConfig = {
+  global: AutoHdrVkGlobal;
+  profiles: AutoHdrVkProfile[];
+};
+
+export type GameToolsResponse = {
+  overrides: GameToolOverrides;
+  executables: string[];
+  steam_app_id: string | null;
+  launch_options: string | null;
+};
+
+export type GameHealthStatus = "ok" | "missing" | "relocate_candidate";
+
+export type GameHealth = {
+  game_id: string;
+  status: GameHealthStatus;
+  new_install_path: string | null;
+  relocate_target_id: string | null;
 };
 
 export type UeLayoutInfo = {
@@ -457,6 +576,7 @@ export type DownloadItem = {
   bytes_total: number | null;
   speed_bps: number;
   batch_id: string | null;
+  can_restart?: boolean;
 };
 
 export type Settings = {
@@ -471,4 +591,5 @@ export type Settings = {
   config_dir: string;
   data_dir: string;
   cache_dir: string;
+  platform_linux?: boolean;
 };

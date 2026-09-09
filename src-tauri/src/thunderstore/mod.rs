@@ -545,11 +545,15 @@ pub fn extract_profile_zip(bytes: &[u8], dest: &Path) -> Result<ProfileManifest>
     let mut archive = zip::ZipArchive::new(cursor).context("open profile zip")?;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(p) => dest.join(p),
+        let raw_name = file.name();
+        let is_dir = raw_name.ends_with('/') || raw_name.ends_with('\\');
+        let rel = match crate::mods::safe_archive_entry_path(raw_name.trim_end_matches(['/', '\\']))
+        {
+            Some(p) => p,
             None => continue,
         };
-        if file.name().ends_with('/') {
+        let outpath = dest.join(rel);
+        if is_dir {
             fs::create_dir_all(&outpath)?;
         } else {
             if let Some(parent) = outpath.parent() {
@@ -559,6 +563,7 @@ pub fn extract_profile_zip(bytes: &[u8], dest: &Path) -> Result<ProfileManifest>
             std::io::copy(&mut file, &mut outfile)?;
         }
     }
+    crate::mods::repair_backslash_entries(dest)?;
     let manifest_path = dest.join("export.r2x");
     let reader = fs::File::open(&manifest_path).context("missing export.r2x in profile")?;
     let manifest: ProfileManifest =

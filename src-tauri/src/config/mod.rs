@@ -49,6 +49,52 @@ pub struct AppConfig {
     pub theme: ThemePreference,
     /// Whether Install switches to the Downloads tab or keeps the current tab.
     pub install_click_behavior: InstallClickBehavior,
+    /// Set after the first import of managed games from legacy nexus-manager config.
+    #[serde(default)]
+    pub legacy_games_merged: bool,
+    /// Vulkan tool integration (lsfg-vk, AutoHDR-VK).
+    #[serde(default)]
+    pub tools: ToolsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub lsfg_vk_repo: String,
+    pub autohdr_vk_repo: String,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            lsfg_vk_repo: "LewisTansley/lsfg-vk".to_string(),
+            autohdr_vk_repo: "LewisTansley/AutoHDR-VK".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GameToolOverrides {
+    #[serde(default)]
+    pub lsfg_vk: ToolGameState,
+    #[serde(default)]
+    pub autohdr_vk: ToolGameState,
+    /// Windows/Linux executables used for profile matching (e.g. Game.exe).
+    #[serde(default)]
+    pub executables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolGameState {
+    #[serde(default)]
+    pub enabled: bool,
+    /// When true, inherit global tool settings instead of per-game overrides.
+    #[serde(default = "default_use_global")]
+    pub use_global_settings: bool,
+}
+
+fn default_use_global() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -60,6 +106,8 @@ impl Default for AppConfig {
             autoclick_free_download: true,
             theme: ThemePreference::System,
             install_click_behavior: InstallClickBehavior::Downloads,
+            legacy_games_merged: false,
+            tools: ToolsConfig::default(),
         }
     }
 }
@@ -85,6 +133,9 @@ pub struct ManagedGame {
     /// mod.io numeric game id when this title is catalogued there.
     #[serde(default)]
     pub modio_game_id: Option<u32>,
+    /// Per-game Vulkan tool overrides (lsfg-vk, AutoHDR-VK).
+    #[serde(default)]
+    pub tool_overrides: Option<GameToolOverrides>,
 }
 
 pub struct Paths {
@@ -146,6 +197,30 @@ impl Paths {
     /// Local library of Emperor share codes (not per-game staging).
     pub fn saved_collections_file(&self) -> PathBuf {
         self.data_dir.join("saved_collections.json")
+    }
+
+    pub fn tools_dir(&self) -> PathBuf {
+        self.data_dir.join("tools")
+    }
+
+    pub fn tools_manifest_file(&self) -> PathBuf {
+        self.tools_dir().join("manifest.json")
+    }
+
+    pub fn lsfg_vk_install_dir(&self) -> PathBuf {
+        self.tools_dir().join("lsfg-vk")
+    }
+
+    pub fn autohdr_vk_install_dir(&self) -> PathBuf {
+        self.tools_dir().join("autohdr-vk")
+    }
+
+    pub fn lsfg_vk_config_file(&self) -> PathBuf {
+        self.lsfg_vk_install_dir().join("conf.toml")
+    }
+
+    pub fn autohdr_vk_config_file(&self) -> PathBuf {
+        self.autohdr_vk_install_dir().join("conf.toml")
     }
 }
 

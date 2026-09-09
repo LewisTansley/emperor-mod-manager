@@ -59,7 +59,8 @@ pub use spaceengineers::SpaceEngineersPlugin;
 pub use stardewvalley::StardewValleyPlugin;
 pub use theforest::TheForestPlugin;
 pub use unity_bepinex::{
-    looks_like_unity_install, thunderstore_community_for_plugin, AgainstTheStormPlugin,
+    bepinex_pack_deploy_root, looks_like_unity_install, thunderstore_community_for_plugin,
+    AgainstTheStormPlugin,
     AmongUsPlugin, AtlyssPlugin, BepInExPlugin, ContentWarningPlugin, CultOfTheLambPlugin,
     DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin, HollowKnightSilksongPlugin,
     InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin, RiskOfRain2Plugin,

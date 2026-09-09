@@ -664,6 +664,7 @@ mod tests {
             project_name: None,
             thunderstore_community: None,
             modio_game_id: None,
+            tool_overrides: None,
         };
         let order = LoadOrder {
             mods: vec![
@@ -729,6 +730,7 @@ mod tests {
             project_name: None,
             thunderstore_community: Some("lethal-company".into()),
             modio_game_id: Some(42),
+            tool_overrides: None,
         };
         let hint = sample_manifest().game;
         assert!(catalogs_overlap(&hint, &game).is_ok());
@@ -747,6 +749,7 @@ mod tests {
             project_name: None,
             thunderstore_community: None,
             modio_game_id: None,
+            tool_overrides: None,
         };
         let hint = ShareGameHint {
             id: None,

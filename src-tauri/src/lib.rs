@@ -1,8 +1,10 @@
+mod app_update;
 mod assist;
 mod commands;
 mod config;
 mod detection;
 mod games;
+mod github_release;
 #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -19,6 +21,7 @@ mod modio_api;
 mod nexus;
 mod share;
 mod thunderstore;
+mod tools;
 
 use commands::AppState;
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -56,6 +59,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
+            app_update::check_app_update,
+            app_update::install_app_update,
             commands::scan_games,
             commands::list_plugins,
             commands::list_managed,
@@ -65,6 +70,8 @@ pub fn run() {
             commands::suggest_catalog_ids,
             commands::suggest_catalog_ids_batch,
             commands::unmanage_game,
+            commands::get_game_health,
+            commands::relink_managed_game,
             commands::get_settings,
             commands::set_adult_content,
             commands::set_theme,
@@ -123,15 +130,33 @@ pub fn run() {
             commands::deploy_mods,
             commands::purge_mods,
             commands::list_downloads,
+            commands::clear_recent_downloads,
+            commands::remove_download,
             commands::cancel_download,
             commands::cancel_download_batch,
             commands::pause_download,
             commands::resume_download,
+            commands::restart_download,
+            commands::force_reset_download,
             assist::open_download_assist,
             assist::close_download_assist,
             assist::clear_assist_session,
             assist::set_assist_bounds,
             assist::set_assist_visible,
+            #[cfg(target_os = "linux")]
+            tools::get_tools_status,
+            #[cfg(target_os = "linux")]
+            tools::check_tool_updates,
+            #[cfg(target_os = "linux")]
+            tools::install_tool,
+            tools::get_lsfg_vk_config,
+            tools::set_lsfg_vk_config,
+            tools::get_autohdr_vk_config,
+            tools::set_autohdr_vk_config,
+            tools::detect_game_executables,
+            tools::get_game_tools,
+            tools::set_game_tools,
+            tools::sync_game_tools,
         ])
         .setup(|app| {
             // Register nxm:// with the OS when supported (Windows installer / Linux desktop).

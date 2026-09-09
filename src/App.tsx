@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./api";
 import {
   createQueueEntry,
@@ -11,6 +11,7 @@ import {
   type AssistQueueEntry,
   type AssistQueueState,
 } from "./downloads";
+import { GameToolsPanel, ToolsErrorBoundary, ToolsWorkspace } from "./tools";
 import {
   catalogFilterMismatchMessage,
   clampCatalogSourceFilter,
@@ -27,6 +28,7 @@ import type {
   CollectionModFile,
   DetectedGame,
   DownloadItem,
+  GameHealth,
   GameInfo,
   InstalledCollection,
   ManagedGame,
@@ -46,13 +48,15 @@ import type {
   SavedCollectionDetail,
   ShareImportResult,
   ShareModEntry,
+  AppInfo,
+  AppUpdateStatus,
 } from "./types";
 import "./App.css";
 
-type Tab = "setup" | "library" | "collections" | "browse" | "downloads" | "settings";
+type Tab = "setup" | "library" | "collections" | "browse" | "downloads" | "tools" | "settings";
 type ViewMode = "list" | "grid";
 type DetailTab = "info" | "files";
-type GameDetailTab = "info" | "mods";
+type GameDetailTab = "info" | "mods" | "collections" | "tools";
 type BrowseTagMap = Record<string, TagFilterState>;
 
 type StatusNotice = {
@@ -383,6 +387,16 @@ function openExternal(url: string) {
   })();
 }
 
+function openPathInExplorer(path: string) {
+  void (async () => {
+    try {
+      await openPath(path);
+    } catch (e) {
+      console.error("Failed to open path", e);
+    }
+  })();
+}
+
 function formatTimestamp(ts: number | null | undefined): string | null {
   if (ts == null || ts <= 0) return null;
   try {
@@ -422,6 +436,20 @@ function groupCollectionMods(files: CollectionModFile[]) {
     }
   }
   return [...map.values()];
+}
+
+function normalizeGameKey(title: string, launcher: string): string {
+  return `${title.trim().toLowerCase()}|${launcher.trim().toLowerCase()}`;
+}
+
+function managedHealthBadge(health: GameHealth | undefined): string | null {
+  if (!health || health.status === "ok") {
+    return null;
+  }
+  if (health.status === "missing") {
+    return "Install not found";
+  }
+  return "Moved — relink available";
 }
 
 function MediaCard(props: {
@@ -508,15 +536,33 @@ function MediaCard(props: {
   );
 }
 
-function App() {
+function isActiveDownloadStatus(status: string): boolean {
+  return status === "downloading" || status === "extracting" || status === "paused";
+}
+
+function hasActiveDownloads(list: DownloadItem[]): boolean {
+  return list.some((d) => isActiveDownloadStatus(d.status));
+}
+
+export default function App() {
   const [tab, setTab] = useState<Tab>("setup");
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
+  const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
+  const [installingAppUpdate, setInstallingAppUpdate] = useState(false);
+  const [appUpdateMessage, setAppUpdateMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<StatusNotice | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [detected, setDetected] = useState<DetectedGame[]>([]);
   const [managed, setManaged] = useState<ManagedGame[]>([]);
+  const [gameHealth, setGameHealth] = useState<GameHealth[]>([]);
+  const [relinkPrompt, setRelinkPrompt] = useState<{
+    game: ManagedGame;
+    health: GameHealth;
+  } | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [mods, setMods] = useState<StagedMod[]>([]);
   const [modUpdates, setModUpdates] = useState<Record<string, StagedModUpdate>>(
@@ -547,6 +593,10 @@ function App() {
   );
   const [savedRename, setSavedRename] = useState("");
   const [savedInstallGameId, setSavedInstallGameId] = useState("");
+  const [gameSavedDetail, setGameSavedDetail] = useState<SavedCollectionDetail | null>(
+    null,
+  );
+  const [gameSavedRename, setGameSavedRename] = useState("");
   const [orphanScan, setOrphanScan] = useState<OrphanScan | null>(null);
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -617,6 +667,7 @@ function App() {
   tabRef.current = tab;
   const assistSyncGenRef = useRef(0);
   const downloadStartedAtRef = useRef<number>(0);
+  const downloadProgressAtRef = useRef<Map<string, { bytes: number; at: number }>>(new Map());
   const tagPickerRef = useRef<HTMLDivElement | null>(null);
   const tagSearchRef = useRef<HTMLInputElement | null>(null);
   const mainScrollRef = useRef<HTMLElement | null>(null);
@@ -646,11 +697,72 @@ function App() {
   );
   const activeGameRef = useRef(activeGame);
   activeGameRef.current = activeGame;
+  const prevActiveGameIdRef = useRef<string | null>(null);
+
+  const closeBrowseDetail = useCallback(() => {
+    setBrowseDetail(null);
+    setModDetail(null);
+    setTsDetail(null);
+    setTsVersion("");
+    setModioDetail(null);
+    setModioFiles([]);
+    setModFiles([]);
+    setCollectionModFiles([]);
+    setCollectionDetail(null);
+  }, []);
+
+  const resetBrowseState = useCallback(() => {
+    browseRequestIdRef.current += 1;
+    browseNextOffsetRef.current = 0;
+    browseLoadingMoreRef.current = false;
+    browseAppendFailedRef.current = false;
+    closeBrowseDetail();
+    setSearchQuery("");
+    setModHits([]);
+    setCollectionHits([]);
+    setBrowseSearched(false);
+    setBrowseTotalCount(0);
+    setBrowseHasMore(false);
+    setBrowseCategory("");
+    setBrowseVersion("");
+    setBrowseTags({});
+    setTagQuery("");
+    setTagsOpen(false);
+    setProfileImportOpen(false);
+    setProfileCode("");
+  }, [closeBrowseDetail]);
+
+  const resetLibraryEphemeralState = useCallback(() => {
+    setShareExportOpen(false);
+    setShareExportName("");
+    setShareImportOpen(false);
+    setShareImportCode("");
+    setLastShareCode(null);
+  }, []);
 
   const unmanaged = useMemo(() => {
     const managedIds = new Set(managed.map((g) => g.id));
-    return detected.filter((g) => !managedIds.has(g.id));
+    const managedKeys = new Set(
+      managed.map((g) => normalizeGameKey(g.title, g.launcher)),
+    );
+    return detected.filter((g) => {
+      if (managedIds.has(g.id)) {
+        return false;
+      }
+      if (managedKeys.has(normalizeGameKey(g.title, g.launcher))) {
+        return false;
+      }
+      return true;
+    });
   }, [detected, managed]);
+
+  const gameHealthById = useMemo(() => {
+    const map = new Map<string, GameHealth>();
+    for (const entry of gameHealth) {
+      map.set(entry.game_id, entry);
+    }
+    return map;
+  }, [gameHealth]);
 
   const visibleMods = useMemo(
     () =>
@@ -723,14 +835,94 @@ function App() {
     return s;
   }, []);
 
+  const loadAppInfo = useCallback(async () => {
+    try {
+      setAppInfo(await api.getAppInfo());
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const checkForAppUpdate = useCallback(async (quiet = false) => {
+    setCheckingAppUpdate(true);
+    if (!quiet) {
+      setAppUpdateMessage(null);
+      setError(null);
+    }
+    try {
+      const status = await api.checkAppUpdate();
+      setAppUpdate(status);
+      setAppInfo((prev) =>
+        prev
+          ? { ...prev, version: status.current_version }
+          : {
+              name: "emperor-mod-manager",
+              version: status.current_version,
+              platform: "unknown",
+              linux_only: false,
+            },
+      );
+      if (!quiet) {
+        if (status.update_available) {
+          setAppUpdateMessage(
+            `Update available: v${status.latest_version}${
+              status.asset_name ? ` (${status.asset_name})` : ""
+            }`,
+          );
+        } else if (status.latest_version) {
+          setAppUpdateMessage("You’re up to date.");
+        } else {
+          setAppUpdateMessage("No releases found on GitHub.");
+        }
+      }
+    } catch (e) {
+      if (!quiet) {
+        setAppUpdateMessage(null);
+        setError(String(e));
+      }
+    } finally {
+      setCheckingAppUpdate(false);
+    }
+  }, []);
+
+  const installAppUpdate = useCallback(async () => {
+    setInstallingAppUpdate(true);
+    setAppUpdateMessage(null);
+    setError(null);
+    try {
+      const result = await api.installAppUpdate();
+      setAppUpdateMessage(result.message);
+      if (!result.will_exit) {
+        setNotice({ kind: "ok", message: result.message });
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setInstallingAppUpdate(false);
+    }
+  }, []);
+
+  const refreshGameHealth = useCallback(async () => {
+    try {
+      const health = await api.getGameHealth();
+      setGameHealth(health);
+      return health;
+    } catch {
+      setGameHealth([]);
+      return [];
+    }
+  }, []);
+
   const refreshManaged = useCallback(async () => {
     const list = await api.listManaged();
     setManaged(list);
+    void refreshGameHealth();
     return list;
-  }, []);
+  }, [refreshGameHealth]);
 
   const refreshMods = useCallback(async (gameId: string) => {
     const list = await api.listMods(gameId);
+    if (activeGameRef.current?.id !== gameId) return;
     setMods(list);
   }, []);
 
@@ -749,6 +941,7 @@ function App() {
 
   const refreshCollections = useCallback(async (gameId: string) => {
     const list = await api.listInstalledCollections(gameId);
+    if (activeGameRef.current?.id !== gameId) return;
     setInstalledCollections(list);
   }, []);
 
@@ -759,7 +952,20 @@ function App() {
   }, []);
 
   const refreshDownloads = useCallback(async () => {
-    setDownloads(await api.listDownloads());
+    const list = await api.listDownloads();
+    const now = Date.now();
+    for (const d of list) {
+      if (isActiveDownloadStatus(d.status)) {
+        const entry = downloadProgressAtRef.current.get(d.id);
+        if (!entry) {
+          downloadProgressAtRef.current.set(d.id, {
+            bytes: d.bytes_downloaded,
+            at: now,
+          });
+        }
+      }
+    }
+    setDownloads(list);
   }, []);
 
   const scan = useCallback(async () => {
@@ -768,12 +974,13 @@ function App() {
     setNotice(null);
     try {
       setDetected(await api.scanGames());
+      await refreshGameHealth();
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
     }
-  }, []);
+  }, [refreshGameHealth]);
 
   useEffect(() => {
     (async () => {
@@ -798,6 +1005,12 @@ function App() {
   }, [refreshManaged, refreshOrphanScan, refreshSettings, scan]);
 
   useEffect(() => {
+    if (tab !== "settings") return;
+    void loadAppInfo();
+    void checkForAppUpdate(true);
+  }, [tab, loadAppInfo, checkForAppUpdate]);
+
+  useEffect(() => {
     if (themePref !== "system") {
       applyTheme(themePref);
       return;
@@ -810,19 +1023,52 @@ function App() {
   }, [themePref]);
 
   useEffect(() => {
+    const nextId = activeGame?.id ?? null;
+    const prevId = prevActiveGameIdRef.current;
+    const gameChanged = prevId !== nextId;
+
+    if (gameChanged) {
+      prevActiveGameIdRef.current = nextId;
+      if (prevId !== null) {
+        resetBrowseState();
+        resetLibraryEphemeralState();
+      }
+      setSavedDetail(null);
+      setSavedRename("");
+      setSavedInstallGameId(nextId ?? "");
+      setGameSavedDetail(null);
+    }
+
     if (activeGame) {
       refreshMods(activeGame.id).catch((e) => setError(String(e)));
       refreshCollections(activeGame.id).catch((e) => setError(String(e)));
-      setBrowseDetail(null);
-      setModDetail(null);
-      setModFiles([]);
-      setCollectionModFiles([]);
-      setCollectionDetail(null);
       setModUpdates({});
     } else {
       setModUpdates({});
     }
-  }, [activeGame, refreshMods, refreshCollections]);
+  }, [
+    activeGame,
+    refreshMods,
+    refreshCollections,
+    resetBrowseState,
+    resetLibraryEphemeralState,
+  ]);
+
+  useEffect(() => {
+    if (!activeGame || !libraryDetail) return;
+    if (libraryDetail.game.id === activeGame.id) return;
+    setLibraryDetail({ ...libraryDetail, game: activeGame });
+    setGameInfo(null);
+    if (activeGame.nexus_domain) {
+      void api.getGame(activeGame.nexus_domain).then(setGameInfo).catch(() => {
+        /* Nexus metadata is optional for local game info */
+      });
+    }
+  }, [activeGame, libraryDetail]);
+
+  useEffect(() => {
+    mainScrollRef.current?.scrollTo(0, 0);
+  }, [tab, activeGame?.id]);
 
   useEffect(() => {
     if (!activeGame || libraryDetail?.tab !== "mods") return;
@@ -1311,6 +1557,85 @@ function App() {
       } catch (e) {
         setError(String(e));
       }
+      setBusy(null);
+      const list = await api.listDownloads();
+      setDownloads(list);
+      if (!hasActiveDownloads(list)) {
+        setBusy(null);
+      }
+    },
+    [],
+  );
+
+  const restartOneDownload = useCallback(async (id: string) => {
+    try {
+      await api.restartDownload(id);
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("No restart metadata")) {
+        try {
+          await api.forceResetDownload(id);
+        } catch (resetErr) {
+          setError(String(resetErr));
+        }
+      } else {
+        setError(msg);
+      }
+    }
+    setBusy(null);
+    downloadProgressAtRef.current.set(id, { bytes: 0, at: Date.now() });
+    await refreshDownloads();
+  }, [refreshDownloads]);
+
+  const forceResetOneDownload = useCallback(async (id: string) => {
+    try {
+      await api.forceResetDownload(id);
+    } catch (e) {
+      setError(String(e));
+    }
+    setBusy(null);
+    downloadProgressAtRef.current.delete(id);
+    const list = await api.listDownloads();
+    setDownloads(list);
+    if (!hasActiveDownloads(list)) {
+      setBusy(null);
+    }
+  }, []);
+
+  const retryAssistOpening = useCallback(async () => {
+    const q = assistQueueRef.current;
+    if (!q || q.cancelled || q.head >= q.entries.length) return;
+    try {
+      await openAssistAtHead(q);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [openAssistAtHead]);
+
+  const isDownloadStuck = useCallback((id: string, status: string) => {
+    if (!isActiveDownloadStatus(status)) return false;
+    const entry = downloadProgressAtRef.current.get(id);
+    if (!entry) return false;
+    return Date.now() - entry.at > 120000;
+  }, []);
+
+  const clearRecentDownloads = useCallback(async () => {
+    if (!window.confirm("Clear recent downloads?")) return;
+    try {
+      await api.clearRecentDownloads();
+    } catch (e) {
+      setError(String(e));
+    }
+    await refreshDownloads();
+  }, [refreshDownloads]);
+
+  const removeOneDownload = useCallback(
+    async (id: string) => {
+      try {
+        await api.removeDownload(id);
+      } catch (e) {
+        setError(String(e));
+      }
       await refreshDownloads();
     },
     [refreshDownloads],
@@ -1573,6 +1898,9 @@ function App() {
             /* ignore */
           }
         }
+        if (!hasActiveDownloads(list)) {
+          setBusy(null);
+        }
       },
     );
     const unlistenDlFailed = listen<{ label?: string; error?: string }>(
@@ -1593,7 +1921,12 @@ function App() {
         }
         const label = event.payload.label ?? "Download";
         const err = event.payload.error ?? "unknown error";
-        setError(`${label}: ${err}`);
+        if (err !== "Reset by user") {
+          setError(`${label}: ${err}`);
+        }
+        if (!hasActiveDownloads(list)) {
+          setBusy(null);
+        }
       },
     );
     const unlistenDlCancelled = listen<{ id?: string; label?: string }>(
@@ -1612,6 +1945,9 @@ function App() {
           );
           if (!still) setActiveBatch(null);
         }
+        if (!hasActiveDownloads(list)) {
+          setBusy(null);
+        }
       },
     );
     const unlistenProgress = listen<{
@@ -1622,10 +1958,18 @@ function App() {
       status: string;
     }>("download-progress", (event) => {
       const p = event.payload;
-      setDownloads((prev) => {
-        const idx = prev.findIndex((d) => d.id === p.id);
-        if (idx < 0) return prev;
-        const next = [...prev];
+      const now = Date.now();
+      const prev = downloadProgressAtRef.current.get(p.id);
+      if (!prev || prev.bytes !== p.bytes_downloaded) {
+        downloadProgressAtRef.current.set(p.id, {
+          bytes: p.bytes_downloaded,
+          at: now,
+        });
+      }
+      setDownloads((prevList) => {
+        const idx = prevList.findIndex((d) => d.id === p.id);
+        if (idx < 0) return prevList;
+        const next = [...prevList];
         next[idx] = {
           ...next[idx],
           bytes_downloaded: p.bytes_downloaded,
@@ -1934,6 +2278,38 @@ function App() {
       } else {
         setActiveId(game.id);
       }
+    });
+  }
+
+  async function confirmRelink() {
+    if (!relinkPrompt?.health.relocate_target_id) {
+      return;
+    }
+    const { game, health } = relinkPrompt;
+    await withBusy(`Relinking ${game.title}…`, async () => {
+      await api.relinkManagedGame(game.id, health.relocate_target_id!);
+      setRelinkPrompt(null);
+      const list = await refreshManaged();
+      await scan();
+      const relinked = list.find((g) => g.id === health.relocate_target_id);
+      if (relinked) {
+        await openGame(relinked, "mods");
+      }
+      setNotice({
+        kind: "ok",
+        message: `${game.title} relinked to the new install folder.`,
+      });
+    });
+  }
+
+  async function unmanageFromLibrary(game: ManagedGame) {
+    await withBusy("Removing…", async () => {
+      await api.unmanageGame(game.id);
+      if (libraryDetail?.game.id === game.id) {
+        closeLibraryDetail();
+      }
+      await refreshManaged();
+      await scan();
     });
   }
 
@@ -2490,25 +2866,16 @@ function App() {
     }
   }
 
-  function closeBrowseDetail() {
-    setBrowseDetail(null);
-    setModDetail(null);
-    setTsDetail(null);
-    setTsVersion("");
-    setModioDetail(null);
-    setModioFiles([]);
-    setModFiles([]);
-    setCollectionModFiles([]);
-    setCollectionDetail(null);
-  }
-
   async function openGame(game: ManagedGame, detailTab: GameDetailTab = "info") {
     await api.setActiveGame(game.id);
     setActiveId(game.id);
+    resetBrowseState();
+    resetLibraryEphemeralState();
     setSourceFilter((prev) =>
       clampCatalogSourceFilter(prev, game, browseMode),
     );
     setLibraryDetail({ game, tab: detailTab });
+    setGameSavedDetail(null);
     setUeDomainEdit(game.nexus_domain);
     setUeProjectEdit(game.project_name ?? "");
     setTsCommunityEdit(game.thunderstore_community ?? "");
@@ -2519,6 +2886,9 @@ function App() {
     );
     setTab("library");
     setGameInfo(null);
+    if (detailTab === "collections") {
+      void refreshSavedCollections();
+    }
     if (game.nexus_domain) {
       try {
         setGameInfo(await api.getGame(game.nexus_domain));
@@ -2558,12 +2928,19 @@ function App() {
   }
 
   function setGameDetailTab(detailTab: GameDetailTab) {
+    if (detailTab !== "collections") {
+      setGameSavedDetail(null);
+    }
     setLibraryDetail((prev) => (prev ? { ...prev, tab: detailTab } : prev));
+    if (detailTab === "collections") {
+      void refreshSavedCollections();
+    }
   }
 
   function closeLibraryDetail() {
     setLibraryDetail(null);
     setGameInfo(null);
+    setGameSavedDetail(null);
   }
 
   async function installModioFile(fileId?: number | null, version?: string | null) {
@@ -2901,6 +3278,29 @@ function App() {
     }
   }
 
+  async function openGameSavedCollection(id: string) {
+    setBusy("Loading collection…");
+    setError(null);
+    try {
+      const detail = await api.getSavedCollection(id);
+      setGameSavedDetail(detail);
+      setGameSavedRename(detail.entry.name);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function installGameSavedCollection() {
+    if (!gameSavedDetail || !libraryDetail) return;
+    await runUnifiedImport(
+      libraryDetail.game.id,
+      gameSavedDetail.entry.code,
+      gameSavedDetail.entry.name,
+    );
+  }
+
   function savedCollectionMatchesGame(
     entry: SavedCollectionEntry,
     game: ManagedGame,
@@ -2931,6 +3331,13 @@ function App() {
     if (entry.source_game_id && entry.source_game_id === game.id) return true;
     return false;
   }
+
+  const gameSavedCollections = useMemo(() => {
+    if (!libraryDetail) return [];
+    return savedCollections.filter((c) =>
+      savedCollectionMatchesGame(c, libraryDetail.game),
+    );
+  }, [savedCollections, libraryDetail]);
 
   function shareModLabel(m: ShareModEntry): string {
     return (
@@ -3230,6 +3637,7 @@ function App() {
               ["collections", "Collections"],
               ["browse", "Browse"],
               ["downloads", "Downloads"],
+              ...(settings?.platform_linux ? ([["tools", "Tools"]] as const) : []),
               ["settings", "Settings"],
             ] as const
           ).map(([id, label]) => (
@@ -3243,6 +3651,9 @@ function App() {
                 if (id === "collections") {
                   void refreshSavedCollections();
                   setSavedDetail(null);
+                }
+                if (id === "browse") {
+                  resetBrowseState();
                 }
               }}
             >
@@ -3452,13 +3863,56 @@ function App() {
                       >
                         Mods
                       </button>
+                      <button
+                        className={
+                          libraryDetail.tab === "collections" ? "active" : ""
+                        }
+                        onClick={() => setGameDetailTab("collections")}
+                      >
+                        Collections
+                      </button>
+                      {settings?.platform_linux && (
+                        <button
+                          className={libraryDetail.tab === "tools" ? "active" : ""}
+                          onClick={() => setGameDetailTab("tools")}
+                        >
+                          Tools
+                        </button>
+                      )}
                     </div>
                     <button
                       className="danger"
                       onClick={() =>
                         withBusy("Removing…", async () => {
                           await api.unmanageGame(libraryDetail.game.id);
-                          await refreshManaged();
+                          const list = await refreshManaged();
+                          const settings = await refreshSettings();
+                          const next =
+                            list.find((g) => g.id === settings.last_active_game_id) ??
+                            list[0] ??
+                            null;
+                          if (next) {
+                            setActiveId(next.id);
+                            setLibraryDetail({ game: next, tab: "mods" });
+                            setGameSavedDetail(null);
+                            setMods([]);
+                            setInstalledCollections([]);
+                            setGameInfo(null);
+                            if (next.nexus_domain) {
+                              try {
+                                setGameInfo(await api.getGame(next.nexus_domain));
+                              } catch {
+                                /* Nexus metadata is optional for local game info */
+                              }
+                            }
+                            await refreshMods(next.id);
+                            await refreshCollections(next.id);
+                          } else {
+                            closeLibraryDetail();
+                            setActiveId(null);
+                            setMods([]);
+                            setInstalledCollections([]);
+                          }
                         })
                       }
                     >
@@ -3544,7 +3998,7 @@ function App() {
                   </div>
                 </div>
 
-                {libraryDetail.tab === "info" ? (
+                {libraryDetail.tab === "info" && (
                   <div className="detail-body">
                     <h2>About</h2>
                     <dl className="meta">
@@ -3566,7 +4020,18 @@ function App() {
                         </>
                       )}
                       <dt>Install</dt>
-                      <dd>{libraryDetail.game.install_path}</dd>
+                      <dd>
+                        <button
+                          type="button"
+                          className="linkish path-link"
+                          title="Open in file manager"
+                          onClick={() =>
+                            openPathInExplorer(libraryDetail.game.install_path)
+                          }
+                        >
+                          {libraryDetail.game.install_path}
+                        </button>
+                      </dd>
                       <dt>Plugin</dt>
                       <dd>{libraryDetail.game.plugin_id}</dd>
                       {libraryDetail.game.project_name && (
@@ -3647,7 +4112,8 @@ function App() {
                         </button>
                       </div>
                   </div>
-                ) : (
+                )}
+                {libraryDetail.tab === "mods" && (
                   <div className="detail-body">
                     {(shareExportOpen || shareImportOpen || lastShareCode) && (
                       <div className="profile-import share-panel">
@@ -4035,6 +4501,223 @@ function App() {
                     </ul>
                   </div>
                 )}
+                {libraryDetail.tab === "collections" && (
+                  <div className="detail-body game-saved-collections">
+                    {gameSavedDetail ? (
+                      <>
+                        <div className="panel-head-inline">
+                          <button
+                            type="button"
+                            className="linkish"
+                            onClick={() => setGameSavedDetail(null)}
+                          >
+                            ← Back
+                          </button>
+                          <h2>{gameSavedDetail.entry.name}</h2>
+                        </div>
+                        <p className="note">
+                          {gameSavedDetail.entry.mod_count} mods
+                          {gameSavedDetail.entry.nexus_count
+                            ? ` · ${gameSavedDetail.entry.nexus_count} Nexus`
+                            : ""}
+                          {gameSavedDetail.entry.thunderstore_count
+                            ? ` · ${gameSavedDetail.entry.thunderstore_count} Thunderstore`
+                            : ""}
+                          {gameSavedDetail.entry.modio_count
+                            ? ` · ${gameSavedDetail.entry.modio_count} mod.io`
+                            : ""}
+                        </p>
+                        <label>
+                          Name
+                          <div className="row">
+                            <input
+                              value={gameSavedRename}
+                              onChange={(e) => setGameSavedRename(e.target.value)}
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void (async () => {
+                                  try {
+                                    const updated = await api.renameSavedCollection(
+                                      gameSavedDetail.entry.id,
+                                      gameSavedRename,
+                                    );
+                                    setGameSavedDetail({
+                                      ...gameSavedDetail,
+                                      entry: updated,
+                                    });
+                                    await refreshSavedCollections();
+                                  } catch (e) {
+                                    setError(String(e));
+                                  }
+                                })()
+                              }
+                            >
+                              Rename
+                            </button>
+                          </div>
+                        </label>
+                        <p className="note">
+                          Install into <strong>{libraryDetail.game.title}</strong>
+                        </p>
+                        <div className="actions" style={{ marginBottom: "1rem" }}>
+                          <button
+                            type="button"
+                            onClick={() => void installGameSavedCollection()}
+                          >
+                            Install
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void navigator.clipboard.writeText(
+                                gameSavedDetail.entry.code,
+                              )
+                            }
+                          >
+                            Copy code
+                          </button>
+                          <button
+                            type="button"
+                            className="danger"
+                            onClick={() =>
+                              void (async () => {
+                                if (
+                                  !window.confirm(
+                                    `Delete ${gameSavedDetail.entry.name}?`,
+                                  )
+                                ) {
+                                  return;
+                                }
+                                try {
+                                  await api.deleteSavedCollection(
+                                    gameSavedDetail.entry.id,
+                                  );
+                                  setGameSavedDetail(null);
+                                  await refreshSavedCollections();
+                                } catch (e) {
+                                  setError(String(e));
+                                }
+                              })()
+                            }
+                          >
+                            Delete
+                          </button>
+                        </div>
+                        <h2>Contained mods</h2>
+                        <ul className="list">
+                          {gameSavedDetail.mods.map((m, i) => (
+                            <li key={`${m.s}-${i}`}>
+                              <div>
+                                <strong>{shareModLabel(m)}</strong>
+                                <small>
+                                  {m.s}
+                                  {m.version ? ` · v${m.version}` : ""}
+                                  {m.s === "nexus" && m.mod_id != null
+                                    ? ` · ${m.domain} ${m.mod_id}/${m.file_id}`
+                                    : ""}
+                                  {m.s === "thunderstore"
+                                    ? ` · ${m.community}/${m.namespace}-${m.name}`
+                                    : ""}
+                                  {m.s === "modio"
+                                    ? ` · game ${m.game_id} mod ${m.mod_id}`
+                                    : ""}
+                                </small>
+                              </div>
+                            </li>
+                          ))}
+                          {gameSavedDetail.mods.length === 0 && (
+                            <li className="empty">No mods in this share.</li>
+                          )}
+                        </ul>
+                        <h2>Code</h2>
+                        <textarea
+                          rows={4}
+                          readOnly
+                          value={gameSavedDetail.entry.code}
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <h2>Saved share codes</h2>
+                        <p className="note">
+                          Emperor share codes that match this game (Nexus domain,
+                          Thunderstore community, mod.io ID, or source game). Create
+                          one from Mods → Share loadout, or paste a code under Mods →
+                          Import code → Save only.
+                        </p>
+                        <ul className="list">
+                          {gameSavedCollections.map((c) => (
+                            <li
+                              key={c.id}
+                              className="list-row-clickable"
+                              onClick={() => void openGameSavedCollection(c.id)}
+                            >
+                              <div className="list-row-main">
+                                <strong>{c.name}</strong>
+                                <small>
+                                  {c.mod_count} mods
+                                  {c.game.nexus_domain
+                                    ? ` · ${c.game.nexus_domain}`
+                                    : ""}
+                                  {c.game.thunderstore_community
+                                    ? ` · ${c.game.thunderstore_community}`
+                                    : ""}
+                                  {c.game.modio_game_id
+                                    ? ` · mod.io ${c.game.modio_game_id}`
+                                    : ""}
+                                  {` · ${new Date(c.created_at).toLocaleString()}`}
+                                </small>
+                              </div>
+                              <div
+                                className="actions"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void navigator.clipboard.writeText(c.code)
+                                  }
+                                >
+                                  Copy
+                                </button>
+                                <button
+                                  type="button"
+                                  className="danger"
+                                  onClick={() =>
+                                    void (async () => {
+                                      if (!window.confirm(`Delete ${c.name}?`)) {
+                                        return;
+                                      }
+                                      try {
+                                        await api.deleteSavedCollection(c.id);
+                                        await refreshSavedCollections();
+                                      } catch (err) {
+                                        setError(String(err));
+                                      }
+                                    })()
+                                  }
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </li>
+                          ))}
+                          {gameSavedCollections.length === 0 && (
+                            <li className="empty">
+                              No saved share codes for this game yet. Share a loadout
+                              from Mods or save a code from Import code.
+                            </li>
+                          )}
+                        </ul>
+                      </>
+                    )}
+                  </div>
+                )}
+                {libraryDetail.tab === "tools" && settings?.platform_linux && (
+                  <GameToolsPanel game={libraryDetail.game} />
+                )}
               </>
             ) : (
               <>
@@ -4207,44 +4890,149 @@ function App() {
                     </div>
                   </div>
                 )}
+                {relinkPrompt && (
+                  <div className="panel relink-panel">
+                    <h3>Relink {relinkPrompt.game.title}</h3>
+                    <p className="note">
+                      The install folder moved. Confirming will update the managed
+                      entry and migrate staged mod data to the new game ID.
+                    </p>
+                    <dl className="detail-dl">
+                      <dt>Old path</dt>
+                      <dd>{relinkPrompt.game.install_path}</dd>
+                      <dt>New path</dt>
+                      <dd>{relinkPrompt.health.new_install_path ?? "—"}</dd>
+                    </dl>
+                    <div className="row-actions">
+                      <button type="button" onClick={() => void confirmRelink()}>
+                        Relink
+                      </button>
+                      <button type="button" onClick={() => setRelinkPrompt(null)}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {managed.length > 0 && (
                   <>
                     <h2>Managed</h2>
                     {libraryView === "grid" ? (
                       <div className="media-grid">
-                        {managed.map((g) => (
-                          <MediaCard
-                            key={g.id}
-                            title={g.title}
-                            imageSrc={mediaSrc(g.cover_path)}
-                            onClick={() => openGame(g, "mods")}
-                          />
-                        ))}
+                        {managed.map((g) => {
+                          const health = gameHealthById.get(g.id);
+                          const badge = managedHealthBadge(health);
+                          const actions =
+                            health?.status === "relocate_candidate" ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setRelinkPrompt({
+                                      game: g,
+                                      health,
+                                    })
+                                  }
+                                >
+                                  Relink
+                                </button>
+                                <button
+                                  type="button"
+                                  className="danger"
+                                  onClick={() => void unmanageFromLibrary(g)}
+                                >
+                                  Unmanage
+                                </button>
+                              </>
+                            ) : health?.status === "missing" ? (
+                              <button
+                                type="button"
+                                className="danger"
+                                onClick={() => void unmanageFromLibrary(g)}
+                              >
+                                Unmanage
+                              </button>
+                            ) : undefined;
+                          return (
+                            <MediaCard
+                              key={g.id}
+                              title={g.title}
+                              imageSrc={mediaSrc(g.cover_path)}
+                              badge={badge}
+                              overlay={
+                                health?.status === "missing"
+                                  ? g.install_path
+                                  : health?.new_install_path ?? undefined
+                              }
+                              actions={actions}
+                              onClick={() => openGame(g, "mods")}
+                            />
+                          );
+                        })}
                       </div>
                     ) : (
                       <ul className="list">
-                        {managed.map((g) => (
-                          <li
-                            key={g.id}
-                            className="list-row-clickable"
-                            onClick={() => openGame(g, "mods")}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                openGame(g, "mods");
-                              }
-                            }}
-                            role="button"
-                            tabIndex={0}
-                          >
-                            <div>
-                              <strong>{g.title}</strong>
-                              <small>
-                                {g.launcher} · {g.nexus_domain || g.thunderstore_community || g.plugin_id}
-                              </small>
-                            </div>
-                          </li>
-                        ))}
+                        {managed.map((g) => {
+                          const health = gameHealthById.get(g.id);
+                          const badge = managedHealthBadge(health);
+                          return (
+                            <li
+                              key={g.id}
+                              className="list-row-clickable"
+                              onClick={() => openGame(g, "mods")}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  openGame(g, "mods");
+                                }
+                              }}
+                              role="button"
+                              tabIndex={0}
+                            >
+                              <div>
+                                <strong>{g.title}</strong>
+                                {badge ? (
+                                  <span className="pill warn">{badge}</span>
+                                ) : null}
+                                <small>
+                                  {g.launcher} · {g.nexus_domain || g.thunderstore_community || g.plugin_id}
+                                  {health?.status === "missing"
+                                    ? ` · ${g.install_path}`
+                                    : health?.new_install_path
+                                      ? ` → ${health.new_install_path}`
+                                      : ""}
+                                </small>
+                              </div>
+                              {(health?.status === "relocate_candidate" ||
+                                health?.status === "missing") && (
+                                <div
+                                  className="actions"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {health.status === "relocate_candidate" ? (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setRelinkPrompt({
+                                          game: g,
+                                          health,
+                                        })
+                                      }
+                                    >
+                                      Relink
+                                    </button>
+                                  ) : null}
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    onClick={() => void unmanageFromLibrary(g)}
+                                  >
+                                    Unmanage
+                                  </button>
+                                </div>
+                              )}
+                            </li>
+                          );
+                        })}
                       </ul>
                     )}
                   </>
@@ -5758,15 +6546,73 @@ function App() {
             onCancel={() => cancelAssistQueue()}
             onCancelRemaining={() => cancelRemainingBatch()}
             onCancelDownload={(id) => cancelOneDownload(id)}
+            onRestartDownload={(id) => restartOneDownload(id)}
+            onForceResetDownload={(id) => forceResetOneDownload(id)}
+            onRetryAssistOpening={() => retryAssistOpening()}
+            isDownloadStuck={isDownloadStuck}
+            onClearRecent={() => clearRecentDownloads()}
+            onRemoveDownload={(id) => removeOneDownload(id)}
             onPauseDownload={(id) => pauseOneDownload(id)}
             onResumeDownload={(id) => resumeOneDownload(id)}
             onAssistHost={handleAssistHost}
           />
         )}
 
+        {tab === "tools" && (
+          <ToolsErrorBoundary>
+            <ToolsWorkspace />
+          </ToolsErrorBoundary>
+        )}
+
         {tab === "settings" && (
           <section className="panel">
             <h1>Settings</h1>
+            <div className="setting-block">
+              <span>App updates</span>
+              <p className="note">
+                Current version:{" "}
+                <strong>v{appInfo?.version ?? appUpdate?.current_version ?? "…"}</strong>
+                {appUpdate?.latest_version
+                  ? ` · Latest on GitHub: v${appUpdate.latest_version}`
+                  : ""}
+              </p>
+              {appUpdateMessage && <p className="note">{appUpdateMessage}</p>}
+              {appUpdate?.update_available && !appUpdate.asset_name && (
+                <p className="note">
+                  A newer release exists, but no installable package was found for this
+                  platform. Use the release page to download manually.
+                </p>
+              )}
+              <div className="actions">
+                <button
+                  type="button"
+                  disabled={checkingAppUpdate || installingAppUpdate}
+                  onClick={() => void checkForAppUpdate(false)}
+                >
+                  {checkingAppUpdate ? "Checking…" : "Check for updates"}
+                </button>
+                {appUpdate?.update_available && appUpdate.asset_name && (
+                  <button
+                    type="button"
+                    disabled={checkingAppUpdate || installingAppUpdate}
+                    onClick={() => void installAppUpdate()}
+                  >
+                    {installingAppUpdate
+                      ? "Downloading…"
+                      : `Download & Install v${appUpdate.latest_version}`}
+                  </button>
+                )}
+                {appUpdate?.release_url && (
+                  <button
+                    type="button"
+                    className="linkish"
+                    onClick={() => void openUrl(appUpdate.release_url!)}
+                  >
+                    Open release page
+                  </button>
+                )}
+              </div>
+            </div>
             <div className="setting-block">
               <span>Theme</span>
               <div className="segment">
@@ -5895,5 +6741,3 @@ function App() {
     </div>
   );
 }
-
-export default App;

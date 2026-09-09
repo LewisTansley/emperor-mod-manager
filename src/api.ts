@@ -11,6 +11,7 @@ import type {
   DeployResult,
   DetectedGame,
   DownloadItem,
+  GameHealth,
   GameInfo,
   InstalledCollection,
   ManagedGame,
@@ -36,9 +37,21 @@ import type {
   ShareImportResult,
   SavedCollectionEntry,
   SavedCollectionDetail,
+  ToolsStatusResponse,
+  ToolUpdatesResponse,
+  LsfgVkConfig,
+  AutoHdrVkConfig,
+  GameToolOverrides,
+  GameToolsResponse,
+  AppInfo,
+  AppUpdateStatus,
+  AppInstallResult,
 } from "./types";
 
 export const api = {
+  getAppInfo: () => invoke<AppInfo>("get_app_info"),
+  checkAppUpdate: () => invoke<AppUpdateStatus>("check_app_update"),
+  installAppUpdate: () => invoke<AppInstallResult>("install_app_update"),
   getSettings: () => invoke<Settings>("get_settings"),
   setApiKey: (key: string) => invoke<NexusUser>("set_api_key", { key }),
   validateUser: () => invoke<NexusUser>("validate_user"),
@@ -56,6 +69,9 @@ export const api = {
   recoverLegacyModData: () =>
     invoke<RecoveryReport>("recover_legacy_mod_data"),
   scanGames: () => invoke<DetectedGame[]>("scan_games"),
+  getGameHealth: () => invoke<GameHealth[]>("get_game_health"),
+  relinkManagedGame: (oldId: string, newId: string) =>
+    invoke<ManagedGame>("relink_managed_game", { oldId, newId }),
   listManaged: () => invoke<ManagedGame[]>("list_managed"),
   manageGame: (game: {
     id: string;
@@ -347,9 +363,31 @@ export const api = {
   deployMods: (gameId: string) => invoke<DeployResult>("deploy_mods", { gameId }),
   purgeMods: (gameId: string) => invoke<void>("purge_mods", { gameId }),
   listDownloads: () => invoke<DownloadItem[]>("list_downloads"),
+  clearRecentDownloads: () => invoke<void>("clear_recent_downloads"),
+  removeDownload: (id: string) => invoke<void>("remove_download", { id }),
   cancelDownload: (id: string) => invoke<void>("cancel_download", { id }),
   cancelDownloadBatch: (batchId: string) =>
     invoke<void>("cancel_download_batch", { batchId }),
   pauseDownload: (id: string) => invoke<void>("pause_download", { id }),
   resumeDownload: (id: string) => invoke<void>("resume_download", { id }),
+  restartDownload: (id: string) => invoke<void>("restart_download", { id }),
+  forceResetDownload: (id: string) => invoke<void>("force_reset_download", { id }),
+  getToolsStatus: () => invoke<ToolsStatusResponse>("get_tools_status"),
+  checkToolUpdates: () => invoke<ToolUpdatesResponse>("check_tool_updates"),
+  installTool: (tool: "lsfg_vk" | "autohdr_vk") =>
+    invoke<ToolsStatusResponse>("install_tool", { tool }),
+  getLsfgVkConfig: () => invoke<LsfgVkConfig>("get_lsfg_vk_config"),
+  setLsfgVkConfig: (config: LsfgVkConfig) =>
+    invoke<void>("set_lsfg_vk_config", { config }),
+  getAutohdrVkConfig: () => invoke<AutoHdrVkConfig>("get_autohdr_vk_config"),
+  setAutohdrVkConfig: (config: AutoHdrVkConfig) =>
+    invoke<void>("set_autohdr_vk_config", { config }),
+  detectGameExecutables: (gameId: string) =>
+    invoke<string[]>("detect_game_executables", { gameId }),
+  getGameTools: (gameId: string) => invoke<GameToolsResponse>("get_game_tools", { gameId }),
+  setGameTools: (gameId: string, overrides: GameToolOverrides) =>
+    invoke<GameToolsResponse>("set_game_tools", {
+      request: { game_id: gameId, overrides },
+    }),
+  syncGameTools: (gameId: string) => invoke<GameToolsResponse>("sync_game_tools", { gameId }),
 };

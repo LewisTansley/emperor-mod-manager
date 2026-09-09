@@ -6,6 +6,8 @@ use serde::Serialize;
 
 use crate::games::{match_plugin, GamePluginInfo};
 
+pub mod reconcile;
+
 #[cfg(target_os = "linux")]
 mod linux;
 // Compile under `test` on non-Windows so pure Steam path/cover helpers are covered in CI.

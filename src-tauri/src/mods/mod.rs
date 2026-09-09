@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
@@ -14,7 +14,8 @@ use walkdir::WalkDir;
 use crate::{
     config::Paths,
     games::{
-        normalize_relative, normalize_staging_root, plugin_by_id, DeployContext, GamePlugin,
+        bepinex_pack_deploy_root, normalize_relative, normalize_staging_root, plugin_by_id,
+        DeployContext, GamePlugin,
     },
 };
 
@@ -714,7 +715,7 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
         .unwrap_or("")
         .to_lowercase();
 
-    match ext.as_str() {
+    let result = match ext.as_str() {
         "zip" => extract_zip(archive, dest),
         "7z" => extract_7z(archive, dest),
         "rar" => extract_rar(archive, dest),
@@ -730,7 +731,110 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
                 bail!("unsupported archive type: .{other}");
             }
         }
+    };
+    result?;
+    repair_backslash_entries(dest)?;
+    Ok(())
+}
+
+/// Normalize a zip/archive entry name into a safe relative path.
+/// Converts Windows `\` separators; rejects `..` and absolute paths.
+pub fn safe_archive_entry_path(name: &str) -> Option<PathBuf> {
+    let normalized = name.replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
     }
+    let mut out = PathBuf::new();
+    for comp in Path::new(trimmed).components() {
+        match comp {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn archive_entry_is_dir(raw_name: &str) -> bool {
+    raw_name.ends_with('/') || raw_name.ends_with('\\')
+}
+
+/// Move files whose names contain literal `\` into a normal directory tree.
+///
+/// Windows-built zips sometimes extract on Linux as flat names like
+/// `BepInEx\plugins\Mod.dll` instead of nested folders.
+pub fn repair_backslash_entries(root: &Path) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+
+    let entries: Vec<_> = fs::read_dir(root)?.filter_map(|e| e.ok()).collect();
+    let mut repairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in &entries {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.contains('\\') {
+            continue;
+        }
+        let rel = normalize_relative(Path::new(&*name_str));
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        repairs.push((entry.path(), root.join(rel)));
+    }
+
+    repairs.sort_by_key(|(_, dest)| std::cmp::Reverse(dest.components().count()));
+    for (src, dest) in repairs {
+        if !src.exists() {
+            continue;
+        }
+        let meta = fs::metadata(&src)?;
+        if meta.is_file() && meta.len() == 0 && dest.is_dir() {
+            fs::remove_file(&src)?;
+            continue;
+        }
+        if dest.exists() && dest.is_dir() && meta.is_file() {
+            let file_name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            fs::rename(&src, dest.join(file_name)).with_context(|| {
+                format!(
+                    "repair backslash file {} into {}",
+                    src.display(),
+                    dest.display()
+                )
+            })?;
+            continue;
+        }
+        if dest.exists() && dest.is_file() && meta.is_file() && meta.len() > 0 {
+            fs::remove_file(&dest)?;
+        } else if dest.exists() && dest.is_file() && meta.is_file() && meta.len() == 0 {
+            fs::remove_file(&src)?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&src, &dest).with_context(|| {
+            format!(
+                "repair backslash path {} -> {}",
+                src.display(),
+                dest.display()
+            )
+        })?;
+    }
+
+    for entry in fs::read_dir(root)?.filter_map(|e| e.ok()) {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            repair_backslash_entries(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
@@ -738,11 +842,14 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file)?;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(p) => dest.join(p),
+        let raw_name = file.name();
+        let is_dir = archive_entry_is_dir(raw_name);
+        let rel = match safe_archive_entry_path(raw_name.trim_end_matches(['/', '\\'])) {
+            Some(p) => p,
             None => continue,
         };
-        if file.name().ends_with('/') {
+        let outpath = dest.join(rel);
+        if is_dir {
             fs::create_dir_all(&outpath)?;
         } else {
             if let Some(parent) = outpath.parent() {
@@ -1065,8 +1172,8 @@ pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn remove_all_mods(paths: &Paths, game_id: &str) -> Result<()> {
-    purge_deploy(paths, game_id)?;
+pub fn remove_all_mods(paths: &Paths, game_id: &str, install_path: Option<&Path>) -> Result<()> {
+    purge_deploy(paths, game_id, install_path)?;
     let order = load_loadorder(paths, game_id)?;
     for m in &order.mods {
         delete_staged_row(m)?;
@@ -1082,21 +1189,186 @@ enum LinkKind {
     Copied,
 }
 
-fn link_or_copy(src: &Path, dest: &Path) -> Result<LinkKind> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+/// Remove a deploy destination without following symlinks.
+fn remove_deploy_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
     }
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || meta.is_file() {
+        fs::remove_file(path)?;
+    } else if meta.is_dir() {
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+/// Ensure `dest` can be created as a directory (remove blocking files/symlinks).
+fn ensure_deploy_dir(dest: &Path) -> Result<()> {
     if dest.exists() {
-        if dest.is_dir() {
-            fs::remove_dir_all(dest)?;
-        } else {
+        let meta = fs::symlink_metadata(dest)?;
+        if meta.file_type().is_symlink() || meta.is_file() {
             fs::remove_file(dest)?;
         }
     }
+    fs::create_dir_all(dest)?;
+    Ok(())
+}
+
+fn ensure_deploy_parent(dest: &Path) -> Result<()> {
+    let Some(parent) = dest.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if parent.exists() {
+        let meta = fs::symlink_metadata(parent)?;
+        if meta.file_type().is_symlink() || meta.is_file() {
+            fs::remove_file(parent)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_points_into(path: &Path, root: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(target) = fs::read_link(path) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        path.parent()
+            .map(|p| p.join(&target))
+            .unwrap_or(target)
+    };
+    resolved.starts_with(root)
+}
+
+#[cfg(windows)]
+fn symlink_points_into(path: &Path, root: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(target) = fs::read_link(path) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        path.parent()
+            .map(|p| p.join(&target))
+            .unwrap_or(target)
+    };
+    resolved.starts_with(root)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn symlink_points_into(_path: &Path, _root: &Path) -> bool {
+    false
+}
+
+fn prune_empty_dirs_up(install_path: &Path, mut dir: PathBuf) {
+    while dir.starts_with(install_path) && dir != install_path {
+        let is_empty = fs::read_dir(&dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if is_empty {
+            let _ = fs::remove_dir(&dir);
+            if !dir.pop() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// Remove deployed symlinks under the game folder that point into app data.
+/// Covers failed deploys where `deployed.json` was never written.
+pub fn purge_install_symlinks(install_path: &Path, data_dir: &Path) -> Result<usize> {
+    if !install_path.is_dir() {
+        return Ok(0);
+    }
+    let mut symlinks: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(install_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if symlink_points_into(path, data_dir) {
+            symlinks.push(path.to_path_buf());
+        }
+    }
+    symlinks.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    let mut removed = 0usize;
+    for path in symlinks {
+        if fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            if let Some(parent) = path.parent() {
+                fs::remove_file(&path)?;
+                prune_empty_dirs_up(install_path, parent.to_path_buf());
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    device_id(a).zip(device_id(b)).map(|(da, db)| da == db).unwrap_or(false)
+}
+
+fn device_id(path: &Path) -> Option<u64> {
+    let probe = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(probe).ok().map(|m| m.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = probe;
+        None
+    }
+}
+
+fn link_or_copy(src: &Path, dest: &Path) -> Result<LinkKind> {
+    ensure_deploy_parent(dest)?;
+    if dest.exists() {
+        remove_deploy_path(dest)?;
+    }
+    if let Some(parent) = dest.parent() {
+        ensure_deploy_dir(parent)?;
+    }
     // Hardlink files; directories are created normally and children linked.
     if src.is_dir() {
-        fs::create_dir_all(dest)?;
+        ensure_deploy_dir(dest)?;
         return Ok(LinkKind::HardlinkOrSymlink);
+    }
+    let is_dll = src
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"));
+    if is_dll && !same_filesystem(src, dest) {
+        fs::copy(src, dest)?;
+        return Ok(LinkKind::Copied);
     }
     match fs::hard_link(src, dest) {
         Ok(()) => Ok(LinkKind::HardlinkOrSymlink),
@@ -1133,28 +1405,34 @@ fn symlink_file(_src: &Path, dest: &Path) -> std::io::Result<()> {
     ))
 }
 
-pub fn purge_deploy(paths: &Paths, game_id: &str) -> Result<()> {
+pub fn purge_deploy(
+    paths: &Paths,
+    game_id: &str,
+    install_path: Option<&Path>,
+) -> Result<()> {
     let manifest_path = paths.deploy_manifest(game_id);
-    if !manifest_path.exists() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(&manifest_path)?;
-    let manifest: DeployManifest = serde_json::from_str(&raw)?;
-    // Remove files first, then empty dirs (reverse sort by path length)
-    let mut entries = manifest.paths;
-    entries.sort_by_key(|p| std::cmp::Reverse(p.len()));
-    for p in entries {
-        let path = PathBuf::from(&p);
-        if path.is_file() || path.is_symlink() {
-            let _ = fs::remove_file(&path);
-        } else if path.is_dir() {
-            let _ = fs::remove_dir(&path); // only if empty
+    if manifest_path.exists() {
+        let raw = fs::read_to_string(&manifest_path)?;
+        let manifest: DeployManifest = serde_json::from_str(&raw)?;
+        // Remove files first, then empty dirs (reverse sort by path length)
+        let mut entries = manifest.paths;
+        entries.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        for p in entries {
+            let path = PathBuf::from(&p);
+            if path.is_symlink() || path.is_file() {
+                let _ = fs::remove_file(&path);
+            } else if path.is_dir() {
+                let _ = fs::remove_dir(&path); // only if empty
+            }
         }
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&DeployManifest::default())?,
+        )?;
     }
-    fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&DeployManifest::default())?,
-    )?;
+    if let Some(install) = install_path {
+        purge_install_symlinks(install, &paths.data_dir)?;
+    }
     Ok(())
 }
 
@@ -1182,7 +1460,7 @@ pub fn deploy(
     warnings.extend(plugin.prepare_deploy(install_path)?);
     warnings.extend(plugin.preflight_warnings_ctx(install_path, &base_ctx));
 
-    purge_deploy(paths, game_id)?;
+    purge_deploy(paths, game_id, Some(install_path))?;
 
     let mut order = load_loadorder(paths, game_id)?;
     order.mods.sort_by_key(|m| m.order);
@@ -1206,6 +1484,12 @@ pub fn deploy(
             warnings.push(msg);
             continue;
         }
+        if let Err(e) = repair_backslash_entries(&staging) {
+            warnings.push(format!(
+                "Could not normalize Windows-style paths for {}: {e:#}",
+                staged.name
+            ));
+        }
         let root = normalize_staging_root(&staging, plugin)?;
         warnings.extend(plugin.staging_deploy_warnings(&root, &staged.name));
         let to_root = plugin.deploys_to_install_root(&root);
@@ -1217,10 +1501,15 @@ pub fn deploy(
                 enabled_mod_folders.push(folder_name);
             }
         }
+        let deploy_root = if to_root {
+            bepinex_pack_deploy_root(&root)
+        } else {
+            root.clone()
+        };
         let (files, copied) = deploy_tree(
             plugin,
             install_path,
-            &root,
+            &deploy_root,
             &staged.name,
             project_name,
             &mut deployed,
@@ -1300,7 +1589,7 @@ fn deploy_tree(
             plugin.resolve_deploy_root_ctx(install_path, &deploy_rel, &ctx)?
         };
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&dest)?;
+            ensure_deploy_dir(&dest)?;
             deployed.paths.push(dest.to_string_lossy().to_string());
             continue;
         }
@@ -1421,6 +1710,7 @@ mod tests {
         std::fs::write(staging.join("Cool.archive"), b"a").unwrap();
         // Literal backslash in filename as produced by some Windows zips on Linux.
         std::fs::write(staging.join(r"r6\scripts\Mod\mod.reds"), b"reds").unwrap();
+        repair_backslash_entries(&staging).unwrap();
 
         save_loadorder(
             &paths,
@@ -1449,6 +1739,382 @@ mod tests {
             .join("archive/pc/mod/Cool.archive")
             .exists());
         assert!(install.path().join("r6/scripts/Mod/mod.reds").exists());
+    }
+
+    #[test]
+    fn repair_backslash_entries_builds_tree() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join(r"BepInEx\plugins\"), b"").unwrap();
+        std::fs::write(
+            staging
+                .path()
+                .join(r"BepInEx\plugins\DarkMode\DarkMode.dll"),
+            b"dll",
+        )
+        .unwrap();
+
+        repair_backslash_entries(staging.path()).unwrap();
+
+        assert!(staging.path().join("BepInEx/plugins").is_dir());
+        assert!(staging
+            .path()
+            .join("BepInEx/plugins/DarkMode/DarkMode.dll")
+            .is_file());
+    }
+
+    #[test]
+    fn deploy_bepinex_repaired_backslash_plugin() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_bepinex";
+        let install = tempfile::tempdir().unwrap();
+        let staging = paths.mods_dir(game_id).join("DarkMode_1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(r"BepInEx\plugins\"), b"").unwrap();
+        std::fs::write(
+            staging.join(r"BepInEx\plugins\DarkMode\DarkMode.dll"),
+            b"dll",
+        )
+        .unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "1".into(),
+                    name: "DarkMode".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "big-walk".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+        assert!(result.file_count >= 1, "{:?}", result.warnings);
+        let plugins = install.path().join("BepInEx/plugins");
+        assert!(plugins.is_dir(), "plugins should be a directory, not a symlink to a file");
+        assert!(plugins.join("DarkMode/DarkMode.dll").exists()
+            || plugins.join("DarkMode/DarkMode/DarkMode.dll").exists());
+    }
+
+    #[test]
+    fn safe_archive_entry_path_normalizes_backslashes() {
+        assert_eq!(
+            safe_archive_entry_path(r"BepInEx\plugins\Mod.dll"),
+            Some(PathBuf::from("BepInEx/plugins/Mod.dll"))
+        );
+        assert!(safe_archive_entry_path(r"..\escape").is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn purge_install_symlinks_without_manifest() {
+        let (_tmp, paths) = test_paths();
+        let install = tempfile::tempdir().unwrap();
+        let staging = paths.mods_dir("bw").join("Mod_1");
+        std::fs::create_dir_all(staging.join("BepInEx/plugins/Mod")).unwrap();
+        std::fs::write(staging.join("BepInEx/plugins/Mod/Mod.dll"), b"dll").unwrap();
+        std::fs::write(staging.join("README.md"), b"readme").unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx")).unwrap();
+        std::os::unix::fs::symlink(
+            staging.join("BepInEx/plugins"),
+            install.path().join("BepInEx/plugins"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            staging.join("README.md"),
+            install.path().join("README.md"),
+        )
+        .unwrap();
+
+        let removed = purge_install_symlinks(install.path(), &paths.data_dir).unwrap();
+        assert!(removed >= 2, "removed {removed}");
+        assert!(!install.path().join("BepInEx/plugins").exists());
+        assert!(!install.path().join("README.md").exists());
+        assert!(staging.join("BepInEx/plugins/Mod/Mod.dll").is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deploy_after_orphaned_symlinks() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_orphan";
+        let install = tempfile::tempdir().unwrap();
+        let staging = paths.mods_dir(game_id).join("BigDart_1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("BigDart.dll"), b"dll").unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx")).unwrap();
+        std::os::unix::fs::symlink(
+            &staging,
+            install.path().join("BepInEx/plugins"),
+        )
+        .unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "1".into(),
+                    name: "BigDart".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "big-walk".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        purge_deploy(&paths, game_id, Some(install.path())).unwrap();
+        let result = deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+        assert!(result.file_count >= 1, "{:?}", result.warnings);
+        let plugins = install.path().join("BepInEx/plugins");
+        assert!(plugins.is_dir());
+        assert!(
+            plugins.join("BigDart.dll").is_file()
+                || plugins.join("BigDart/BigDart.dll").is_file()
+                || plugins.join("BigDart_1/BigDart.dll").is_file()
+        );
+    }
+
+    #[test]
+    fn deploy_bepinex_plugins_under_bepinexpack() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_pack";
+        let install = tempfile::tempdir().unwrap();
+
+        let pack_staging = paths.mods_dir(game_id).join("BepInExPack_1");
+        std::fs::create_dir_all(pack_staging.join("BepInExPack").join("BepInEx").join("core"))
+            .unwrap();
+        std::fs::write(pack_staging.join("BepInExPack").join("winhttp.dll"), b"x").unwrap();
+        std::fs::write(
+            pack_staging.join("BepInExPack").join("doorstop_config.ini"),
+            b"target_assembly = BepInEx\\core\\BepInEx.Unity.IL2CPP.dll\n",
+        )
+        .unwrap();
+
+        let mod_staging = paths.mods_dir(game_id).join("BigDart_1");
+        std::fs::create_dir_all(&mod_staging).unwrap();
+        std::fs::write(mod_staging.join("BigDart.dll"), b"dll").unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![
+                    StagedMod {
+                        id: "pack".into(),
+                        name: "BepInExPack".into(),
+                        source: ModSource::Thunderstore,
+                        domain: "big-walk".into(),
+                        staging_path: pack_staging.to_string_lossy().into(),
+                        enabled: true,
+                        order: 1,
+                        ..Default::default()
+                    },
+                    StagedMod {
+                        id: "dart".into(),
+                        name: "BigDart".into(),
+                        source: ModSource::Thunderstore,
+                        domain: "big-walk".into(),
+                        staging_path: mod_staging.to_string_lossy().into(),
+                        enabled: true,
+                        order: 2,
+                        ..Default::default()
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+        assert!(result.file_count >= 2, "{:?}", result.warnings);
+        assert!(install.path().join("winhttp.dll").is_file());
+        assert!(install.path().join("BepInEx").join("core").is_dir());
+        let plugins = install.path().join("BepInEx").join("plugins");
+        assert!(plugins.is_dir(), "plugins should be under flat BepInEx");
+        assert!(
+            plugins.join("BigDart.dll").is_file()
+                || plugins.join("BigDart/BigDart.dll").is_file()
+                || plugins.join("BigDart_1/BigDart.dll").is_file()
+        );
+        assert!(!install.path().join("BepInExPack").join("winhttp.dll").exists());
+    }
+
+    #[test]
+    fn deploy_bepinexpack_flattens_thunderstore_layout() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_flat_pack";
+        let install = tempfile::tempdir().unwrap();
+
+        let pack_staging = paths.mods_dir(game_id).join("BepInExPack_1");
+        std::fs::create_dir_all(pack_staging.join("BepInExPack").join("BepInEx").join("core"))
+            .unwrap();
+        std::fs::write(pack_staging.join("BepInExPack").join("winhttp.dll"), b"x").unwrap();
+        std::fs::write(pack_staging.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(pack_staging.join("icon.png"), b"png").unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "pack".into(),
+                    name: "BepInExPack".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "big-walk".into(),
+                    staging_path: pack_staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+        assert!(install.path().join("winhttp.dll").is_file());
+        assert!(install.path().join("BepInEx").join("core").is_dir());
+        assert!(!install.path().join("manifest.json").exists());
+        assert!(!install.path().join("icon.png").exists());
+        assert!(!install.path().join("BepInExPack").join("winhttp.dll").exists());
+    }
+
+    #[test]
+    fn deploy_ror2_plugins_prefix_without_wrap() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "ror2_plugins";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("R2API_1");
+        std::fs::create_dir_all(staging.join("plugins").join("R2API.Legacy")).unwrap();
+        std::fs::write(
+            staging
+                .join("plugins")
+                .join("R2API.Legacy")
+                .join("R2API.dll"),
+            b"dll",
+        )
+        .unwrap();
+        std::fs::write(staging.join("manifest.json"), b"{}").unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "r2api".into(),
+                    name: "R2API".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "riskofrain2".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "riskofrain2", install.path(), None).unwrap();
+        assert!(result.file_count >= 1, "{:?}", result.warnings);
+        let dll = install
+            .path()
+            .join("BepInEx")
+            .join("plugins")
+            .join("R2API.Legacy")
+            .join("R2API.dll");
+        assert!(
+            dll.is_file(),
+            "expected flat plugins layout, got {:?}",
+            std::fs::read_dir(install.path().join("BepInEx").join("plugins"))
+                .map(|d| d
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name())
+                    .collect::<Vec<_>>())
+                .ok()
+        );
+        assert!(
+            !install
+                .path()
+                .join("BepInEx")
+                .join("plugins")
+                .join("R2API")
+                .join("plugins")
+                .exists()
+                && !install
+                    .path()
+                    .join("BepInEx")
+                    .join("plugins")
+                    .join("R2API_1")
+                    .join("plugins")
+                    .exists(),
+            "must not double-wrap plugins/"
+        );
+    }
+
+    #[test]
+    fn deploy_bepinex_plugin_tree_under_bepinexpack() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_plugin_tree";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+
+        let mod_staging = paths.mods_dir(game_id).join("DarkMode_1");
+        std::fs::create_dir_all(
+            mod_staging
+                .join("BepInEx")
+                .join("plugins")
+                .join("BigWalk.DarkMode"),
+        )
+        .unwrap();
+        std::fs::write(
+            mod_staging
+                .join("BepInEx")
+                .join("plugins")
+                .join("BigWalk.DarkMode")
+                .join("BigWalk.DarkMode.dll"),
+            b"dll",
+        )
+        .unwrap();
+        std::fs::write(mod_staging.join("manifest.json"), b"{}").unwrap();
+
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "darkmode".into(),
+                    name: "DarkMode".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "big-walk".into(),
+                    staging_path: mod_staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+        assert!(result.file_count >= 1, "{:?}", result.warnings);
+        let correct = install
+            .path()
+            .join("BepInEx")
+            .join("plugins")
+            .join("BigWalk.DarkMode")
+            .join("BigWalk.DarkMode.dll");
+        assert!(correct.is_file(), "expected plugin at {}", correct.display());
     }
 
     #[test]
