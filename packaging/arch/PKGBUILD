@@ -1,6 +1,6 @@
 # Maintainer: emperor-mod-manager contributors <https://github.com/LewisTansley/emperor-mod-manager>
 pkgname=emperor-mod-manager-bin
-pkgver=0.4.0
+pkgver=0.4.5
 pkgrel=1
 pkgdesc="Mod manager for Nexus Mods, Thunderstore and mod.io"
 arch=('x86_64')
