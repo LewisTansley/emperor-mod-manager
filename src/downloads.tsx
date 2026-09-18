@@ -153,7 +153,7 @@ type DownloadsWorkspaceProps = {
   onForceResetDownload: (id: string) => void;
   onRetryAssistOpening: () => void;
   isDownloadStuck: (id: string, status: string) => boolean;
-  onClearRecent: () => void;
+  onClearRecent: (ids: string[]) => void;
   onRemoveDownload: (id: string) => void;
   onPauseDownload: (id: string) => void;
   onResumeDownload: (id: string) => void;
@@ -344,7 +344,10 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
             <>
               <div className="downloads-recent-head">
                 <h2 className="downloads-recent-heading">Recent</h2>
-                <button type="button" onClick={onClearRecent}>
+                <button
+                  type="button"
+                  onClick={() => onClearRecent(recentDownloads.map((d) => d.id))}
+                >
                   Clear
                 </button>
               </div>

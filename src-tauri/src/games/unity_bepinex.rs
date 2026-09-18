@@ -35,7 +35,22 @@ const DOORSTOP_FILES: &[&str] = &[
     "winmm.dll",
     "doorstop_config.ini",
     ".doorstop_version",
-    "changelog.txt",
+];
+
+/// Subdirectories BepInEx itself loads from, relative to the `BepInEx/` root.
+const BEPINEX_SUBDIRS: &[&str] = &["plugins", "patchers", "config", "core", "monomod", "cache"];
+
+/// Thunderstore package metadata that BepInEx never loads. Kept for wrapped mods
+/// (BepInEx.GUI reads `manifest.json` next to a plugin to show "TS Manifest"),
+/// dropped when a mod merges into the shared `BepInEx/` tree.
+const THUNDERSTORE_METADATA: &[&str] = &[
+    "manifest.json",
+    "icon.png",
+    "readme.md",
+    "changelog.md",
+    "license",
+    "license.md",
+    "license.txt",
 ];
 
 /// Seeded Unity / BepInEx titles with Nexus domain + Thunderstore community.
@@ -207,7 +222,11 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         display_name: "Hollow Knight: Silksong",
         nexus_domain: "hollowknightsilksong",
         thunderstore_community: "hollow-knight-silksong",
-        match_names: &["silksong", "hollow knight: silksong", "hollowknightsilksong"],
+        match_names: &[
+            "silksong",
+            "hollow knight: silksong",
+            "hollowknightsilksong",
+        ],
     },
 ];
 
@@ -486,16 +505,50 @@ fn dir_contains_dll(dir: &Path) -> bool {
     false
 }
 
-/// True when content is already laid out as `BepInEx/plugins/...`.
+/// True when content is already laid out as `BepInEx/<plugins|patchers|config|...>`.
+/// Such trees merge into the game's BepInEx root; wrapping them would bury a
+/// patcher at `BepInEx/plugins/<mod>/BepInEx/patchers/...` where nothing loads it.
 pub fn looks_like_bepinex_plugin_tree(content_root: &Path) -> bool {
-    content_root.join("BepInEx").join("plugins").is_dir()
+    let root = content_root.join("BepInEx");
+    if !root.is_dir() {
+        return false;
+    }
+    BEPINEX_SUBDIRS.iter().any(|name| root.join(name).is_dir())
+}
+
+/// Root-level Thunderstore metadata that must not be linked next to a merged tree.
+fn is_thunderstore_metadata_root_file(relative: &Path) -> bool {
+    let mut parts = relative.components();
+    let Some(Component::Normal(first)) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let name = first.to_string_lossy().to_lowercase();
+    THUNDERSTORE_METADATA.contains(&name.as_str())
+}
+
+/// Skip Thunderstore metadata for mods that merge into the shared `BepInEx/` tree,
+/// otherwise every package drops a `manifest.json` / `icon.png` into `BepInEx/plugins/`.
+fn should_deploy_bepinex_file(content_root: Option<&Path>, relative: &Path) -> bool {
+    let Some(content_root) = content_root else {
+        return true;
+    };
+    if should_wrap_bepinex_mod(content_root) {
+        return true;
+    }
+    !is_thunderstore_metadata_root_file(relative)
 }
 
 fn should_wrap_bepinex_mod(content_root: &Path) -> bool {
     // Thunderstore layouts that already use plugins/ or patchers/ must map via
     // resolve_bepinex_deploy (BepInEx/plugins/...) — wrapping would nest them as
     // BepInEx/plugins/<mod>/plugins/...
-    if content_root.join("plugins").is_dir() || content_root.join("patchers").is_dir() {
+    if BEPINEX_SUBDIRS
+        .iter()
+        .any(|name| content_root.join(name).is_dir())
+    {
         return false;
     }
     !looks_like_bepinex_pack(content_root)
@@ -510,9 +563,9 @@ fn dir_has_entries(path: &Path) -> bool {
 }
 
 fn doorstop_dll_at_root(install_path: &Path) -> bool {
-    DOORSTOP_FILES.iter().any(|name| {
-        name.ends_with(".dll") && install_path.join(name).is_file()
-    })
+    DOORSTOP_FILES
+        .iter()
+        .any(|name| name.ends_with(".dll") && install_path.join(name).is_file())
 }
 
 fn nested_doorstop_dir(install_path: &Path) -> Option<PathBuf> {
@@ -524,7 +577,10 @@ fn nested_doorstop_dir(install_path: &Path) -> Option<PathBuf> {
             continue;
         }
         let path = entry.path();
-        if DOORSTOP_FILES.iter().any(|name| name.ends_with(".dll") && path.join(name).is_file()) {
+        if DOORSTOP_FILES
+            .iter()
+            .any(|name| name.ends_with(".dll") && path.join(name).is_file())
+        {
             return Some(path);
         }
     }
@@ -560,6 +616,96 @@ fn doorstop_target_assembly_warning(install_path: &Path, ini_path: &Path) -> Opt
         }
     }
     None
+}
+
+/// BepInEx.GUI replaces the log console, but only when BepInEx is configured to
+/// show one. A mod set that ships the GUI patcher with `Enabled = false` starts
+/// with no visible console at all, which reads as "mods did not load".
+fn gui_patcher_deployed(bepinex_root: &Path) -> bool {
+    let patchers = bepinex_root.join("patchers");
+    if !patchers.is_dir() {
+        return false;
+    }
+    walkdir::WalkDir::new(&patchers)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            name == "bepinex_gui.exe"
+                || name == "bepinex.gui.loader.dll"
+                || name == "bepinex.gui.patcher.dll"
+        })
+}
+
+const CONSOLE_SECTION: &str = "[Logging.Console]";
+
+fn console_enabled_config(existing: Option<&str>) -> Option<String> {
+    let Some(existing) = existing else {
+        // BepInEx merges its defaults into whatever is already here on startup.
+        return Some(format!("{CONSOLE_SECTION}\nEnabled = true\n"));
+    };
+    let mut out = String::with_capacity(existing.len() + CONSOLE_SECTION.len() + 16);
+    let mut in_section = false;
+    let mut rewrote = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed.eq_ignore_ascii_case(CONSOLE_SECTION);
+        } else if in_section && trimmed.starts_with("Enabled") {
+            if trimmed.split('=').nth(1).map(str::trim) == Some("true") {
+                return None;
+            }
+            out.push_str("Enabled = true\n");
+            rewrote = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !rewrote {
+        out.push_str(&format!("\n{CONSOLE_SECTION}\nEnabled = true\n"));
+    }
+    Some(out)
+}
+
+/// Turn the BepInEx console on when a GUI console patcher is installed.
+pub fn enable_bepinex_console(install_path: &Path) -> Vec<String> {
+    let Some(root) = detect_bepinex_root(install_path) else {
+        return Vec::new();
+    };
+    if !gui_patcher_deployed(&root) {
+        return Vec::new();
+    }
+    let config = root.join("config").join("BepInEx.cfg");
+    let existing = std::fs::read_to_string(&config).ok();
+    let Some(updated) = console_enabled_config(existing.as_deref()) else {
+        return Vec::new();
+    };
+    // Write through a temp file: the deployed config may be a hardlink to the
+    // staged pack, and editing in place would rewrite the staged copy too.
+    let tmp = config.with_extension("cfg.emperor-tmp");
+    let write = std::fs::create_dir_all(config.parent().unwrap_or(&root))
+        .and_then(|()| std::fs::write(&tmp, updated))
+        .and_then(|()| std::fs::rename(&tmp, &config));
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return vec![format!(
+            "Could not enable the BepInEx console in {}: {e}",
+            config.display()
+        )];
+    }
+    Vec::new()
+}
+
+/// Loader-owned directories whose empty leftovers are safe to remove on purge.
+pub fn bepinex_prunable_dirs(install_path: &Path) -> Vec<PathBuf> {
+    let root = detect_bepinex_root(install_path).unwrap_or_else(|| install_path.join("BepInEx"));
+    ["plugins", "patchers", "monomod"]
+        .iter()
+        .map(|name| root.join(name))
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 pub fn bepinex_preflight_warnings(install_path: &Path) -> Vec<String> {
@@ -633,8 +779,8 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
         })
         .collect();
 
-    let bepinex_root = detect_bepinex_root(install_path)
-        .unwrap_or_else(|| install_path.join("BepInEx"));
+    let bepinex_root =
+        detect_bepinex_root(install_path).unwrap_or_else(|| install_path.join("BepInEx"));
     let plugins_dir = bepinex_plugins_dir(install_path);
 
     if parts.is_empty() {
@@ -668,8 +814,8 @@ pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<Pa
         return Ok(out);
     }
 
-    // plugins/ or patchers/ without BepInEx prefix
-    if first_lower == "plugins" || first_lower == "patchers" || first_lower == "config" {
+    // plugins/, patchers/, config/, monomod/ without BepInEx prefix
+    if BEPINEX_SUBDIRS.contains(&first_lower.as_str()) {
         let mut out = bepinex_root;
         for p in &parts {
             out.push(p);
@@ -719,6 +865,18 @@ macro_rules! bepinex_title_plugin {
                 looks_like_bepinex_pack(content_root)
             }
 
+            fn should_deploy_file_ctx(
+                &self,
+                relative: &Path,
+                ctx: &crate::games::DeployContext<'_>,
+            ) -> bool {
+                should_deploy_bepinex_file(ctx.content_root, relative)
+            }
+
+            fn prunable_dirs(&self, install_path: &Path) -> Vec<PathBuf> {
+                bepinex_prunable_dirs(install_path)
+            }
+
             fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
                 bepinex_preflight_warnings(install_path)
             }
@@ -740,6 +898,14 @@ macro_rules! bepinex_title_plugin {
             ) -> Result<PathBuf> {
                 resolve_bepinex_deploy(install_path, relative)
             }
+
+            fn after_deploy(
+                &self,
+                install_path: &Path,
+                _enabled_mod_folders: &[String],
+            ) -> Result<Vec<String>> {
+                Ok(enable_bepinex_console(install_path))
+            }
         }
     };
 }
@@ -751,13 +917,7 @@ bepinex_title_plugin!(
     "lethalcompany",
     &["lethal company", "lethalcompany"]
 );
-bepinex_title_plugin!(
-    ValheimPlugin,
-    "valheim",
-    "Valheim",
-    "valheim",
-    &["valheim"]
-);
+bepinex_title_plugin!(ValheimPlugin, "valheim", "Valheim", "valheim", &["valheim"]);
 bepinex_title_plugin!(
     RiskOfRain2Plugin,
     "riskofrain2",
@@ -837,13 +997,7 @@ bepinex_title_plugin!(
     "repo",
     &["r.e.p.o.", "r.e.p.o", "repo"]
 );
-bepinex_title_plugin!(
-    PeakPlugin,
-    "peak",
-    "PEAK",
-    "peak",
-    &["peak"]
-);
+bepinex_title_plugin!(PeakPlugin, "peak", "PEAK", "peak", &["peak"]);
 bepinex_title_plugin!(
     H3vrPlugin,
     "h3vr",
@@ -863,13 +1017,7 @@ bepinex_title_plugin!(
     "ultrakill",
     &["ultrakill"]
 );
-bepinex_title_plugin!(
-    AtlyssPlugin,
-    "atlyss",
-    "ATLYSS",
-    "atlyss",
-    &["atlyss"]
-);
+bepinex_title_plugin!(AtlyssPlugin, "atlyss", "ATLYSS", "atlyss", &["atlyss"]);
 bepinex_title_plugin!(
     DysonSphereProgramPlugin,
     "dysonsphereprogram",
@@ -889,7 +1037,11 @@ bepinex_title_plugin!(
     "hollowknightsilksong",
     "Hollow Knight: Silksong",
     "hollowknightsilksong",
-    &["silksong", "hollow knight: silksong", "hollowknightsilksong"]
+    &[
+        "silksong",
+        "hollow knight: silksong",
+        "hollowknightsilksong"
+    ]
 );
 
 /// Generic BepInEx plugin for any detected Unity install.
@@ -925,6 +1077,18 @@ impl GamePlugin for BepInExPlugin {
         looks_like_bepinex_pack(content_root)
     }
 
+    fn should_deploy_file_ctx(
+        &self,
+        relative: &Path,
+        ctx: &crate::games::DeployContext<'_>,
+    ) -> bool {
+        should_deploy_bepinex_file(ctx.content_root, relative)
+    }
+
+    fn prunable_dirs(&self, install_path: &Path) -> Vec<PathBuf> {
+        bepinex_prunable_dirs(install_path)
+    }
+
     fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
         bepinex_preflight_warnings(install_path)
     }
@@ -941,6 +1105,14 @@ impl GamePlugin for BepInExPlugin {
 
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
         resolve_bepinex_deploy(install_path, relative)
+    }
+
+    fn after_deploy(
+        &self,
+        install_path: &Path,
+        _enabled_mod_folders: &[String],
+    ) -> Result<Vec<String>> {
+        Ok(enable_bepinex_console(install_path))
     }
 }
 
@@ -960,10 +1132,7 @@ mod tests {
         let dest = plugin
             .resolve_deploy_root(Path::new("/game"), Path::new("CoolMod.dll"))
             .unwrap();
-        assert_eq!(
-            dest,
-            PathBuf::from("/game/BepInEx/plugins/CoolMod.dll")
-        );
+        assert_eq!(dest, PathBuf::from("/game/BepInEx/plugins/CoolMod.dll"));
     }
 
     #[test]
@@ -980,12 +1149,104 @@ mod tests {
     }
 
     #[test]
-    fn preserves_plugins_prefix() {
-        let dest = resolve_bepinex_deploy(
-            Path::new("/game"),
-            Path::new("plugins/MyMod/MyMod.dll"),
+    fn patcher_tree_merges_into_bepinex_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gui = tmp
+            .path()
+            .join("BepInEx")
+            .join("patchers")
+            .join("BepInEx.GUI");
+        fs::create_dir_all(&gui).unwrap();
+        fs::write(gui.join("BepInEx.GUI.Loader.dll"), b"x").unwrap();
+        fs::write(tmp.path().join("manifest.json"), b"{}").unwrap();
+
+        let plugin = RiskOfRain2Plugin;
+        // Wrapping would bury the patcher at BepInEx/plugins/<mod>/BepInEx/patchers.
+        assert!(!plugin.should_wrap_as_mod_folder(tmp.path()));
+        assert!(!plugin.deploys_to_install_root(tmp.path()));
+        let dest = plugin
+            .resolve_deploy_root(
+                Path::new("/game"),
+                Path::new("BepInEx/patchers/BepInEx.GUI/BepInEx.GUI.Loader.dll"),
+            )
+            .unwrap();
+        assert_eq!(
+            dest,
+            PathBuf::from("/game/BepInEx/patchers/BepInEx.GUI/BepInEx.GUI.Loader.dll")
+        );
+
+        let ctx = crate::games::DeployContext {
+            content_root: Some(tmp.path()),
+            ..Default::default()
+        };
+        assert!(!plugin.should_deploy_file_ctx(Path::new("manifest.json"), &ctx));
+        assert!(plugin.should_deploy_file_ctx(
+            Path::new("BepInEx/patchers/BepInEx.GUI/BepInEx.GUI.Loader.dll"),
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn wrapped_mods_keep_their_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("CoolMod.dll"), b"x").unwrap();
+        fs::write(tmp.path().join("manifest.json"), b"{}").unwrap();
+        let ctx = crate::games::DeployContext {
+            content_root: Some(tmp.path()),
+            ..Default::default()
+        };
+        // BepInEx.GUI shows the Thunderstore manifest that sits next to a plugin.
+        assert!(RiskOfRain2Plugin.should_deploy_file_ctx(Path::new("manifest.json"), &ctx));
+    }
+
+    #[test]
+    fn monomod_folder_maps_into_bepinex() {
+        let dest = resolve_bepinex_deploy(Path::new("/game"), Path::new("monomod/Assembly.mm.dll"))
+            .unwrap();
+        assert_eq!(dest, PathBuf::from("/game/BepInEx/monomod/Assembly.mm.dll"));
+    }
+
+    #[test]
+    fn console_config_turns_the_console_on() {
+        let existing = "[Logging.Console]\n\n## Enables showing a console.\nEnabled = false\n\n[Logging.Disk]\nEnabled = true\n";
+        let updated = console_enabled_config(Some(existing)).unwrap();
+        assert!(updated
+            .contains("[Logging.Console]\n\n## Enables showing a console.\nEnabled = true\n"));
+        // The disk logging section keeps its own value.
+        assert!(updated.ends_with("[Logging.Disk]\nEnabled = true\n"));
+        // Already enabled configs are left alone.
+        assert!(console_enabled_config(Some(&updated)).is_none());
+        assert!(console_enabled_config(None)
+            .unwrap()
+            .contains("Enabled = true"));
+    }
+
+    #[test]
+    fn console_is_enabled_when_the_gui_patcher_is_deployed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("BepInEx");
+        fs::create_dir_all(root.join("core")).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(
+            root.join("config").join("BepInEx.cfg"),
+            "[Logging.Console]\nEnabled = false\n",
         )
         .unwrap();
+        assert!(enable_bepinex_console(tmp.path()).is_empty());
+        let cfg = || fs::read_to_string(root.join("config").join("BepInEx.cfg")).unwrap();
+        assert!(cfg().contains("Enabled = false"), "no GUI installed yet");
+
+        let gui = root.join("patchers").join("BepInEx.GUI");
+        fs::create_dir_all(&gui).unwrap();
+        fs::write(gui.join("bepinex_gui.exe"), b"x").unwrap();
+        assert!(enable_bepinex_console(tmp.path()).is_empty());
+        assert!(cfg().contains("Enabled = true"));
+    }
+
+    #[test]
+    fn preserves_plugins_prefix() {
+        let dest = resolve_bepinex_deploy(Path::new("/game"), Path::new("plugins/MyMod/MyMod.dll"))
+            .unwrap();
         assert_eq!(dest, PathBuf::from("/game/BepInEx/plugins/MyMod/MyMod.dll"));
     }
 
@@ -1024,7 +1285,10 @@ mod tests {
             thunderstore_community_for_plugin("dysonsphereprogram"),
             Some("dyson-sphere-program")
         );
-        assert_eq!(thunderstore_community_for_plugin("bonelab"), Some("bonelab"));
+        assert_eq!(
+            thunderstore_community_for_plugin("bonelab"),
+            Some("bonelab")
+        );
         assert_eq!(
             thunderstore_community_for_plugin("boneworks"),
             Some("boneworks")
@@ -1082,11 +1346,9 @@ mod tests {
                 .join("core"),
         )
         .unwrap();
-        let dest = resolve_bepinex_deploy(
-            install.path(),
-            Path::new("BepInEx/plugins/MyMod/MyMod.dll"),
-        )
-        .unwrap();
+        let dest =
+            resolve_bepinex_deploy(install.path(), Path::new("BepInEx/plugins/MyMod/MyMod.dll"))
+                .unwrap();
         assert_eq!(
             dest,
             install
@@ -1106,7 +1368,11 @@ mod tests {
         let dest = resolve_bepinex_deploy(install.path(), Path::new("CoolMod.dll")).unwrap();
         assert_eq!(
             dest,
-            install.path().join("BepInEx").join("plugins").join("CoolMod.dll")
+            install
+                .path()
+                .join("BepInEx")
+                .join("plugins")
+                .join("CoolMod.dll")
         );
     }
 
@@ -1162,7 +1428,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join("patchers").join("HookGen")).unwrap();
         fs::write(
-            tmp.path().join("patchers").join("HookGen").join("HookGen.dll"),
+            tmp.path()
+                .join("patchers")
+                .join("HookGen")
+                .join("HookGen.dll"),
             b"x",
         )
         .unwrap();
@@ -1266,11 +1535,7 @@ mod tests {
                 .join("core"),
         )
         .unwrap();
-        fs::write(
-            install.path().join("BepInExPack").join("winhttp.dll"),
-            b"x",
-        )
-        .unwrap();
+        fs::write(install.path().join("BepInExPack").join("winhttp.dll"), b"x").unwrap();
         fs::write(
             install
                 .path()

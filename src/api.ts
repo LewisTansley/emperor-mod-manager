@@ -19,6 +19,8 @@ import type {
   ModFileInfo,
   ModioFileInfo,
   ModioModDetail,
+  ModOptionSelection,
+  ModOptionsView,
   ModSearchPage,
   NexusUser,
   OrphanScan,
@@ -356,6 +358,12 @@ export const api = {
     invoke<void>("set_mod_enabled", { gameId, modId, enabled }),
   setLoadOrder: (gameId: string, orderedIds: string[]) =>
     invoke<void>("set_load_order", { gameId, orderedIds }),
+  getModOptions: (gameId: string, modId: string) =>
+    invoke<ModOptionsView | null>("get_mod_options", { gameId, modId }),
+  setModOptions: (gameId: string, modId: string, selection: ModOptionSelection) =>
+    invoke<ModOptionSelection>("set_mod_options", { gameId, modId, selection }),
+  listModsWithOptions: (gameId: string) =>
+    invoke<string[]>("list_mods_with_options", { gameId }),
   removeMod: (gameId: string, modId: string) =>
     invoke<void>("remove_mod", { gameId, modId }),
   removeAllMods: (gameId: string) =>
@@ -363,7 +371,8 @@ export const api = {
   deployMods: (gameId: string) => invoke<DeployResult>("deploy_mods", { gameId }),
   purgeMods: (gameId: string) => invoke<void>("purge_mods", { gameId }),
   listDownloads: () => invoke<DownloadItem[]>("list_downloads"),
-  clearRecentDownloads: () => invoke<void>("clear_recent_downloads"),
+  clearRecentDownloads: (ids: string[]) =>
+    invoke<void>("clear_recent_downloads", { ids }),
   removeDownload: (id: string) => invoke<void>("remove_download", { id }),
   cancelDownload: (id: string) => invoke<void>("cancel_download", { id }),
   cancelDownloadBatch: (batchId: string) =>

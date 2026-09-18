@@ -18,6 +18,7 @@ import {
   type CatalogSourceFilter,
 } from "./catalogSources";
 import { RichText } from "./RichText";
+import { ModOptionsDialog } from "./ModOptionsDialog";
 import type {
   BrowseMeta,
   BrowseSearchOpts,
@@ -540,6 +541,15 @@ function isActiveDownloadStatus(status: string): boolean {
   return status === "downloading" || status === "extracting" || status === "paused";
 }
 
+function isFinishedDownloadStatus(status: string): boolean {
+  return (
+    status === "done" ||
+    status === "staged" ||
+    status === "failed" ||
+    status === "cancelled"
+  );
+}
+
 function hasActiveDownloads(list: DownloadItem[]): boolean {
   return list.some((d) => isActiveDownloadStatus(d.status));
 }
@@ -568,6 +578,8 @@ export default function App() {
   const [modUpdates, setModUpdates] = useState<Record<string, StagedModUpdate>>(
     {},
   );
+  const [modsWithOptions, setModsWithOptions] = useState<Set<string>>(new Set());
+  const [modOptionsFor, setModOptionsFor] = useState<StagedMod | null>(null);
   const [modsQuery, setModsQuery] = useState("");
   const [modsStatusFilter, setModsStatusFilter] =
     useState<ModsStatusFilter>("all");
@@ -924,6 +936,15 @@ export default function App() {
     const list = await api.listMods(gameId);
     if (activeGameRef.current?.id !== gameId) return;
     setMods(list);
+    // Reading a manifest per mod is a disk walk, so ask once per refresh
+    // instead of on every row render.
+    try {
+      const withOptions = await api.listModsWithOptions(gameId);
+      if (activeGameRef.current?.id !== gameId) return;
+      setModsWithOptions(new Set(withOptions));
+    } catch (e) {
+      console.warn("list_mods_with_options failed", e);
+    }
   }, []);
 
   const refreshModUpdates = useCallback(async (gameId: string) => {
@@ -1619,15 +1640,18 @@ export default function App() {
     return Date.now() - entry.at > 120000;
   }, []);
 
-  const clearRecentDownloads = useCallback(async () => {
-    if (!window.confirm("Clear recent downloads?")) return;
-    try {
-      await api.clearRecentDownloads();
-    } catch (e) {
-      setError(String(e));
-    }
-    await refreshDownloads();
-  }, [refreshDownloads]);
+  const clearRecentDownloads = useCallback(
+    async (ids: string[]) => {
+      if (!window.confirm("Clear recent downloads?")) return;
+      try {
+        await api.clearRecentDownloads(ids);
+      } catch (e) {
+        setError(String(e));
+      }
+      await refreshDownloads();
+    },
+    [refreshDownloads],
+  );
 
   const removeOneDownload = useCallback(
     async (id: string) => {
@@ -1737,6 +1761,15 @@ export default function App() {
   );
 
   useEffect(() => {
+    // A dependency closure emits one event per package; coalesce the bursts.
+    let changedTimer: number | null = null;
+    const unlistenChanged = listen("downloads-changed", () => {
+      if (changedTimer != null) return;
+      changedTimer = window.setTimeout(() => {
+        changedTimer = null;
+        void refreshDownloads();
+      }, 150);
+    });
     const unlistenNxm = listen<string>("nxm-url", async (event) => {
       const q = assistQueueRef.current;
       setBusy(
@@ -1969,6 +2002,9 @@ export default function App() {
       setDownloads((prevList) => {
         const idx = prevList.findIndex((d) => d.id === p.id);
         if (idx < 0) return prevList;
+        // A late progress event must not pull a finished row back into the
+        // active list.
+        if (isFinishedDownloadStatus(prevList[idx].status)) return prevList;
         const next = [...prevList];
         next[idx] = {
           ...next[idx],
@@ -1998,6 +2034,8 @@ export default function App() {
       await advanceAssistAfterStart();
     });
     return () => {
+      if (changedTimer != null) window.clearTimeout(changedTimer);
+      unlistenChanged.then((f) => f());
       unlistenNxm.then((f) => f());
       unlistenAssist.then((f) => f());
       unlistenOpened.then((f) => f());
@@ -3504,7 +3542,13 @@ export default function App() {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
       multiple: false,
-      filters: [{ name: "Archives", extensions: ["zip", "7z", "rar"] }],
+      filters: [
+        {
+          name: "Mods",
+          extensions: ["zip", "7z", "rar", "package", "ts4script", "dbc", "sims3pack"],
+        },
+        { name: "Archives", extensions: ["zip", "7z", "rar"] },
+      ],
     });
     if (!selected || Array.isArray(selected)) return;
     await withBusy("Importing archive…", async () => {
@@ -4444,6 +4488,15 @@ export default function App() {
                                   {modUpdates[m.id].available_version
                                     ? `Update to v${modUpdates[m.id].available_version}`
                                     : "Update"}
+                                </button>
+                              )}
+                              {modsWithOptions.has(m.id) && (
+                                <button
+                                  type="button"
+                                  onClick={() => setModOptionsFor(m)}
+                                  title="Choose which parts of this mod install"
+                                >
+                                  Options
                                 </button>
                               )}
                               <button
@@ -6550,7 +6603,7 @@ export default function App() {
             onForceResetDownload={(id) => forceResetOneDownload(id)}
             onRetryAssistOpening={() => retryAssistOpening()}
             isDownloadStuck={isDownloadStuck}
-            onClearRecent={() => clearRecentDownloads()}
+            onClearRecent={(ids) => clearRecentDownloads(ids)}
             onRemoveDownload={(id) => removeOneDownload(id)}
             onPauseDownload={(id) => pauseOneDownload(id)}
             onResumeDownload={(id) => resumeOneDownload(id)}
@@ -6738,6 +6791,24 @@ export default function App() {
           </section>
         )}
       </main>
+      {modOptionsFor && activeGame && (
+        <ModOptionsDialog
+          gameId={activeGame.id}
+          mod={modOptionsFor}
+          onClose={() => setModOptionsFor(null)}
+          onSaved={(selection) => {
+            setMods((prev) =>
+              prev.map((m) =>
+                m.id === modOptionsFor.id ? { ...m, option_selection: selection } : m,
+              ),
+            );
+            setNotice({
+              kind: "ok",
+              message: `Saved options for ${modOptionsFor.name}. Deploy to apply them.`,
+            });
+          }}
+        />
+      )}
     </div>
   );
 }

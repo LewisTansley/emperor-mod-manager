@@ -105,60 +105,7 @@ fn write_mods_settings(install_path: &Path, enabled_mod_folders: &[String]) -> R
 }
 
 fn mods_settings_dir(install_path: &Path) -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(native) = native_documents_tw3() {
-            return Some(native);
-        }
-    }
-    proton_documents_tw3(install_path).or_else(native_documents_tw3)
-}
-
-fn native_documents_tw3() -> Option<PathBuf> {
-    directories::UserDirs::new().and_then(|u| {
-        u.document_dir()
-            .map(|d| d.join("The Witcher 3"))
-    })
-}
-
-fn proton_documents_tw3(install_path: &Path) -> Option<PathBuf> {
-    let steamapps = find_steamapps_dir(install_path)?;
-    Some(
-        steamapps
-            .join("compatdata")
-            .join(STEAM_APP_ID)
-            .join("pfx")
-            .join("drive_c")
-            .join("users")
-            .join("steamuser")
-            .join("Documents")
-            .join("The Witcher 3"),
-    )
-}
-
-fn find_steamapps_dir(install_path: &Path) -> Option<PathBuf> {
-    for ancestor in install_path.ancestors() {
-        if ancestor
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-        {
-            return Some(ancestor.to_path_buf());
-        }
-        if ancestor
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("common"))
-        {
-            if let Some(parent) = ancestor.parent() {
-                if parent
-                    .file_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-                {
-                    return Some(parent.to_path_buf());
-                }
-            }
-        }
-    }
-    None
+    super::user_data::documents_dir(install_path, STEAM_APP_ID).map(|d| d.join("The Witcher 3"))
 }
 
 fn path_components_lower(path: &Path) -> Vec<String> {
@@ -249,7 +196,8 @@ mod tests {
         plugin()
             .after_deploy(&install, &["modA".into(), "modB".into()])
             .unwrap();
-        let raw = std::fs::read_to_string(docs.join("The Witcher 3").join("mods.settings")).unwrap();
+        let raw =
+            std::fs::read_to_string(docs.join("The Witcher 3").join("mods.settings")).unwrap();
         assert!(raw.contains("[modA]"));
         assert!(raw.contains("Priority=1"));
         assert!(raw.contains("[modB]"));

@@ -1,6 +1,8 @@
 //! mod.io API client wrapper (API-key auth only).
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use modio::request::filter::prelude::*;
@@ -9,6 +11,7 @@ use modio::types::id::Id;
 use modio::util::download::{Download, DownloadAction};
 use modio::Client;
 use serde::Serialize;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 use crate::config::KEYRING_SERVICE;
 
@@ -225,6 +228,7 @@ impl ModioClient {
         mod_id: u64,
         file_id: Option<u64>,
         dest: &Path,
+        on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
     ) -> Result<()> {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -241,11 +245,41 @@ impl ModioClient {
                 mod_id: Id::new(mod_id),
             }
         };
-        self.inner
+        let mut chunked = self
+            .inner
             .download(action)
-            .save_to_file(dest)
+            .chunked()
             .await
             .map_err(|e| anyhow::anyhow!("mod.io download: {e}"))?;
+        let total = Some(chunked.info().filesize).filter(|n| *n > 0);
+
+        let file = tokio::fs::File::create(dest).await?;
+        let mut out = BufWriter::with_capacity(512 * 512, file);
+        let mut downloaded: u64 = 0;
+        let started = Instant::now();
+        let mut last_report = started;
+        while let Some(chunk) = chunked.data().await {
+            let chunk = chunk.map_err(|e| anyhow::anyhow!("mod.io download: {e}"))?;
+            out.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            let now = Instant::now();
+            if now.duration_since(last_report).as_millis() >= 150 {
+                if let Some(cb) = on_progress {
+                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                    cb(downloaded, total, (downloaded as f64 / elapsed) as u64);
+                }
+                last_report = now;
+            }
+        }
+        out.flush().await?;
+        if let Some(cb) = on_progress {
+            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            cb(
+                downloaded,
+                total.or(Some(downloaded)),
+                (downloaded as f64 / elapsed) as u64,
+            );
+        }
         Ok(())
     }
 }

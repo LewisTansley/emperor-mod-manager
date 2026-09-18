@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::mods::options::ModOptionSet;
+
 mod baldursgate3;
 mod bladeandsorcery;
 mod creation_engine;
@@ -21,12 +23,16 @@ mod nomanssky;
 mod re_engine;
 mod rimworld;
 mod sevendaystodie;
+mod sims3;
+mod sims4;
+mod sims_framework;
 mod snowrunner;
 mod spaceengineers;
 mod stardewvalley;
 mod theforest;
 mod unity_bepinex;
 mod unreal_engine;
+mod user_data;
 mod warhammer40kdarktide;
 mod witcher3;
 
@@ -54,18 +60,19 @@ pub use re_engine::{
 };
 pub use rimworld::RimWorldPlugin;
 pub use sevendaystodie::SevenDaysToDiePlugin;
+pub use sims3::Sims3Plugin;
+pub use sims4::Sims4Plugin;
 pub use snowrunner::SnowRunnerPlugin;
 pub use spaceengineers::SpaceEngineersPlugin;
 pub use stardewvalley::StardewValleyPlugin;
 pub use theforest::TheForestPlugin;
 pub use unity_bepinex::{
     bepinex_pack_deploy_root, looks_like_unity_install, thunderstore_community_for_plugin,
-    AgainstTheStormPlugin,
-    AmongUsPlugin, AtlyssPlugin, BepInExPlugin, ContentWarningPlugin, CultOfTheLambPlugin,
-    DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin, HollowKnightSilksongPlugin,
-    InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin, RiskOfRain2Plugin,
-    RoundsPlugin, Schedule1Plugin, SonsOfTheForestPlugin, SubnauticaBelowZeroPlugin,
-    SubnauticaPlugin, TimberbornPlugin, UltrakillPlugin, ValheimPlugin,
+    AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin, BepInExPlugin, ContentWarningPlugin,
+    CultOfTheLambPlugin, DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin,
+    HollowKnightSilksongPlugin, InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin,
+    RiskOfRain2Plugin, RoundsPlugin, Schedule1Plugin, SonsOfTheForestPlugin,
+    SubnauticaBelowZeroPlugin, SubnauticaPlugin, TimberbornPlugin, UltrakillPlugin, ValheimPlugin,
 };
 pub use unreal_engine::{
     detect_ue_layout, layout_info, DeepRockGalacticPlugin, DeployContext, HogwartsLegacyPlugin,
@@ -126,16 +133,31 @@ pub trait GamePlugin: Send + Sync {
         false
     }
 
+    /// When false, a staged file is not linked into the game (e.g. readmes and
+    /// preview images that the game never loads). `relative` is the path inside
+    /// the staged mod, before any mod-folder wrapping.
+    fn should_deploy_file(&self, _relative: &Path) -> bool {
+        true
+    }
+
+    /// Same as `should_deploy_file`, with the staging layout available.
+    fn should_deploy_file_ctx(&self, relative: &Path, ctx: &DeployContext<'_>) -> bool {
+        let _ = ctx;
+        self.should_deploy_file(relative)
+    }
+
+    /// Directories owned by the mod loader whose empty leftovers should be pruned
+    /// on purge (e.g. `BepInEx/plugins` folders from mods that are gone).
+    fn prunable_dirs(&self, _install_path: &Path) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Install-level warnings shown before/during deploy (e.g. missing mod loader).
     fn preflight_warnings(&self, _install_path: &Path) -> Vec<String> {
         Vec::new()
     }
 
-    fn preflight_warnings_ctx(
-        &self,
-        install_path: &Path,
-        ctx: &DeployContext<'_>,
-    ) -> Vec<String> {
+    fn preflight_warnings_ctx(&self, install_path: &Path, ctx: &DeployContext<'_>) -> Vec<String> {
         let _ = ctx;
         self.preflight_warnings(install_path)
     }
@@ -143,6 +165,12 @@ pub trait GamePlugin: Send + Sync {
     /// Per-staging-pack warnings (e.g. SMAPI installer deployed as a mod).
     fn staging_deploy_warnings(&self, _content_root: &Path, _mod_name: &str) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Options the mod declares for itself (Arsenal / HD2MM `manifest.json`).
+    /// `None` means the mod is deployed whole, which is the norm.
+    fn mod_options(&self, _content_root: &Path) -> Option<ModOptionSet> {
+        None
     }
 
     /// Optional install prep before purge/link (rename paks, etc.). Returns warnings.
@@ -213,6 +241,8 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &SevenDaysToDiePlugin,
         &RimWorldPlugin,
         &NoMansSkyPlugin,
+        &Sims4Plugin,
+        &Sims3Plugin,
         &SnowRunnerPlugin,
         &SpaceEngineersPlugin,
         &SkyrimSpecialEditionPlugin,
@@ -244,8 +274,42 @@ pub fn plugin_by_id(id: &str) -> Option<&'static dyn GamePlugin> {
     all_plugins().into_iter().find(|p| p.info().id == id)
 }
 
+/// Serializes tests that deploy Helldivers 2 mods, which share a process-global
+/// patch index.
+#[cfg(test)]
+pub(crate) fn hd2_test_gate() -> std::sync::MutexGuard<'static, ()> {
+    helldivers2::TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Lowercase a store title and drop trademark marks.
+///
+/// Steam and `lib_game_detector` report names like `The Sims™ 4`, which would
+/// otherwise never match a `sims 4` entry in `match_names`.
+pub fn normalize_title(title: &str) -> String {
+    let stripped: String = title
+        .chars()
+        .map(|c| {
+            if matches!(c, '™' | '®' | '©') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut out = String::with_capacity(stripped.len());
+    for word in stripped.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&word.to_lowercase());
+    }
+    out
+}
+
 pub fn match_plugin(title: &str, install_path: Option<&str>) -> Option<GamePluginInfo> {
-    let lower = title.to_lowercase();
+    let lower = normalize_title(title);
     for plugin in all_plugins() {
         let info = plugin.info();
         if info.match_names.is_empty() {
@@ -371,10 +435,7 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         let named = staging.path().join("CoolMod_12_34");
         std::fs::create_dir_all(&named).unwrap();
-        assert_eq!(
-            content_folder_wrap_name(&named, "Cool Mod"),
-            "Cool Mod"
-        );
+        assert_eq!(content_folder_wrap_name(&named, "Cool Mod"), "Cool Mod");
 
         let peeled = staging.path().join("CoolMod");
         std::fs::create_dir_all(&peeled).unwrap();
@@ -392,11 +453,22 @@ mod tests {
     }
 
     #[test]
+    fn match_ignores_trademark_symbols_in_store_titles() {
+        // Steam and lib_game_detector report titles with ™ / ®.
+        assert_eq!(
+            match_plugin("The Witcher® 3: Wild Hunt", None).unwrap().id,
+            "witcher3"
+        );
+        assert_eq!(normalize_title("The Sims™ 4"), "the sims 4");
+        assert_eq!(normalize_title("HELLDIVERS™ 2"), "helldivers 2");
+        assert_eq!(match_plugin("The Sims™ 4", None).unwrap().id, "sims4");
+        assert_eq!(match_plugin("The Sims™ 3", None).unwrap().id, "sims3");
+    }
+
+    #[test]
     fn match_re_engine_titles() {
         assert_eq!(
-            match_plugin("Resident Evil 7 Biohazard", None)
-                .unwrap()
-                .id,
+            match_plugin("Resident Evil 7 Biohazard", None).unwrap().id,
             "residentevil7"
         );
         assert_eq!(
@@ -456,7 +528,8 @@ mod tests {
         let dmf = dmf_only.path().join("dmf");
         std::fs::create_dir_all(&dmf).unwrap();
         std::fs::write(dmf.join("dmf.lua"), b"x").unwrap();
-        let kept_dmf = normalize_staging_root(dmf_only.path(), &Warhammer40kDarktidePlugin).unwrap();
+        let kept_dmf =
+            normalize_staging_root(dmf_only.path(), &Warhammer40kDarktidePlugin).unwrap();
         assert_eq!(kept_dmf, dmf_only.path());
 
         let normal = tempfile::tempdir().unwrap();
@@ -477,22 +550,13 @@ mod tests {
             match_plugin("Subnautica: Below Zero", None).unwrap().id,
             "subnauticabelowzero"
         );
-        assert_eq!(
-            match_plugin("Subnautica", None).unwrap().id,
-            "subnautica"
-        );
+        assert_eq!(match_plugin("Subnautica", None).unwrap().id, "subnautica");
         assert_eq!(
             match_plugin("Sons of the Forest", None).unwrap().id,
             "sonsoftheforest"
         );
-        assert_eq!(
-            match_plugin("Ready or Not", None).unwrap().id,
-            "readyornot"
-        );
-        assert_eq!(
-            match_plugin("Schedule I", None).unwrap().id,
-            "schedule1"
-        );
+        assert_eq!(match_plugin("Ready or Not", None).unwrap().id, "readyornot");
+        assert_eq!(match_plugin("Schedule I", None).unwrap().id, "schedule1");
         assert_eq!(
             match_plugin("Monster Hunter Wilds", None).unwrap().id,
             "monsterhunterwilds"
@@ -501,10 +565,7 @@ mod tests {
             match_plugin("Monster Hunter Rise", None).unwrap().id,
             "monsterhunterrise"
         );
-        assert_eq!(
-            match_plugin("The Forest", None).unwrap().id,
-            "theforest"
-        );
+        assert_eq!(match_plugin("The Forest", None).unwrap().id, "theforest");
         assert_eq!(
             match_plugin("The Witcher 3: Wild Hunt", None).unwrap().id,
             "witcher3"
@@ -549,10 +610,7 @@ mod tests {
             "7daystodie"
         );
         assert_eq!(match_plugin("RimWorld", None).unwrap().id, "rimworld");
-        assert_eq!(
-            match_plugin("No Man's Sky", None).unwrap().id,
-            "nomanssky"
-        );
+        assert_eq!(match_plugin("No Man's Sky", None).unwrap().id, "nomanssky");
         assert_eq!(
             match_plugin("Marvel Rivals", None).unwrap().id,
             "marvelrivals"

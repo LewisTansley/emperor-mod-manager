@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -22,6 +23,9 @@ const GQL_URL: &str = "https://api.nexusmods.com/v2/graphql";
 
 pub const CANCELLED_MSG: &str = "CANCELLED";
 pub const PAUSED_MSG: &str = "PAUSED";
+/// A transfer that ended before `Content-Length` bytes arrived. Callers must
+/// treat the partial file as garbage rather than resume from it.
+pub const INCOMPLETE_MSG: &str = "INCOMPLETE";
 
 /// Cooperative cancel / pause flags for an in-flight HTTP transfer.
 pub struct TransferControl {
@@ -120,6 +124,10 @@ pub struct ModDetail {
 pub struct ModFileInfo {
     pub file_id: u64,
     pub name: String,
+    /// The uploaded archive's real name, e.g. `Cool Mod-123-1-0.7z`. `name` is
+    /// the display title and says nothing about the payload's format.
+    #[serde(default)]
+    pub file_name: Option<String>,
     pub version: Option<String>,
     pub category_name: Option<String>,
     pub size_kb: Option<u64>,
@@ -250,6 +258,12 @@ impl NexusClient {
         );
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            // A read timeout is per-chunk, so a stalled CDN connection surfaces
+            // as an error rather than a silent short read. Deliberately not
+            // `.timeout()`, which is a whole-request deadline and would abort
+            // legitimate multi-hundred-megabyte downloads.
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self { http })
     }
@@ -644,6 +658,10 @@ impl NexusClient {
                 Some(ModFileInfo {
                     file_id: n.get("file_id")?.as_u64()?,
                     name: n.get("name")?.as_str()?.to_string(),
+                    file_name: n
+                        .get("file_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     version: n
                         .get("version")
                         .and_then(|v| v.as_str())
@@ -681,7 +699,7 @@ impl NexusClient {
         start_offset: u64,
         control: Option<&TransferControl>,
         on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let has_nxm = nxm_key.map(|k| !k.is_empty()).unwrap_or(false) && nxm_expires.is_some();
         if !is_premium && !has_nxm {
             bail!(
@@ -721,8 +739,40 @@ impl NexusClient {
             control,
             on_progress,
         )
-        .await
+        .await?;
+        Ok(filename_from_url(&download_url))
     }
+}
+
+/// The archive's real name from a CDN link. Nexus appends `?md5=...&expires=...`,
+/// so this parses the URL instead of slicing the raw string.
+pub fn filename_from_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let last = parsed.path_segments()?.next_back()?;
+    let decoded = percent_decode(last);
+    let name = sanitize_filename::sanitize(decoded.trim());
+    if name.is_empty() || !name.contains('.') {
+        return None;
+    }
+    Some(name)
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Stream an HTTP URL to `dest`, optionally resuming with a Range request.
@@ -795,12 +845,18 @@ pub async fn stream_url_to_file(
     let session_start = offset;
 
     while let Some(chunk) = stream.next().await {
-        if control.map(|c| c.cancel.load(Ordering::SeqCst)).unwrap_or(false) {
+        if control
+            .map(|c| c.cancel.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
             drop(file);
             let _ = tokio::fs::remove_file(dest).await;
             bail!("{CANCELLED_MSG}");
         }
-        if control.map(|c| c.pause.load(Ordering::SeqCst)).unwrap_or(false) {
+        if control
+            .map(|c| c.pause.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
             file.flush().await?;
             drop(file);
             if let Some(cb) = on_progress {
@@ -824,10 +880,27 @@ pub async fn stream_url_to_file(
         }
     }
     file.flush().await?;
+    // A dropped connection ends the stream without an error, so the byte count
+    // is the only thing that separates a finished download from a truncated
+    // one. Without this an incomplete archive reaches the extractor and fails
+    // there, where the cause is no longer visible.
+    verify_complete(downloaded, total)?;
     if let Some(cb) = on_progress {
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
         let speed = ((downloaded - session_start) as f64 / elapsed) as u64;
         cb(downloaded, total.or(Some(downloaded)), speed);
+    }
+    Ok(())
+}
+
+/// `total` is `None` when the server sent no length, which leaves nothing to
+/// check against. Only a short read is an error; a server over-reporting its
+/// own length is not worth failing a usable download over.
+fn verify_complete(downloaded: u64, total: Option<u64>) -> Result<()> {
+    if let Some(expected) = total {
+        if downloaded < expected {
+            bail!("{INCOMPLETE_MSG}: got {downloaded} of {expected} bytes");
+        }
     }
     Ok(())
 }
@@ -928,10 +1001,8 @@ impl NexusClient {
                             .and_then(|v| v.as_str())
                     })
                     .map(str::to_string);
-                let overall_rating = n
-                    .get("overallRating")
-                    .and_then(|v| v.as_f64())
-                    .or_else(|| {
+                let overall_rating =
+                    n.get("overallRating").and_then(|v| v.as_f64()).or_else(|| {
                         n.get("overallRating")
                             .and_then(|v| v.as_str())
                             .and_then(|s| s.parse().ok())
@@ -1055,7 +1126,11 @@ impl NexusClient {
               }
             }
             "#;
-            let exclude_adult = if adult_content { Value::Null } else { json!(true) };
+            let exclude_adult = if adult_content {
+                Value::Null
+            } else {
+                json!(true)
+            };
             match self
                 .graphql(
                     legacy_gql,
@@ -1182,10 +1257,7 @@ impl NexusClient {
         });
         apply_adult_content_filter(&mut mods_filter, adult_content, true);
         match self
-            .graphql(
-                mods_facet_gql,
-                json!({ "filter": mods_filter, "count": 1 }),
-            )
+            .graphql(mods_facet_gql, json!({ "filter": mods_filter, "count": 1 }))
             .await
         {
             Ok(data) => {
@@ -1451,11 +1523,7 @@ fn apply_adult_content_filter(filter: &mut Value, adult_content: bool, as_array:
         return;
     }
     let clause = json!({ "value": false, "op": "EQUALS" });
-    filter["adultContent"] = if as_array {
-        json!([clause])
-    } else {
-        clause
-    };
+    filter["adultContent"] = if as_array { json!([clause]) } else { clause };
 }
 
 fn tag_value(value: &str, op: &str) -> Value {
@@ -1583,9 +1651,7 @@ fn push_unique(out: &mut Vec<String>, value: &str) {
 }
 
 fn facet_name_matches(name: &str, aliases: &[&str]) -> bool {
-    aliases
-        .iter()
-        .any(|alias| name.eq_ignore_ascii_case(alias))
+    aliases.iter().any(|alias| name.eq_ignore_ascii_case(alias))
 }
 
 /// Collect values for the given facet names from nodesFacets and/or facetsData.
@@ -1788,6 +1854,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_short_body_is_an_error_not_a_finished_download() {
+        let err = verify_complete(199_000_000, Some(224_000_000)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(INCOMPLETE_MSG), "{msg}");
+        assert!(msg.contains("199000000"), "{msg}");
+        assert!(msg.contains("224000000"), "{msg}");
+    }
+
+    #[test]
+    fn a_complete_or_unmeasurable_transfer_passes() {
+        verify_complete(1024, Some(1024)).unwrap();
+        // Some servers over-report; that is not worth failing a usable file over.
+        verify_complete(1024, Some(1000)).unwrap();
+        // No Content-Length leaves nothing to compare against.
+        verify_complete(1024, None).unwrap();
+    }
+
+    #[test]
+    fn cdn_query_parameters_do_not_become_part_of_the_filename() {
+        let name = filename_from_url(
+            "https://cf.nexus.com/1034/Cool%20Mod-1034-1-0.7z?md5=abc&expires=123",
+        );
+        assert_eq!(name.as_deref(), Some("Cool Mod-1034-1-0.7z"));
+    }
+
+    #[test]
+    fn a_url_without_a_real_filename_yields_nothing() {
+        assert_eq!(filename_from_url("https://cf.nexus.com/1034/"), None);
+        assert_eq!(filename_from_url("https://cf.nexus.com/download"), None);
+        assert_eq!(filename_from_url("not a url"), None);
+    }
+
+    #[test]
     fn parses_nxm_url() {
         let link =
             parse_nxm("nxm://stardewvalley/mods/2400/files/12345?key=abc&expires=1&user_id=2")
@@ -1829,7 +1928,10 @@ mod tests {
             json!([{ "value": "SKSE", "op": "WILDCARD" }])
         );
         let value = filter["name"][0]["value"].as_str().unwrap();
-        assert!(!value.contains('*'), "WILDCARD must not wrap query with '*'");
+        assert!(
+            !value.contains('*'),
+            "WILDCARD must not wrap query with '*'"
+        );
     }
 
     #[test]

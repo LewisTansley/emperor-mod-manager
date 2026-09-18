@@ -1,5 +1,7 @@
 //! Mod staging, extraction, load order, and deploy.
 
+pub mod options;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -17,6 +19,7 @@ use crate::{
         bepinex_pack_deploy_root, normalize_relative, normalize_staging_root, plugin_by_id,
         DeployContext, GamePlugin,
     },
+    mods::options::{IncludeFilter, ModOptionSelection},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -68,6 +71,15 @@ pub struct StagedMod {
     /// Staged mod ids this mod requires.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Files present in staging right after extraction. Staging is immutable, so
+    /// a smaller count means something outside Emperor deleted staged files and
+    /// the package has to be downloaded again.
+    #[serde(default)]
+    pub staged_file_count: Option<usize>,
+    /// Which of the mod's own options are on. `None` means the mod declares no
+    /// options, or the user has not touched the defaults yet.
+    #[serde(default)]
+    pub option_selection: Option<ModOptionSelection>,
 }
 
 fn default_true() -> bool {
@@ -96,6 +108,8 @@ impl Default for StagedMod {
             collection_ids: Vec::new(),
             independent: true,
             depends_on: Vec::new(),
+            staged_file_count: None,
+            option_selection: None,
         }
     }
 }
@@ -157,6 +171,7 @@ struct StagingProvenance {
     depends_on: Vec<String>,
     enabled: bool,
     order: Option<u32>,
+    option_selection: Option<ModOptionSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -330,14 +345,11 @@ fn newest_nexus_file<'a, F>(files: &'a [NexusFileMeta], pred: F) -> Option<&'a N
 where
     F: Fn(&NexusFileMeta) -> bool,
 {
-    files
-        .iter()
-        .filter(|f| pred(f))
-        .max_by(|a, b| {
-            a.uploaded_timestamp
-                .cmp(&b.uploaded_timestamp)
-                .then_with(|| a.file_id.cmp(&b.file_id))
-        })
+    files.iter().filter(|f| pred(f)).max_by(|a, b| {
+        a.uploaded_timestamp
+            .cmp(&b.uploaded_timestamp)
+            .then_with(|| a.file_id.cmp(&b.file_id))
+    })
 }
 
 /// Pick a newer Nexus file that should replace the staged file, if any.
@@ -398,7 +410,8 @@ fn rewrite_depends_on(order: &mut LoadOrder, old_id: &str, new_id: &str) {
             }
         }
         let mut seen = HashSet::new();
-        m.depends_on.retain(|s| !s.is_empty() && seen.insert(s.clone()));
+        m.depends_on
+            .retain(|s| !s.is_empty() && seen.insert(s.clone()));
     }
 }
 
@@ -420,6 +433,10 @@ fn provenance_from_removed(old: Option<StagedMod>, new_staging: &Path) -> Stagin
         depends_on: old.depends_on,
         enabled: old.enabled,
         order: Some(old.order),
+        // Option ids are slugs of the manifest entries, so an update that keeps
+        // the same options keeps the user's picks. Anything the new manifest
+        // dropped is discarded when the selection is normalized.
+        option_selection: old.option_selection,
     }
 }
 
@@ -545,11 +562,7 @@ pub fn record_installed_collection(
     save_loadorder(paths, game_id, &order)?;
 
     let mut store = load_collections(paths, game_id)?;
-    if let Some(existing) = store
-        .collections
-        .iter_mut()
-        .find(|c| c.id == collection.id)
-    {
+    if let Some(existing) = store.collections.iter_mut().find(|c| c.id == collection.id) {
         let mut ids = existing.mod_ids.clone();
         for id in &collection.mod_ids {
             push_unique(&mut ids, id.clone());
@@ -626,7 +639,8 @@ pub fn uninstall_collection(paths: &Paths, game_id: &str, collection_id: &str) -
     }
     order.mods = remaining;
     for c in &mut store.collections {
-        c.mod_ids.retain(|id| order.mods.iter().any(|m| &m.id == id));
+        c.mod_ids
+            .retain(|id| order.mods.iter().any(|m| &m.id == id));
     }
     save_loadorder(paths, game_id, &order)?;
     save_collections(paths, game_id, &store)?;
@@ -696,11 +710,117 @@ pub fn stage_overlay_dir(
         collection_ids: provenance.collection_ids,
         independent: provenance.independent,
         depends_on: provenance.depends_on,
+        option_selection: provenance.option_selection,
         ..Default::default()
     };
     order.mods.push(staged.clone());
     save_loadorder(paths, game_id, &order)?;
     Ok(staged)
+}
+
+/// Mod payloads that are single files rather than archives (e.g. Sims `.package`
+/// downloads). These are copied into staging as-is.
+pub const LOOSE_MOD_EXTENSIONS: &[&str] = &["package", "ts4script", "dbc", "sims3pack"];
+
+pub fn is_loose_mod_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            LOOSE_MOD_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+fn stage_loose_file(file: &Path, dest: &Path) -> Result<()> {
+    let name = file
+        .file_name()
+        .map(|n| sanitize_filename::sanitize(n.to_string_lossy().as_ref()))
+        .filter(|n| !n.is_empty())
+        .context("mod file has no usable file name")?;
+    let target = dest.join(name);
+    fs::copy(file, &target)
+        .with_context(|| format!("copy {} to {}", file.display(), target.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    Zip,
+    SevenZ,
+    Rar,
+    /// A Sims `.package`; a payload, not a container.
+    Dbpf,
+}
+
+impl ArchiveKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::SevenZ => "7z",
+            Self::Rar => "rar",
+            Self::Dbpf => "Sims package",
+        }
+    }
+}
+
+/// Identify a file by its header. Downloads are saved under a synthesized name,
+/// so the extension says what the app guessed rather than what the file is.
+fn detect_archive_kind(path: &Path) -> Option<ArchiveKind> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut magic = [0u8; 8];
+    let read = file.read(&mut magic).ok()?;
+    let magic = &magic[..read];
+    if magic.starts_with(b"PK\x03\x04")
+        || magic.starts_with(b"PK\x05\x06")
+        || magic.starts_with(b"PK\x07\x08")
+    {
+        return Some(ArchiveKind::Zip);
+    }
+    if magic.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        return Some(ArchiveKind::SevenZ);
+    }
+    if magic.starts_with(b"Rar!\x1a\x07") {
+        return Some(ArchiveKind::Rar);
+    }
+    if magic.starts_with(b"DBPF") {
+        return Some(ArchiveKind::Dbpf);
+    }
+    None
+}
+
+fn extract_by_kind(kind: ArchiveKind, archive: &Path, dest: &Path) -> Result<()> {
+    match kind {
+        ArchiveKind::Zip => extract_zip(archive, dest),
+        ArchiveKind::SevenZ => extract_7z(archive, dest),
+        ArchiveKind::Rar => extract_rar(archive, dest),
+        ArchiveKind::Dbpf => stage_loose_file(archive, dest),
+    }
+}
+
+/// Wrap a failure with what the file actually is, since the caller only knows
+/// the name the app invented for it.
+fn unreadable_archive(
+    archive: &Path,
+    detected: Option<ArchiveKind>,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    let name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| archive.display().to_string());
+    let size = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+    match detected {
+        Some(kind) => anyhow::anyhow!(
+            "could not read {name} ({size} bytes, looks like {}): {cause:#}. \
+             The download may be incomplete — remove it and download again.",
+            kind.label()
+        ),
+        None => anyhow::anyhow!(
+            "could not read {name} ({size} bytes): not a zip, 7z, or rar archive. \
+             The download may be incomplete — remove it and download again."
+        ),
+    }
 }
 
 pub fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
@@ -709,30 +829,38 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
     }
     fs::create_dir_all(dest)?;
 
+    // The header wins over the extension: Nexus downloads land as `.bin` and
+    // mod.io downloads as `.zip` regardless of what they really contain.
+    let detected = detect_archive_kind(archive);
+    if let Some(kind) = detected {
+        // A loose payload named like an archive is still a loose payload, but a
+        // `.ts4script` is a real zip, so the extension decides between them.
+        if kind == ArchiveKind::Zip && is_loose_mod_file(archive) {
+            return stage_loose_file(archive, dest);
+        }
+        extract_by_kind(kind, archive, dest)
+            .map_err(|e| unreadable_archive(archive, detected, e))?;
+        repair_backslash_entries(dest)?;
+        return Ok(());
+    }
+
+    if is_loose_mod_file(archive) {
+        return stage_loose_file(archive, dest);
+    }
+
+    // Headerless or unrecognized: fall back to whatever the name claims.
     let ext = archive
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-
     let result = match ext.as_str() {
         "zip" => extract_zip(archive, dest),
         "7z" => extract_7z(archive, dest),
         "rar" => extract_rar(archive, dest),
-        other => {
-            // Some Nexus files have no extension or odd names — try zip, 7z, then RAR magic
-            if extract_zip(archive, dest).is_ok() {
-                Ok(())
-            } else if extract_7z(archive, dest).is_ok() {
-                Ok(())
-            } else if looks_like_rar(archive) {
-                extract_rar(archive, dest)
-            } else {
-                bail!("unsupported archive type: .{other}");
-            }
-        }
+        _ => Err(anyhow::anyhow!("unrecognized file header")),
     };
-    result?;
+    result.map_err(|e| unreadable_archive(archive, detected, e))?;
     repair_backslash_entries(dest)?;
     Ok(())
 }
@@ -866,19 +994,6 @@ fn extract_7z(archive: &Path, dest: &Path) -> Result<()> {
     sevenz_rust::decompress_file(archive, dest).map_err(|e| anyhow::anyhow!("7z extract: {e}"))
 }
 
-/// RAR signature: `Rar!` followed by `0x1A 0x07` (RAR 1.5+ / RAR 5).
-fn looks_like_rar(archive: &Path) -> bool {
-    let Ok(mut file) = fs::File::open(archive) else {
-        return false;
-    };
-    let mut magic = [0u8; 6];
-    match file.read(&mut magic) {
-        Ok(n) if n >= 6 => {}
-        _ => return false,
-    }
-    magic[0..4] == *b"Rar!" && magic[4] == 0x1a && magic[5] == 0x07
-}
-
 fn extract_rar(archive: &Path, dest: &Path) -> Result<()> {
     let archive = unrar_ng::Archive::new(archive)
         .open_for_processing()
@@ -900,15 +1015,7 @@ pub fn stage_mod(
     archive: &Path,
 ) -> Result<StagedMod> {
     stage_mod_inner(
-        paths,
-        game_id,
-        None,
-        name,
-        domain,
-        mod_id,
-        file_id,
-        version,
-        archive,
+        paths, game_id, None, name, domain, mod_id, file_id, version, archive,
     )
 }
 
@@ -990,10 +1097,39 @@ fn stage_mod_inner(
         collection_ids: provenance.collection_ids,
         independent: provenance.independent,
         depends_on: provenance.depends_on,
+        staged_file_count: Some(count_staged_files(&staging)),
+        option_selection: provenance.option_selection,
     };
     order.mods.push(staged.clone());
     save_loadorder(paths, game_id, &order)?;
     Ok(staged)
+}
+
+/// Files currently present in a staging folder.
+pub fn count_staged_files(dir: &Path) -> usize {
+    WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count()
+}
+
+/// Staged mods that lost files after extraction. Older builds symlinked staging
+/// into the game folder, so a loader deleting its own plugin directory deleted
+/// the staged originals too; those packages must be downloaded again.
+pub fn damaged_staging(order: &LoadOrder) -> Vec<&StagedMod> {
+    order
+        .mods
+        .iter()
+        .filter(|m| {
+            let Some(expected) = m.staged_file_count else {
+                return false;
+            };
+            let staging = Path::new(&m.staging_path);
+            staging.is_dir() && count_staged_files(staging) < expected
+        })
+        .collect()
 }
 
 pub fn stage_thunderstore_mod(
@@ -1044,6 +1180,8 @@ pub fn stage_thunderstore_mod(
         collection_ids: provenance.collection_ids,
         independent: provenance.independent,
         depends_on: provenance.depends_on,
+        staged_file_count: Some(count_staged_files(&staging)),
+        option_selection: provenance.option_selection,
     };
     order.mods.push(staged.clone());
     save_loadorder(paths, game_id, &order)?;
@@ -1098,6 +1236,8 @@ pub fn stage_modio_mod(
         collection_ids: provenance.collection_ids,
         independent: provenance.independent,
         depends_on: provenance.depends_on,
+        staged_file_count: Some(count_staged_files(&staging)),
+        option_selection: provenance.option_selection,
     };
     order.mods.push(staged.clone());
     save_loadorder(paths, game_id, &order)?;
@@ -1123,9 +1263,10 @@ pub fn has_thunderstore_package(
 #[allow(dead_code)]
 pub fn has_modio_mod(paths: &Paths, game_id: &str, modio_mod_id: u64) -> Result<bool> {
     let order = load_loadorder(paths, game_id)?;
-    Ok(order.mods.iter().any(|m| {
-        m.source == ModSource::Modio && m.modio_mod_id == Some(modio_mod_id)
-    }))
+    Ok(order
+        .mods
+        .iter()
+        .any(|m| m.source == ModSource::Modio && m.modio_mod_id == Some(modio_mod_id)))
 }
 
 pub fn set_enabled(paths: &Paths, game_id: &str, mod_uid: &str, enabled: bool) -> Result<()> {
@@ -1134,6 +1275,20 @@ pub fn set_enabled(paths: &Paths, game_id: &str, mod_uid: &str, enabled: bool) -
         bail!("mod not found: {mod_uid}");
     };
     m.enabled = enabled;
+    save_loadorder(paths, game_id, &order)
+}
+
+pub fn set_mod_options(
+    paths: &Paths,
+    game_id: &str,
+    mod_uid: &str,
+    selection: ModOptionSelection,
+) -> Result<()> {
+    let mut order = load_loadorder(paths, game_id)?;
+    let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+        bail!("mod not found: {mod_uid}");
+    };
+    m.option_selection = Some(selection);
     save_loadorder(paths, game_id, &order)
 }
 
@@ -1185,7 +1340,7 @@ pub fn remove_all_mods(paths: &Paths, game_id: &str, install_path: Option<&Path>
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkKind {
-    HardlinkOrSymlink,
+    Hardlinked,
     Copied,
 }
 
@@ -1245,9 +1400,7 @@ fn symlink_points_into(path: &Path, root: &Path) -> bool {
     let resolved = if target.is_absolute() {
         target
     } else {
-        path.parent()
-            .map(|p| p.join(&target))
-            .unwrap_or(target)
+        path.parent().map(|p| p.join(&target)).unwrap_or(target)
     };
     resolved.starts_with(root)
 }
@@ -1266,9 +1419,7 @@ fn symlink_points_into(path: &Path, root: &Path) -> bool {
     let resolved = if target.is_absolute() {
         target
     } else {
-        path.parent()
-            .map(|p| p.join(&target))
-            .unwrap_or(target)
+        path.parent().map(|p| p.join(&target)).unwrap_or(target)
     };
     resolved.starts_with(root)
 }
@@ -1328,26 +1479,48 @@ pub fn purge_install_symlinks(install_path: &Path, data_dir: &Path) -> Result<us
     Ok(removed)
 }
 
-fn same_filesystem(a: &Path, b: &Path) -> bool {
-    device_id(a).zip(device_id(b)).map(|(da, db)| da == db).unwrap_or(false)
+/// Remove empty leftover directories under loader-owned folders. Mods that were
+/// purged or removed leave their (now empty) folders behind, which pile up in
+/// `BepInEx/plugins` and make an install look modded when it is not.
+pub fn prune_empty_loader_dirs(plugin: &dyn GamePlugin, install_path: &Path) -> usize {
+    let mut removed = 0usize;
+    for root in plugin.prunable_dirs(install_path) {
+        let mut dirs: Vec<PathBuf> = WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir() && e.path() != root)
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        // Deepest first so nested leftovers collapse in one pass.
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for dir in dirs {
+            let is_empty = fs::read_dir(&dir)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if is_empty && fs::remove_dir(&dir).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
-fn device_id(path: &Path) -> Option<u64> {
-    let probe = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()?.to_path_buf()
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(probe).ok().map(|m| m.dev())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = probe;
-        None
-    }
+/// Manifest paths that no longer exist, i.e. files a game or loader deleted
+/// after deploy. Returned paths are relative to the install when possible.
+fn missing_deployed_paths(deployed: &DeployManifest, install_path: &Path) -> Vec<String> {
+    deployed
+        .paths
+        .iter()
+        .filter(|p| !Path::new(p).exists())
+        .map(|p| {
+            Path::new(p)
+                .strip_prefix(install_path)
+                .unwrap_or(Path::new(p))
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect()
 }
 
 fn link_or_copy(src: &Path, dest: &Path) -> Result<LinkKind> {
@@ -1361,55 +1534,26 @@ fn link_or_copy(src: &Path, dest: &Path) -> Result<LinkKind> {
     // Hardlink files; directories are created normally and children linked.
     if src.is_dir() {
         ensure_deploy_dir(dest)?;
-        return Ok(LinkKind::HardlinkOrSymlink);
+        return Ok(LinkKind::Hardlinked);
     }
-    let is_dll = src
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"));
-    if is_dll && !same_filesystem(src, dest) {
-        fs::copy(src, dest)?;
-        return Ok(LinkKind::Copied);
-    }
+    // Never symlink into a game folder: a mod loader that deletes its own
+    // directory (BepInEx prunes BepInEx/plugins/RoR2BepInExPack on startup)
+    // follows the link and destroys the staged original.
     match fs::hard_link(src, dest) {
-        Ok(()) => Ok(LinkKind::HardlinkOrSymlink),
-        Err(_) => match symlink_file(src, dest) {
-            Ok(()) => Ok(LinkKind::HardlinkOrSymlink),
-            Err(e) => {
-                log::debug!(
-                    "symlink failed for {} -> {} ({e}); copying instead",
-                    src.display(),
-                    dest.display()
-                );
-                fs::copy(src, dest)?;
-                Ok(LinkKind::Copied)
-            }
-        },
+        Ok(()) => Ok(LinkKind::Hardlinked),
+        Err(e) => {
+            log::debug!(
+                "hardlink failed for {} -> {} ({e}); copying instead",
+                src.display(),
+                dest.display()
+            );
+            fs::copy(src, dest)?;
+            Ok(LinkKind::Copied)
+        }
     }
 }
 
-#[cfg(unix)]
-fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(src, dest)
-}
-
-#[cfg(windows)]
-fn symlink_file(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(src, dest)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn symlink_file(_src: &Path, dest: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!("symlink unsupported on this platform for {}", dest.display()),
-    ))
-}
-
-pub fn purge_deploy(
-    paths: &Paths,
-    game_id: &str,
-    install_path: Option<&Path>,
-) -> Result<()> {
+pub fn purge_deploy(paths: &Paths, game_id: &str, install_path: Option<&Path>) -> Result<()> {
     let manifest_path = paths.deploy_manifest(game_id);
     if manifest_path.exists() {
         let raw = fs::read_to_string(&manifest_path)?;
@@ -1448,6 +1592,7 @@ pub fn deploy(
     let base_ctx = DeployContext {
         project_name,
         content_root: None,
+        source_dir: None,
     };
 
     if !install_path.is_dir() {
@@ -1458,9 +1603,9 @@ pub fn deploy(
     }
 
     warnings.extend(plugin.prepare_deploy(install_path)?);
-    warnings.extend(plugin.preflight_warnings_ctx(install_path, &base_ctx));
 
     purge_deploy(paths, game_id, Some(install_path))?;
+    prune_empty_loader_dirs(plugin, install_path);
 
     let mut order = load_loadorder(paths, game_id)?;
     order.mods.sort_by_key(|m| m.order);
@@ -1468,6 +1613,7 @@ pub fn deploy(
     let mut deployed = DeployManifest::default();
     let mut count = 0usize;
     let mut copied_files = 0usize;
+    let mut skipped_files = 0usize;
     let enabled: Vec<_> = order.mods.iter().filter(|m| m.enabled).cloned().collect();
     let enabled_mods = enabled.len();
     let mut enabled_mod_folders = Vec::new();
@@ -1475,14 +1621,20 @@ pub fn deploy(
     for staged in &enabled {
         let staging = PathBuf::from(&staged.staging_path);
         if !staging.exists() {
-            let msg = format!(
-                "Missing staging for {}: {}",
-                staged.name,
-                staging.display()
-            );
+            let msg = format!("Missing staging for {}: {}", staged.name, staging.display());
             log::warn!("{msg}");
             warnings.push(msg);
             continue;
+        }
+        if let Some(expected) = staged.staged_file_count {
+            let actual = count_staged_files(&staging);
+            if actual < expected {
+                warnings.push(format!(
+                    "{} is missing {} of {expected} staged file(s); download it again before deploying.",
+                    staged.name,
+                    expected - actual
+                ));
+            }
         }
         if let Err(e) = repair_backslash_entries(&staging) {
             warnings.push(format!(
@@ -1492,9 +1644,13 @@ pub fn deploy(
         }
         let root = normalize_staging_root(&staging, plugin)?;
         warnings.extend(plugin.staging_deploy_warnings(&root, &staged.name));
+        let filter = plugin
+            .mod_options(&root)
+            .map(|set| IncludeFilter::build(&set, staged.option_selection.as_ref()))
+            .filter(|f| !f.is_passthrough());
         let to_root = plugin.deploys_to_install_root(&root);
-        let wrap = !to_root
-            && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(&root));
+        let wrap =
+            !to_root && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(&root));
         if wrap {
             let folder_name = plugin.wrap_mod_folder_name(&root, &staged.name);
             if !folder_name.is_empty() {
@@ -1506,26 +1662,40 @@ pub fn deploy(
         } else {
             root.clone()
         };
-        let (files, copied) = deploy_tree(
+        let stats = deploy_tree(
             plugin,
             install_path,
             &deploy_root,
             &staged.name,
             project_name,
+            filter.as_ref(),
             &mut deployed,
         )?;
-        if files == 0 {
-            warnings.push(format!("No files deployed from {}", staged.name));
+        if stats.linked == 0 {
+            let msg = if filter.is_some() {
+                format!(
+                    "No files deployed from {}; check its options, every one may be turned off.",
+                    staged.name
+                )
+            } else {
+                format!("No files deployed from {}", staged.name)
+            };
+            warnings.push(msg);
         }
-        if copied > 0 {
-            copied_files += copied;
-        }
-        count += files;
+        copied_files += stats.copied;
+        skipped_files += stats.skipped;
+        count += stats.linked;
     }
 
     if copied_files > 0 {
         warnings.push(format!(
-            "{copied_files} file(s) were copied instead of hardlinked/symlinked (cross-volume or missing symlink privilege). On Windows, enable Developer Mode for symlink deploy."
+            "{copied_files} file(s) were copied instead of hardlinked because staging and the game are on different drives. Keep them on one drive to save space."
+        ));
+    }
+
+    if skipped_files > 0 {
+        warnings.push(format!(
+            "{skipped_files} file(s) were skipped because this game does not load them (documentation, previews, or loose archives)."
         ));
     }
 
@@ -1536,6 +1706,19 @@ pub fn deploy(
     }
 
     warnings.extend(plugin.after_deploy(install_path, &enabled_mod_folders)?);
+
+    // Warn about the tree we just produced, not the one we started from: a pack
+    // that failed to land leaves an install that cannot load anything, and a
+    // pre-purge check would report problems the deploy has already fixed.
+    warnings.extend(plugin.preflight_warnings_ctx(install_path, &base_ctx));
+    let missing = missing_deployed_paths(&deployed, install_path);
+    if !missing.is_empty() {
+        warnings.push(format!(
+            "{} deployed file(s) are already missing from the game folder, starting with {}. Purge and deploy again.",
+            missing.len(),
+            missing[0]
+        ));
+    }
 
     crate::config::ensure_game_dirs(paths, game_id)?;
     fs::write(
@@ -1549,24 +1732,27 @@ pub fn deploy(
     })
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct TreeStats {
+    linked: usize,
+    copied: usize,
+    skipped: usize,
+}
+
 fn deploy_tree(
     plugin: &dyn GamePlugin,
     install_path: &Path,
     content_root: &Path,
     mod_name: &str,
     project_name: Option<&str>,
+    filter: Option<&IncludeFilter>,
     deployed: &mut DeployManifest,
-) -> Result<(usize, usize)> {
-    let mut n = 0usize;
-    let mut copied = 0usize;
+) -> Result<TreeStats> {
+    let mut stats = TreeStats::default();
     let to_root = plugin.deploys_to_install_root(content_root);
-    let wrap = !to_root
-        && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root));
+    let wrap =
+        !to_root && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(content_root));
     let folder_name = plugin.wrap_mod_folder_name(content_root, mod_name);
-    let ctx = DeployContext {
-        project_name,
-        content_root: Some(content_root),
-    };
 
     for entry in WalkDir::new(content_root)
         .into_iter()
@@ -1576,8 +1762,26 @@ fn deploy_tree(
         if path == content_root {
             continue;
         }
-        let rel = path.strip_prefix(content_root)?;
-        let rel = normalize_relative(rel);
+        let source_rel = normalize_relative(path.strip_prefix(content_root)?);
+        // Options decide membership before the plugin decides layout, and they
+        // rewrite the path: an include folder is a container, so its contents
+        // deploy as if they had been at the mod root all along.
+        let rel = match filter {
+            Some(f) => match f.map(&source_rel, entry.file_type().is_dir()) {
+                Some(mapped) => mapped,
+                None => continue,
+            },
+            None => source_rel.clone(),
+        };
+        let ctx = DeployContext {
+            project_name,
+            content_root: Some(content_root),
+            source_dir: source_rel.parent(),
+        };
+        if entry.file_type().is_file() && !plugin.should_deploy_file_ctx(&rel, &ctx) {
+            stats.skipped += 1;
+            continue;
+        }
         let deploy_rel: PathBuf = if wrap {
             Path::new(&folder_name).join(&rel)
         } else {
@@ -1597,12 +1801,12 @@ fn deploy_tree(
             continue;
         }
         if link_or_copy(path, &dest)? == LinkKind::Copied {
-            copied += 1;
+            stats.copied += 1;
         }
         deployed.paths.push(dest.to_string_lossy().to_string());
-        n += 1;
+        stats.linked += 1;
     }
-    Ok((n, copied))
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -1623,6 +1827,243 @@ mod tests {
         (tmp, paths)
     }
 
+    /// A one-entry zip, returned as raw bytes so tests can truncate it.
+    fn zip_bytes() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        zip.start_file::<_, ()>("readme.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"hello").unwrap();
+        zip.finish().unwrap();
+        buf.into_inner()
+    }
+
+    /// Downloads land under a synthesized `.bin` name, so every extraction path
+    /// has to work from the header alone.
+    #[test]
+    fn a_zip_named_bin_still_extracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("helldivers2_383_35491.bin");
+        std::fs::write(&archive, zip_bytes()).unwrap();
+
+        let dest = tmp.path().join("out");
+        extract_archive(&archive, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("readme.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn a_sims_package_named_bin_is_staged_as_a_loose_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("sims4_99_1.bin");
+        let mut body = b"DBPF".to_vec();
+        body.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&archive, &body).unwrap();
+
+        let dest = tmp.path().join("out");
+        extract_archive(&archive, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("sims4_99_1.bin")).unwrap(), body);
+    }
+
+    /// A `.ts4script` is a real zip, so the loose-file rule must not swallow it.
+    #[test]
+    fn a_ts4script_is_copied_whole_rather_than_unpacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("mod.ts4script");
+        std::fs::write(&archive, zip_bytes()).unwrap();
+
+        let dest = tmp.path().join("out");
+        extract_archive(&archive, &dest).unwrap();
+        assert!(dest.join("mod.ts4script").exists());
+        assert!(!dest.join("readme.txt").exists());
+    }
+
+    /// The bug this whole change exists for: a download cut short used to be
+    /// reported as "unsupported archive type: .bin", which sent people looking
+    /// for a format problem that was never there.
+    #[test]
+    fn a_truncated_zip_reports_the_file_not_a_bogus_archive_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("helldivers2_383_35491.bin");
+        let full = zip_bytes();
+        std::fs::write(&archive, &full[..full.len() / 2]).unwrap();
+
+        let err = extract_archive(&archive, &tmp.path().join("out")).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("unsupported archive type"), "{msg}");
+        assert!(msg.contains("helldivers2_383_35491.bin"), "{msg}");
+        assert!(msg.contains("looks like zip"), "{msg}");
+        assert!(msg.contains("download again"), "{msg}");
+    }
+
+    #[test]
+    fn random_bytes_fail_with_the_size_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("garbage.bin");
+        std::fs::write(&archive, vec![0x42u8; 4096]).unwrap();
+
+        let err = extract_archive(&archive, &tmp.path().join("out")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("garbage.bin"), "{msg}");
+        assert!(msg.contains("4096 bytes"), "{msg}");
+        assert!(msg.contains("not a zip, 7z, or rar"), "{msg}");
+    }
+
+    #[test]
+    fn headers_are_recognized_regardless_of_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases: &[(&str, &[u8], ArchiveKind)] = &[
+            ("a.bin", b"PK\x03\x04rest", ArchiveKind::Zip),
+            ("b.zip", b"7z\xBC\xAF\x27\x1C\x00\x04", ArchiveKind::SevenZ),
+            ("c.bin", b"Rar!\x1a\x07\x01\x00", ArchiveKind::Rar),
+            ("d.bin", b"DBPF\x02\x00\x00\x00", ArchiveKind::Dbpf),
+        ];
+        for (name, magic, expected) in cases {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, magic).unwrap();
+            assert_eq!(detect_archive_kind(&path), Some(*expected), "{name}");
+        }
+
+        let plain = tmp.path().join("e.bin");
+        std::fs::write(&plain, b"nothing here").unwrap();
+        assert_eq!(detect_archive_kind(&plain), None);
+    }
+
+    /// An Arsenal-style pack: root file, a plain option, and a two-variant group.
+    fn stage_hd2_option_mod(paths: &Paths, game_id: &str) -> PathBuf {
+        let staging = paths.mods_dir(game_id).join("ArsenalMod_1_1");
+        std::fs::create_dir_all(staging.join("Head")).unwrap();
+        std::fs::create_dir_all(staging.join("Body").join("Blue")).unwrap();
+        std::fs::create_dir_all(staging.join("Body").join("Red")).unwrap();
+        std::fs::create_dir_all(staging.join("Unused")).unwrap();
+        std::fs::write(
+            staging.join("manifest.json"),
+            r#"{
+                "Version": 1,
+                "Name": "Arsenal Mod",
+                "Description": "",
+                "Options": [
+                    { "Name": "Head", "Include": ["Head"] },
+                    { "Name": "Body", "SubOptions": [
+                        { "Name": "Blue", "Include": ["Body/Blue"] },
+                        { "Name": "Red", "Include": ["Body/Red"] }
+                    ] }
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(staging.join("always.patch_0"), b"root").unwrap();
+        std::fs::write(staging.join("Head").join("aaa.patch_0"), b"head").unwrap();
+        std::fs::write(
+            staging.join("Body").join("Blue").join("bbb.patch_0"),
+            b"blue",
+        )
+        .unwrap();
+        std::fs::write(staging.join("Body").join("Red").join("bbb.patch_0"), b"red").unwrap();
+        std::fs::write(staging.join("Unused").join("ccc.patch_0"), b"unused").unwrap();
+        staging
+    }
+
+    fn hd2_order(staging: &Path, selection: Option<ModOptionSelection>) -> LoadOrder {
+        LoadOrder {
+            mods: vec![StagedMod {
+                id: "1_1".into(),
+                name: "Arsenal Mod".into(),
+                domain: "helldivers2".into(),
+                staging_path: staging.to_string_lossy().into(),
+                enabled: true,
+                order: 1,
+                option_selection: selection,
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn hd2_options_default_to_everything_on_with_the_first_variant() {
+        let _gate = crate::games::hd2_test_gate();
+        let (_tmp, paths) = test_paths();
+        let game_id = "hd2_default";
+        let install = tempfile::tempdir().unwrap();
+        let staging = stage_hd2_option_mod(&paths, game_id);
+        save_loadorder(&paths, game_id, &hd2_order(&staging, None)).unwrap();
+
+        deploy(&paths, game_id, "helldivers2", install.path(), None).unwrap();
+
+        let data = install.path().join("data");
+        assert!(data.join("always.patch_0").exists());
+        assert!(data.join("aaa.patch_0").exists());
+        // Blue is the first sub-option, so Red must not be there.
+        assert_eq!(std::fs::read(data.join("bbb.patch_0")).unwrap(), b"blue");
+        // A folder the manifest never includes is packaging, not content.
+        assert!(!data.join("ccc.patch_0").exists());
+        // Include folders are containers; they leave no shell behind.
+        assert!(!data.join("Head").exists());
+        assert!(!data.join("Body").exists());
+        assert!(!data.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn hd2_selection_picks_the_other_variant_and_drops_disabled_options() {
+        let _gate = crate::games::hd2_test_gate();
+        let (_tmp, paths) = test_paths();
+        let game_id = "hd2_selected";
+        let install = tempfile::tempdir().unwrap();
+        let staging = stage_hd2_option_mod(&paths, game_id);
+        let selection = ModOptionSelection {
+            enabled_options: vec!["1-body".into()],
+            sub_choice: [("1-body".to_string(), "1-body.1-red".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        save_loadorder(&paths, game_id, &hd2_order(&staging, Some(selection))).unwrap();
+
+        deploy(&paths, game_id, "helldivers2", install.path(), None).unwrap();
+
+        let data = install.path().join("data");
+        assert!(data.join("always.patch_0").exists());
+        assert!(!data.join("aaa.patch_0").exists());
+        assert_eq!(std::fs::read(data.join("bbb.patch_0")).unwrap(), b"red");
+    }
+
+    #[test]
+    fn hd2_option_selection_survives_a_reinstall() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "hd2_update";
+        let staging = stage_hd2_option_mod(&paths, game_id);
+        let selection = ModOptionSelection {
+            enabled_options: vec!["1-body".into()],
+            sub_choice: [("1-body".to_string(), "1-body.1-red".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mut order = hd2_order(&staging, Some(selection.clone()));
+        order.mods[0].nexus_mod_id = 1;
+        order.mods[0].nexus_file_id = 1;
+        save_loadorder(&paths, game_id, &order).unwrap();
+
+        let archive = _tmp.path().join("update.zip");
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>("abc.patch_0", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"x").unwrap();
+        zip.finish().unwrap();
+
+        let staged = stage_mod_replacing(
+            &paths,
+            game_id,
+            "1_1",
+            "Arsenal Mod",
+            "helldivers2",
+            1,
+            2,
+            None,
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(staged.option_selection, Some(selection));
+    }
+
     #[test]
     fn deploy_cyberpunk_preserves_bin_and_red4ext() {
         let (_tmp, paths) = test_paths();
@@ -1631,11 +2072,7 @@ mod tests {
 
         let staging = paths.mods_dir(game_id).join("CET_1_1");
         std::fs::create_dir_all(staging.join("bin").join("x64").join("plugins")).unwrap();
-        std::fs::write(
-            staging.join("bin").join("x64").join("version.dll"),
-            b"dll",
-        )
-        .unwrap();
+        std::fs::write(staging.join("bin").join("x64").join("version.dll"), b"dll").unwrap();
         std::fs::create_dir_all(staging.join("red4ext").join("plugins")).unwrap();
         std::fs::write(staging.join("red4ext").join("RED4ext.dll"), b"dll").unwrap();
 
@@ -1734,10 +2171,7 @@ mod tests {
 
         let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
-        assert!(install
-            .path()
-            .join("archive/pc/mod/Cool.archive")
-            .exists());
+        assert!(install.path().join("archive/pc/mod/Cool.archive").exists());
         assert!(install.path().join("r6/scripts/Mod/mod.reds").exists());
     }
 
@@ -1797,9 +2231,28 @@ mod tests {
         let result = deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
         assert!(result.file_count >= 1, "{:?}", result.warnings);
         let plugins = install.path().join("BepInEx/plugins");
-        assert!(plugins.is_dir(), "plugins should be a directory, not a symlink to a file");
-        assert!(plugins.join("DarkMode/DarkMode.dll").exists()
-            || plugins.join("DarkMode/DarkMode/DarkMode.dll").exists());
+        assert!(
+            plugins.is_dir(),
+            "plugins should be a directory, not a symlink to a file"
+        );
+        assert!(
+            plugins.join("DarkMode/DarkMode.dll").exists()
+                || plugins.join("DarkMode/DarkMode/DarkMode.dll").exists()
+        );
+    }
+
+    #[test]
+    fn stages_bare_package_file_without_extracting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let download = tmp.path().join("CoolHair.package");
+        std::fs::write(&download, b"DBPF").unwrap();
+        let staging = tmp.path().join("staged");
+
+        extract_archive(&download, &staging).unwrap();
+        assert_eq!(
+            std::fs::read(staging.join("CoolHair.package")).unwrap(),
+            b"DBPF"
+        );
     }
 
     #[test]
@@ -1826,11 +2279,8 @@ mod tests {
             install.path().join("BepInEx/plugins"),
         )
         .unwrap();
-        std::os::unix::fs::symlink(
-            staging.join("README.md"),
-            install.path().join("README.md"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(staging.join("README.md"), install.path().join("README.md"))
+            .unwrap();
 
         let removed = purge_install_symlinks(install.path(), &paths.data_dir).unwrap();
         assert!(removed >= 2, "removed {removed}");
@@ -1849,11 +2299,7 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("BigDart.dll"), b"dll").unwrap();
         std::fs::create_dir_all(install.path().join("BepInEx")).unwrap();
-        std::os::unix::fs::symlink(
-            &staging,
-            install.path().join("BepInEx/plugins"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(&staging, install.path().join("BepInEx/plugins")).unwrap();
 
         save_loadorder(
             &paths,
@@ -1892,8 +2338,13 @@ mod tests {
         let install = tempfile::tempdir().unwrap();
 
         let pack_staging = paths.mods_dir(game_id).join("BepInExPack_1");
-        std::fs::create_dir_all(pack_staging.join("BepInExPack").join("BepInEx").join("core"))
-            .unwrap();
+        std::fs::create_dir_all(
+            pack_staging
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
         std::fs::write(pack_staging.join("BepInExPack").join("winhttp.dll"), b"x").unwrap();
         std::fs::write(
             pack_staging.join("BepInExPack").join("doorstop_config.ini"),
@@ -1946,7 +2397,11 @@ mod tests {
                 || plugins.join("BigDart/BigDart.dll").is_file()
                 || plugins.join("BigDart_1/BigDart.dll").is_file()
         );
-        assert!(!install.path().join("BepInExPack").join("winhttp.dll").exists());
+        assert!(!install
+            .path()
+            .join("BepInExPack")
+            .join("winhttp.dll")
+            .exists());
     }
 
     #[test]
@@ -1956,8 +2411,13 @@ mod tests {
         let install = tempfile::tempdir().unwrap();
 
         let pack_staging = paths.mods_dir(game_id).join("BepInExPack_1");
-        std::fs::create_dir_all(pack_staging.join("BepInExPack").join("BepInEx").join("core"))
-            .unwrap();
+        std::fs::create_dir_all(
+            pack_staging
+                .join("BepInExPack")
+                .join("BepInEx")
+                .join("core"),
+        )
+        .unwrap();
         std::fs::write(pack_staging.join("BepInExPack").join("winhttp.dll"), b"x").unwrap();
         std::fs::write(pack_staging.join("manifest.json"), b"{}").unwrap();
         std::fs::write(pack_staging.join("icon.png"), b"png").unwrap();
@@ -1985,7 +2445,11 @@ mod tests {
         assert!(install.path().join("BepInEx").join("core").is_dir());
         assert!(!install.path().join("manifest.json").exists());
         assert!(!install.path().join("icon.png").exists());
-        assert!(!install.path().join("BepInExPack").join("winhttp.dll").exists());
+        assert!(!install
+            .path()
+            .join("BepInExPack")
+            .join("winhttp.dll")
+            .exists());
     }
 
     #[test]
@@ -2114,7 +2578,119 @@ mod tests {
             .join("plugins")
             .join("BigWalk.DarkMode")
             .join("BigWalk.DarkMode.dll");
-        assert!(correct.is_file(), "expected plugin at {}", correct.display());
+        assert!(
+            correct.is_file(),
+            "expected plugin at {}",
+            correct.display()
+        );
+    }
+
+    #[test]
+    fn deploy_never_symlinks_staging_into_the_game() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_no_symlinks";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("DarkMode_1");
+        std::fs::create_dir_all(staging.join("plugins")).unwrap();
+        std::fs::write(staging.join("plugins").join("DarkMode.dll"), b"dll").unwrap();
+        std::fs::write(staging.join("plugins").join("config.json"), b"{}").unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "darkmode".into(),
+                    name: "DarkMode".into(),
+                    source: ModSource::Thunderstore,
+                    domain: "big-walk".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+
+        // A loader that deletes its own plugin folder must not reach staging.
+        let plugins = install.path().join("BepInEx").join("plugins");
+        for name in ["DarkMode.dll", "config.json"] {
+            let deployed = plugins.join(name);
+            assert!(
+                !std::fs::symlink_metadata(&deployed)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name} was symlinked into the game folder"
+            );
+        }
+        std::fs::remove_dir_all(&plugins).unwrap();
+        assert!(staging.join("plugins").join("DarkMode.dll").is_file());
+        assert!(staging.join("plugins").join("config.json").is_file());
+    }
+
+    #[test]
+    fn deploy_warns_when_staged_files_went_missing() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_damaged";
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("Pack_1");
+        std::fs::create_dir_all(staging.join("plugins")).unwrap();
+        std::fs::write(staging.join("plugins").join("Pack.dll"), b"dll").unwrap();
+        let order = LoadOrder {
+            mods: vec![StagedMod {
+                id: "pack".into(),
+                name: "Pack".into(),
+                source: ModSource::Thunderstore,
+                domain: "big-walk".into(),
+                staging_path: staging.to_string_lossy().into(),
+                enabled: true,
+                order: 1,
+                // Extraction produced five files; four are gone.
+                staged_file_count: Some(5),
+                ..Default::default()
+            }],
+        };
+        save_loadorder(&paths, game_id, &order).unwrap();
+
+        assert_eq!(damaged_staging(&order).len(), 1);
+        let result = deploy(&paths, game_id, "bepinex", install.path(), None).unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("Pack is missing 4 of 5")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn purge_removes_empty_plugin_folders_left_behind() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "bw_prune";
+        let install = tempfile::tempdir().unwrap();
+        let plugins = install.path().join("BepInEx").join("plugins");
+        std::fs::create_dir_all(install.path().join("BepInEx").join("core")).unwrap();
+        std::fs::create_dir_all(plugins.join("GoneMod").join("nested")).unwrap();
+        std::fs::create_dir_all(plugins.join("StillHere")).unwrap();
+        std::fs::write(plugins.join("StillHere").join("mod.dll"), b"dll").unwrap();
+
+        purge_deploy(&paths, game_id, Some(install.path())).unwrap();
+        let removed = prune_empty_loader_dirs(
+            crate::games::plugin_by_id("bepinex").unwrap(),
+            install.path(),
+        );
+
+        assert_eq!(removed, 2);
+        assert!(!plugins.join("GoneMod").exists());
+        assert!(plugins.join("StillHere").join("mod.dll").is_file());
     }
 
     #[test]
@@ -2159,7 +2735,10 @@ mod tests {
         .unwrap();
         let result = deploy(&paths, game_id, "cyberpunk2077", install.path(), None).unwrap();
         assert_eq!(result.file_count, 0);
-        assert!(result.warnings.iter().any(|w| w.contains("Missing staging")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Missing staging")));
     }
 
     #[test]
@@ -2200,13 +2779,7 @@ mod tests {
         assert!(!install.path().join("mods/Nexus REDmod Title").exists());
     }
 
-    fn stage_stardew(
-        paths: &Paths,
-        game_id: &str,
-        id: &str,
-        name: &str,
-        staging: PathBuf,
-    ) {
+    fn stage_stardew(paths: &Paths, game_id: &str, id: &str, name: &str, staging: PathBuf) {
         save_loadorder(
             paths,
             game_id,
@@ -2247,7 +2820,10 @@ mod tests {
         assert!(install.path().join("Mods/CoolMod/manifest.json").exists());
         assert!(install.path().join("Mods/CoolMod/Cool.dll").exists());
         assert!(!install.path().join("Mods/Cool Mod/manifest.json").exists());
-        assert!(!result.warnings.iter().any(|w| w.contains("SMAPI not found")));
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|w| w.contains("SMAPI not found")));
     }
 
     #[test]
@@ -2294,6 +2870,145 @@ mod tests {
         assert_eq!(result.file_count, 2, "{:?}", result.warnings);
         assert!(install.path().join("Mods/ModA/manifest.json").exists());
         assert!(install.path().join("Mods/ModB/manifest.json").exists());
+    }
+
+    #[test]
+    fn deploy_sims4_wraps_mods_and_skips_unloadable_files() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sims4_deploy";
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp
+            .path()
+            .join("steamapps")
+            .join("common")
+            .join("The Sims 4");
+        std::fs::create_dir_all(&install).unwrap();
+        let user_dir = tmp
+            .path()
+            .join("steamapps")
+            .join("compatdata")
+            .join("1222670")
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("Documents")
+            .join("Electronic Arts")
+            .join("The Sims 4");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("MCCC_7_7");
+        std::fs::create_dir_all(staging.join("scripts")).unwrap();
+        std::fs::write(staging.join("mccc.package"), b"pkg").unwrap();
+        std::fs::write(staging.join("scripts").join("core.ts4script"), b"zip").unwrap();
+        std::fs::write(staging.join("README.txt"), b"docs").unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "7_7".into(),
+                    name: "MCCC".into(),
+                    nexus_mod_id: 7,
+                    nexus_file_id: 7,
+                    version: None,
+                    domain: "thesims4".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "sims4", &install, None).unwrap();
+        let mods = user_dir.join("Mods");
+        assert_eq!(result.file_count, 2, "{:?}", result.warnings);
+        assert!(mods.join("MCCC").join("mccc.package").exists());
+        // Flattened up from scripts/ so the game can still load it.
+        assert!(mods.join("MCCC").join("scripts_core.ts4script").exists());
+        assert!(!mods.join("MCCC").join("README.txt").exists());
+        assert!(mods.join("Resource.cfg").is_file());
+        assert!(
+            result.warnings.iter().any(|w| w.contains("skipped")),
+            "{:?}",
+            result.warnings
+        );
+
+        // Purge must clean the user-data folder, not just the install.
+        purge_deploy(&paths, game_id, Some(&install)).unwrap();
+        assert!(!mods.join("MCCC").join("mccc.package").exists());
+    }
+
+    #[test]
+    fn deploy_sims3_routes_packages_and_sims3packs() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "sims3_deploy";
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp
+            .path()
+            .join("steamapps")
+            .join("common")
+            .join("The Sims 3");
+        std::fs::create_dir_all(&install).unwrap();
+        let user_dir = tmp
+            .path()
+            .join("steamapps")
+            .join("compatdata")
+            .join("47890")
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("Documents")
+            .join("Electronic Arts")
+            .join("The Sims 3");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let staging = paths.mods_dir(game_id).join("HairSet_8_8");
+        std::fs::create_dir_all(staging.join("extras")).unwrap();
+        std::fs::write(staging.join("hair.package"), b"pkg").unwrap();
+        std::fs::write(staging.join("extras").join("bonus.sims3pack"), b"s3p").unwrap();
+        save_loadorder(
+            &paths,
+            game_id,
+            &LoadOrder {
+                mods: vec![StagedMod {
+                    id: "8_8".into(),
+                    name: "Hair Set".into(),
+                    nexus_mod_id: 8,
+                    nexus_file_id: 8,
+                    version: None,
+                    domain: "thesims3".into(),
+                    staging_path: staging.to_string_lossy().into(),
+                    enabled: true,
+                    order: 1,
+                    ..Default::default()
+                }],
+            },
+        )
+        .unwrap();
+
+        let result = deploy(&paths, game_id, "sims3", &install, None).unwrap();
+        assert_eq!(result.file_count, 2, "{:?}", result.warnings);
+        assert!(user_dir
+            .join("Mods")
+            .join("Packages")
+            .join("Hair Set")
+            .join("hair.package")
+            .exists());
+        // The Launcher only reads the top level of Downloads.
+        assert!(user_dir.join("Downloads").join("bonus.sims3pack").exists());
+        assert!(user_dir.join("Mods").join("Resource.cfg").is_file());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("Sims 3 Launcher")),
+            "{:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -2415,7 +3130,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path(), None).unwrap();
+        let result = deploy(
+            &paths,
+            game_id,
+            "warhammer40kdarktide",
+            install.path(),
+            None,
+        )
+        .unwrap();
         assert!(result.file_count >= 2, "{:?}", result.warnings);
         assert!(install.path().join("mods/HolyLight/HolyLight.mod").exists());
         assert!(!install.path().join("mods/Holy Light").exists());
@@ -2472,7 +3194,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = deploy(&paths, game_id, "warhammer40kdarktide", install.path(), None).unwrap();
+        let result = deploy(
+            &paths,
+            game_id,
+            "warhammer40kdarktide",
+            install.path(),
+            None,
+        )
+        .unwrap();
         assert!(result.file_count >= 3, "{:?}", result.warnings);
         assert!(install.path().join("tools/dtkit-patch.exe").exists());
         assert!(install.path().join("binaries/mod_loader").exists());
@@ -2559,17 +3288,18 @@ mod tests {
         for id in ["A", "B", "Z", "W"] {
             std::fs::create_dir_all(staging_root.join(id)).unwrap();
         }
-        let staged = |id: &str, independent: bool, depends_on: Vec<String>, collection_ids: Vec<String>| {
-            StagedMod {
-                id: id.into(),
-                name: id.into(),
-                staging_path: staging_root.join(id).to_string_lossy().into(),
-                independent,
-                depends_on,
-                collection_ids,
-                ..Default::default()
-            }
-        };
+        let staged =
+            |id: &str, independent: bool, depends_on: Vec<String>, collection_ids: Vec<String>| {
+                StagedMod {
+                    id: id.into(),
+                    name: id.into(),
+                    staging_path: staging_root.join(id).to_string_lossy().into(),
+                    independent,
+                    depends_on,
+                    collection_ids,
+                    ..Default::default()
+                }
+            };
         save_loadorder(
             &paths,
             game_id,

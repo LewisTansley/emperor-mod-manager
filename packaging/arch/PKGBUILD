@@ -1,0 +1,32 @@
+# Maintainer: emperor-mod-manager contributors <https://github.com/LewisTansley/emperor-mod-manager>
+pkgname=emperor-mod-manager-bin
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Mod manager for Nexus Mods, Thunderstore and mod.io"
+arch=('x86_64')
+url="https://github.com/LewisTansley/emperor-mod-manager"
+license=('AGPL-3.0-or-later')
+depends=('webkit2gtk-4.1' 'gtk3' 'hicolor-icon-theme')
+optdepends=('gnome-keyring: store the Nexus/mod.io API keys in the Secret Service keyring'
+            'wine: Darktide dtkit-patch when no native patcher is present')
+provides=('emperor-mod-manager')
+conflicts=('emperor-mod-manager')
+options=('!strip')
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/emperor-mod-manager-$pkgver-x86_64.tar.gz")
+# Releases publish a PKGBUILD asset with the real checksum; this in-repo copy
+# tracks main, where the next tarball does not exist yet.
+sha256sums=('SKIP')
+
+package() {
+  cd "$srcdir/emperor-mod-manager-$pkgver-x86_64"
+
+  install -Dm755 emperor-mod-manager "$pkgdir/usr/bin/emperor-mod-manager"
+  install -Dm644 emperor-mod-manager.desktop \
+    "$pkgdir/usr/share/applications/emperor-mod-manager.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  for size in 32x32 128x128 256x256; do
+    install -Dm644 "icons/$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/$size/apps/emperor-mod-manager.png"
+  done
+}

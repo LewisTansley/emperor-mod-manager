@@ -1,7 +1,7 @@
 {
   "name": "emperor-mod-manager",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.5",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "scripts": {
@@ -11,6 +11,7 @@
     "tauri": "tauri",
     "build:host": "tauri build",
     "build:release": "node scripts/build-release.mjs",
+    "package:linux-tarball": "node scripts/package-linux-tarball.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

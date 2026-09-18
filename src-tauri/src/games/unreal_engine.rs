@@ -25,11 +25,7 @@ pub const UE_PRESERVE_ROOTS: &[&str] = &[
 ];
 
 /// Vortex-style markers that mean pak files in this pack are LogicMods.
-const LOGICMOD_MARKERS: &[&str] = &[
-    ".logicmod",
-    ".ue4sslogicmod",
-    "ue4sslogicmod.info",
-];
+const LOGICMOD_MARKERS: &[&str] = &[".logicmod", ".ue4sslogicmod", "ue4sslogicmod.info"];
 
 /// Injector / companion DLLs that deploy next to the game binary.
 const ROOT_INJECTOR_DLLS: &[&str] = &[
@@ -46,6 +42,10 @@ pub struct DeployContext<'a> {
     pub project_name: Option<&'a str>,
     /// Staging content root (for LogicMod marker detection).
     pub content_root: Option<&'a Path>,
+    /// Directory the staged file came from, relative to the content root. Mod
+    /// options peel their include folder off `relative` before a plugin sees
+    /// it, so this is what tells two identically named files apart.
+    pub source_dir: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +60,7 @@ impl UeLayout {
     }
 
     pub fn paks_dir(&self, install_path: &Path) -> PathBuf {
-        self.project_dir(install_path)
-            .join("Content")
-            .join("Paks")
+        self.project_dir(install_path).join("Content").join("Paks")
     }
 
     pub fn mods_dir(&self, install_path: &Path) -> PathBuf {
@@ -134,8 +132,7 @@ fn looks_like_ue_project(dir: &Path) -> bool {
     if dir.join("Content").join("Paks").is_dir() {
         return true;
     }
-    if dir.join("Binaries").join("Win64").is_dir() || dir.join("Binaries").join("WinGDK").is_dir()
-    {
+    if dir.join("Binaries").join("Win64").is_dir() || dir.join("Binaries").join("WinGDK").is_dir() {
         return true;
     }
     // Loose .uproject next to Content/
@@ -195,10 +192,7 @@ fn detect_binaries_platform(project_dir: &Path) -> String {
 }
 
 /// Resolve layout: preferred override, else detect, else preferred-as-literal (for tests / offline).
-pub fn resolve_layout(
-    install_path: &Path,
-    preferred_project: Option<&str>,
-) -> Result<UeLayout> {
+pub fn resolve_layout(install_path: &Path, preferred_project: Option<&str>) -> Result<UeLayout> {
     if let Some(layout) = detect_ue_layout_with_preferred(install_path, preferred_project) {
         return Ok(layout);
     }
@@ -251,9 +245,7 @@ fn is_pak_like(name: &str) -> bool {
 
 fn is_logicmod_marker_file(name: &str) -> bool {
     let lower = name.to_lowercase();
-    LOGICMOD_MARKERS
-        .iter()
-        .any(|m| lower == m.to_lowercase())
+    LOGICMOD_MARKERS.iter().any(|m| lower == m.to_lowercase())
 }
 
 fn is_injector_dll(name: &str) -> bool {
@@ -470,11 +462,7 @@ macro_rules! ue_title_plugin {
                 $preserve
             }
 
-            fn resolve_deploy_root(
-                &self,
-                install_path: &Path,
-                relative: &Path,
-            ) -> Result<PathBuf> {
+            fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
                 resolve_ue_deploy(
                     install_path,
                     relative,
@@ -706,11 +694,7 @@ impl GamePlugin for MarvelRivalsPlugin {
         warnings
     }
 
-    fn preflight_warnings_ctx(
-        &self,
-        install_path: &Path,
-        ctx: &DeployContext<'_>,
-    ) -> Vec<String> {
+    fn preflight_warnings_ctx(&self, install_path: &Path, ctx: &DeployContext<'_>) -> Vec<String> {
         let root = marvel_ue_install_root(install_path);
         let preferred = ctx.project_name.or(Some("Marvel"));
         let mut warnings = ue_preflight_warnings(&root, preferred);
@@ -765,11 +749,7 @@ impl GamePlugin for PavlovPlugin {
         warnings
     }
 
-    fn preflight_warnings_ctx(
-        &self,
-        install_path: &Path,
-        ctx: &DeployContext<'_>,
-    ) -> Vec<String> {
+    fn preflight_warnings_ctx(&self, install_path: &Path, ctx: &DeployContext<'_>) -> Vec<String> {
         let preferred = ctx.project_name.or(Some("Pavlov"));
         let mut warnings = ue_preflight_warnings(install_path, preferred);
         warnings.push(
@@ -818,11 +798,7 @@ impl GamePlugin for UnrealEnginePlugin {
         ue_preflight_warnings(install_path, None)
     }
 
-    fn preflight_warnings_ctx(
-        &self,
-        install_path: &Path,
-        ctx: &DeployContext<'_>,
-    ) -> Vec<String> {
+    fn preflight_warnings_ctx(&self, install_path: &Path, ctx: &DeployContext<'_>) -> Vec<String> {
         ue_preflight_warnings(install_path, ctx.project_name)
     }
 }
@@ -857,11 +833,8 @@ mod tests {
         let install = Path::new("/game");
         let p = Stalker2HeartOfChornobylPlugin;
         assert_eq!(
-            p.resolve_deploy_root(
-                install,
-                Path::new("Stalker2/Content/Paks/~mods/Foo.pak")
-            )
-            .unwrap(),
+            p.resolve_deploy_root(install, Path::new("Stalker2/Content/Paks/~mods/Foo.pak"))
+                .unwrap(),
             PathBuf::from("/game/Stalker2/Content/Paks/~mods/Foo.pak")
         );
     }
@@ -871,11 +844,13 @@ mod tests {
         let install = Path::new("/game");
         let p = Stalker2HeartOfChornobylPlugin;
         assert_eq!(
-            p.resolve_deploy_root(install, Path::new("Foo.pak")).unwrap(),
+            p.resolve_deploy_root(install, Path::new("Foo.pak"))
+                .unwrap(),
             PathBuf::from("/game/Stalker2/Content/Paks/~mods/Foo.pak")
         );
         assert_eq!(
-            p.resolve_deploy_root(install, Path::new("Foo.ucas")).unwrap(),
+            p.resolve_deploy_root(install, Path::new("Foo.ucas"))
+                .unwrap(),
             PathBuf::from("/game/Stalker2/Content/Paks/~mods/Foo.ucas")
         );
     }
@@ -913,8 +888,8 @@ mod tests {
         std::fs::write(staging.path().join(".logicmod"), b"").unwrap();
         let install = Path::new("/game");
         let ctx = DeployContext {
-            project_name: None,
             content_root: Some(staging.path()),
+            ..Default::default()
         };
         assert_eq!(
             resolve_ue_deploy(install, Path::new("MyBp.pak"), Some("Stalker2"), &ctx).unwrap(),
@@ -948,7 +923,7 @@ mod tests {
         let install = Path::new("/game");
         let ctx = DeployContext {
             project_name: Some("CustomGame"),
-            content_root: None,
+            ..Default::default()
         };
         assert_eq!(
             UnrealEnginePlugin
@@ -1008,7 +983,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             dest,
-            marvel.join("Content").join("Paks").join("~mods").join("Skin.pak")
+            marvel
+                .join("Content")
+                .join("Paks")
+                .join("~mods")
+                .join("Skin.pak")
         );
         let warns = MarvelRivalsPlugin.preflight_warnings(tmp.path());
         assert!(warns.iter().any(|w| w.contains("signature bypass")));

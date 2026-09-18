@@ -17,9 +17,15 @@ use crate::{
     assist::{AssistBounds, AssistContext},
     config::{self, AppConfig, ManagedGame, Paths, APP_NAME, APP_VERSION},
     detection::{self, DetectedGame},
-    games, migration,
+    games::{self, GamePlugin},
+    migration,
     modio_api::{self, ModioClient, ModioFileInfo, ModioModDetail},
-    mods::{self, CollectionKind, CollectionSource, InstalledCollection, ModSource, StagedMod, StagedModUpdate},
+    mods::{
+        self,
+        options::{self, ModOptionSelection, ModOptionSet},
+        CollectionKind, CollectionSource, InstalledCollection, ModSource, StagedMod,
+        StagedModUpdate,
+    },
     nexus::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
         ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
@@ -29,7 +35,7 @@ use crate::{
         SavedCollectionEntry, ShareAssistFile, ShareDecodePreview, ShareImportResult,
         ShareModSource,
     },
-    thunderstore::{self, ThunderstoreClient, TsPackageDetail, TsDependency},
+    thunderstore::{self, ThunderstoreClient, TsDependency, TsPackageDetail},
 };
 
 #[derive(Clone)]
@@ -116,7 +122,14 @@ pub struct AppState {
     pub nexus_games_cache: Mutex<Option<Vec<nexus::NexusGameEntry>>>,
     /// Session cache of Thunderstore communities for catalog matching.
     pub ts_communities_cache: Mutex<Option<Vec<thunderstore::TsCommunity>>>,
+    /// Caps simultaneous transfers. Installing a collection queues dozens of
+    /// downloads at once, and saturating the connection is what makes CDN
+    /// streams stall and end short in the first place.
+    pub download_slots: tokio::sync::Semaphore,
 }
+
+/// Enough to keep a fast link busy without starving any single transfer.
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DownloadItem {
@@ -185,6 +198,7 @@ impl AppState {
             ts_package_cache: Mutex::new(HashMap::new()),
             nexus_games_cache: Mutex::new(None),
             ts_communities_cache: Mutex::new(None),
+            download_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
         })
     }
 
@@ -264,6 +278,11 @@ fn load_modio_key_with_fallback(paths: &Paths) -> anyhow::Result<Option<String>>
 
 fn is_active_download_status(status: &str) -> bool {
     status == "downloading" || status == "extracting" || status == "paused"
+}
+
+/// Terminal states that belong in the Recent list and are safe to forget.
+fn is_finished_download_status(status: &str) -> bool {
+    matches!(status, "done" | "staged" | "failed" | "cancelled")
 }
 
 fn push_download(state: &AppState, item: DownloadItem) {
@@ -530,6 +549,21 @@ fn progress_callback(
 
 fn file_offset(path: &PathBuf) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The extension worth carrying over from an upload's real name. Anything
+/// containing a path separator or no extension at all is ignored, and the
+/// result is lowercased so `is_loose_mod_file` matches.
+fn archive_extension(file_name: Option<&str>) -> Option<String> {
+    let name = file_name?;
+    if name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    let ext = Path::new(name).extension()?.to_str()?.to_lowercase();
+    if ext.is_empty() || ext.len() > 12 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext)
 }
 
 #[tauri::command]
@@ -1021,7 +1055,9 @@ pub async fn suggest_catalog_ids_batch(
 }
 
 #[tauri::command]
-pub fn get_game_health(state: State<'_, AppState>) -> Result<Vec<detection::reconcile::GameHealth>, String> {
+pub fn get_game_health(
+    state: State<'_, AppState>,
+) -> Result<Vec<detection::reconcile::GameHealth>, String> {
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
     let detected = detection::scan_games();
     Ok(detection::reconcile::compute_game_health(
@@ -1707,7 +1743,10 @@ fn filter_ts_modpacks(
     filter_ts_packages(community, &packs, query, include_nsfw, offset, count)
 }
 
-fn snapshot_mod_ids(paths: &crate::config::Paths, game_id: &str) -> Result<HashSet<String>, String> {
+fn snapshot_mod_ids(
+    paths: &crate::config::Paths,
+    game_id: &str,
+) -> Result<HashSet<String>, String> {
     let order = mods::load_loadorder(paths, game_id).map_err(|e| e.to_string())?;
     Ok(order.mods.into_iter().map(|m| m.id).collect())
 }
@@ -1801,7 +1840,20 @@ fn apply_ts_depends_on(
     Ok(())
 }
 
-async fn stage_thunderstore_package_newest(
+/// What to do when the package is already staged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagePolicy {
+    /// Keep what is installed unless the incoming build is newer.
+    KeepNewer,
+    /// Install exactly this version, downgrading if needed. Dependency pins ask
+    /// for this: a mod set only loads with the versions it was tested against.
+    MatchResolved,
+    /// Download again even if the same version is recorded (repairing staging).
+    Force,
+}
+
+/// Stage `pkg` at its first listed version.
+async fn stage_thunderstore_package(
     app: &tauri::AppHandle,
     state: &AppState,
     client: &ThunderstoreClient,
@@ -1811,6 +1863,7 @@ async fn stage_thunderstore_package_newest(
     display_name: &str,
     enabled: Option<bool>,
     reuse_dl_id: Option<String>,
+    policy: StagePolicy,
 ) -> Result<StagedMod, String> {
     let ns = pkg.namespace.clone();
     let pkg_name = pkg.name.clone();
@@ -1821,23 +1874,24 @@ async fn stage_thunderstore_package_newest(
     let incoming_ver = &ver.version_number;
     let order = mods::load_loadorder(&state.paths, game_id).map_err(|e| e.to_string())?;
     if let Some(existing) = mods::find_thunderstore_package(&order, &ns, &pkg_name) {
-        if !mods::incoming_is_newer(existing.version.as_deref(), incoming_ver) {
+        let keep_existing = match policy {
+            StagePolicy::KeepNewer => {
+                !mods::incoming_is_newer(existing.version.as_deref(), incoming_ver)
+            }
+            StagePolicy::MatchResolved => {
+                existing.version.as_deref() == Some(incoming_ver.as_str())
+            }
+            StagePolicy::Force => false,
+        };
+        if keep_existing {
             let id = existing.id.clone();
             let apply_enabled = match enabled {
                 Some(true) => Some(true),
                 _ => None,
             };
-            return mods::merge_mod_meta(
-                &state.paths,
-                game_id,
-                &id,
-                &[],
-                &[],
-                None,
-                apply_enabled,
-            )
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Missing staged package {id}"));
+            return mods::merge_mod_meta(&state.paths, game_id, &id, &[], &[], None, apply_enabled)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Missing staged package {id}"));
         }
     }
 
@@ -1891,8 +1945,14 @@ async fn stage_thunderstore_package_newest(
         cancel: cancel.clone(),
         pause: pause.clone(),
     };
-    match client.download_version(ver, &dest, Some(&control)).await {
+    let on_progress = progress_callback(Some(app), dl_id.clone());
+    match client
+        .download_version(ver, &dest, Some(&control), on_progress.as_ref())
+        .await
+    {
         Ok(()) => {
+            update_download(state, &dl_id, "extracting", None);
+            let _ = app.emit("downloads-changed", ());
             let staged = mods::stage_thunderstore_mod(
                 &state.paths,
                 game_id,
@@ -1983,7 +2043,7 @@ async fn stage_thunderstore_with_deps(
             format!("{} (dependency)", pkg.name)
         };
         let enabled = if is_root { root_enabled } else { None };
-        let staged = stage_thunderstore_package_newest(
+        let staged = stage_thunderstore_package(
             app,
             state,
             client,
@@ -1993,6 +2053,12 @@ async fn stage_thunderstore_with_deps(
             &display,
             enabled,
             None,
+            // Never downgrade the package the user asked for, only its deps.
+            if is_root {
+                StagePolicy::KeepNewer
+            } else {
+                StagePolicy::MatchResolved
+            },
         )
         .await?;
         staged_all.push(staged);
@@ -2096,8 +2162,7 @@ pub async fn import_thunderstore_profile(
         .paths
         .downloads_dir()
         .join(format!("ts_profile_{}", sanitize_filename::sanitize(&code)));
-    let manifest =
-        thunderstore::extract_profile_zip(&bytes, &temp).map_err(|e| e.to_string())?;
+    let manifest = thunderstore::extract_profile_zip(&bytes, &temp).map_err(|e| e.to_string())?;
     if let Some(slug) = manifest.community.as_deref() {
         if !slug.is_empty() && !thunderstore::community_slug_matches(slug, &community) {
             let _ = std::fs::remove_dir_all(&temp);
@@ -2173,14 +2238,9 @@ pub async fn import_thunderstore_profile(
     );
     if thunderstore::profile_has_overlay_files(&temp) {
         let overlay_name = format!("{} configs", manifest.profile_name);
-        let staged = mods::stage_overlay_dir(
-            &state.paths,
-            &game_id,
-            &overlay_id,
-            &overlay_name,
-            &temp,
-        )
-        .map_err(|e| e.to_string())?;
+        let staged =
+            mods::stage_overlay_dir(&state.paths, &game_id, &overlay_id, &overlay_name, &temp)
+                .map_err(|e| e.to_string())?;
         member_ids.push(staged.id);
     }
     let _ = std::fs::remove_dir_all(&temp);
@@ -2362,11 +2422,20 @@ pub async fn download_modio_mod(
         }
         store_restart_meta(&state, &dl_id, modio_source);
         let _ = app.emit("downloads-changed", ());
+        let on_progress = progress_callback(Some(&app), dl_id.clone());
         match client
-            .download_file(modio_game_id, mid, Some(resolved_file), &dest)
+            .download_file(
+                modio_game_id,
+                mid,
+                Some(resolved_file),
+                &dest,
+                on_progress.as_ref(),
+            )
             .await
         {
             Ok(()) => {
+                update_download(&state, &dl_id, "extracting", None);
+                let _ = app.emit("downloads-changed", ());
                 let staged = mods::stage_modio_mod(
                     &state.paths,
                     &game_id,
@@ -2506,7 +2575,9 @@ pub struct CollectionCatalogPage {
     pub thunderstore_available: bool,
 }
 
-fn interleave_collection_hits(sources: Vec<Vec<nexus::CollectionHit>>) -> Vec<nexus::CollectionHit> {
+fn interleave_collection_hits(
+    sources: Vec<Vec<nexus::CollectionHit>>,
+) -> Vec<nexus::CollectionHit> {
     let mut iters: Vec<_> = sources
         .into_iter()
         .map(|v| v.into_iter().peekable())
@@ -2598,7 +2669,10 @@ pub async fn search_collection_catalog(
                         offset: offset as u32,
                         count: count as u32,
                     };
-                    match client.search_collections(domain, &query, adult, &opts).await {
+                    match client
+                        .search_collections(domain, &query, adult, &opts)
+                        .await
+                    {
                         Ok(page) => {
                             nexus_total = page.total_count as u32;
                             nexus_hits = page.items;
@@ -2627,8 +2701,7 @@ pub async fn search_collection_catalog(
 
     let items = interleave_collection_hits(vec![nexus_hits, ts_hits]);
     let total_count = nexus_total.saturating_add(ts_total);
-    let has_more = (offset + count) < nexus_total as usize
-        || (offset + count) < ts_total as usize;
+    let has_more = (offset + count) < nexus_total as usize || (offset + count) < ts_total as usize;
 
     Ok(CollectionCatalogPage {
         items,
@@ -2773,6 +2846,14 @@ async fn download_and_stage_inner(
     };
     let on_progress = progress_callback(app, dl_id.clone());
 
+    // Held for the transfer only; extraction is disk-bound and should not
+    // occupy a network slot.
+    let _slot = state
+        .download_slots
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
+
     let download_result = client
         .download_file(
             domain,
@@ -2788,8 +2869,8 @@ async fn download_and_stage_inner(
         )
         .await;
 
-    match download_result {
-        Ok(()) => {}
+    let cdn_name = match download_result {
+        Ok(name) => name,
         Err(e) => {
             let msg = e.to_string();
             if is_pause_err(&msg) || pause.load(Ordering::SeqCst) {
@@ -2802,11 +2883,15 @@ async fn download_and_stage_inner(
                 clear_download_job(state, &dl_id);
                 return Err("Cancelled".into());
             }
+            // The partial is the resume base for the next attempt, and the
+            // path is derived from the file id, so keeping a broken one makes
+            // every retry fail the same way. Start clean instead.
+            let _ = std::fs::remove_file(&dest);
             update_download(state, &dl_id, "failed", Some(msg.clone()));
             clear_download_job(state, &dl_id);
             return Err(msg);
         }
-    }
+    };
 
     if cancel.load(Ordering::SeqCst) {
         let _ = std::fs::remove_file(&dest);
@@ -2818,6 +2903,28 @@ async fn download_and_stage_inner(
         mark_paused(app, state, &dl_id);
         return Err("Paused".into());
     }
+
+    drop(_slot);
+
+    // Downloading to a stable `.bin` name keeps pause/resume working, but
+    // staging needs the real extension: a Sims `.package` is recognized by name,
+    // not by header. Rename only now that the transfer is verified complete.
+    let dest = match archive_extension(cdn_name.as_deref()) {
+        Some(ext) => {
+            let renamed = state
+                .paths
+                .downloads_dir()
+                .join(format!("{domain}_{mod_id}_{file_id}.{ext}"));
+            match std::fs::rename(&dest, &renamed) {
+                Ok(()) => renamed,
+                Err(e) => {
+                    log::warn!("could not rename {} to {ext}: {e}", dest.display());
+                    dest
+                }
+            }
+        }
+        None => dest,
+    };
 
     update_download(state, &dl_id, "extracting", None);
     if let Some(handle) = app {
@@ -2873,6 +2980,8 @@ async fn download_and_stage_inner(
         }
         Err(e) => {
             let msg = e.to_string();
+            // An archive that would not extract is worthless; never resume onto it.
+            let _ = std::fs::remove_file(&dest);
             if cancel.load(Ordering::SeqCst) {
                 mark_cancelled(state, &dl_id);
             } else {
@@ -3482,6 +3591,14 @@ async fn fetch_and_stage_cdn(
         dest.display()
     );
 
+    // Held for the transfer only; extraction is disk-bound and should not
+    // occupy a network slot.
+    let slot = state
+        .download_slots
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
+
     let download_result = stream_url_to_file(
         &client,
         cdn_url,
@@ -3516,6 +3633,9 @@ async fn fetch_and_stage_cdn(
             } else {
                 msg.clone()
             };
+            // Same reasoning as the API path: a failed transfer must not become
+            // the resume base for the next attempt.
+            let _ = std::fs::remove_file(&dest);
             update_download(state, dl_id, "failed", Some(fail_msg.clone()));
             clear_download_job(state, dl_id);
             return Err(fail_msg);
@@ -3532,6 +3652,24 @@ async fn fetch_and_stage_cdn(
         mark_paused(Some(app), state, dl_id);
         return Err("Paused".into());
     }
+
+    drop(slot);
+
+    // Same as the API path: give staging the real extension now that the
+    // transfer is known complete.
+    let dest = match archive_extension(nexus::filename_from_url(cdn_url).as_deref()) {
+        Some(ext) => {
+            let renamed = dest.with_extension(&ext);
+            match std::fs::rename(&dest, &renamed) {
+                Ok(()) => renamed,
+                Err(e) => {
+                    log::warn!("could not rename {} to {ext}: {e}", dest.display());
+                    dest
+                }
+            }
+        }
+        None => dest,
+    };
 
     log::info!("cdn download saved to {}", dest.display());
 
@@ -3588,6 +3726,8 @@ async fn fetch_and_stage_cdn(
         }
         Err(e) => {
             let msg = e.to_string();
+            // An archive that would not extract is worthless; never resume onto it.
+            let _ = std::fs::remove_file(&dest);
             if cancel.load(Ordering::SeqCst) {
                 mark_cancelled(state, dl_id);
                 clear_download_job(state, dl_id);
@@ -3701,10 +3841,7 @@ pub fn list_mods(state: State<'_, AppState>, game_id: String) -> Result<Vec<Stag
     Ok(order.mods)
 }
 
-async fn detect_update_for_staged(
-    state: &AppState,
-    staged: &StagedMod,
-) -> Option<StagedModUpdate> {
+async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Option<StagedModUpdate> {
     match staged.source {
         ModSource::Nexus => {
             if staged.nexus_mod_id == 0 || staged.domain.is_empty() {
@@ -3725,8 +3862,11 @@ async fn detect_update_for_staged(
                     is_primary: f.is_primary,
                 })
                 .collect();
-            let candidate =
-                mods::nexus_update_candidate(staged.nexus_file_id, staged.version.as_deref(), &metas)?;
+            let candidate = mods::nexus_update_candidate(
+                staged.nexus_file_id,
+                staged.version.as_deref(),
+                &metas,
+            )?;
             Some(StagedModUpdate {
                 staged_id: staged.id.clone(),
                 available_version: candidate.version.clone(),
@@ -3743,10 +3883,7 @@ async fn detect_update_for_staged(
                 return None;
             }
             let client = ThunderstoreClient::new().ok()?;
-            let detail = client
-                .get_package(&staged.domain, ns, name)
-                .await
-                .ok()?;
+            let detail = client.get_package(&staged.domain, ns, name).await.ok()?;
             let latest = detail
                 .latest_version
                 .or_else(|| detail.versions.first().map(|v| v.version_number.clone()))?;
@@ -3872,7 +4009,7 @@ pub async fn update_staged_mod(
                 .get_package(&staged.domain, &ns, &name)
                 .await
                 .map_err(|e| e.to_string())?;
-            stage_thunderstore_package_newest(
+            stage_thunderstore_package(
                 &app,
                 &*state,
                 &client,
@@ -3882,6 +4019,7 @@ pub async fn update_staged_mod(
                 &staged.name,
                 Some(staged.enabled),
                 None,
+                StagePolicy::KeepNewer,
             )
             .await
         }
@@ -3998,8 +4136,7 @@ pub fn export_share_code(
 ) -> Result<ExportShareResult, String> {
     let game = managed_game(&state, &game_id)?;
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-    let (manifest, skipped) =
-        share::build_manifest_from_loadorder(&order, &game, name.clone());
+    let (manifest, skipped) = share::build_manifest_from_loadorder(&order, &game, name.clone());
     if manifest.mods.is_empty() {
         return Err(if skipped.is_empty() {
             "No enabled mods to share.".into()
@@ -4025,8 +4162,7 @@ pub fn export_share_code(
             code.len() as f64 / 1024.0
         ));
     }
-    let saved = share::entry_from_code(&code, name, Some(game_id))
-        .map_err(|e| e.to_string())?;
+    let saved = share::entry_from_code(&code, name, Some(game_id)).map_err(|e| e.to_string())?;
     let saved = share::add_saved_collection(&state.paths, saved).map_err(|e| e.to_string())?;
     Ok(ExportShareResult {
         code,
@@ -4077,12 +4213,8 @@ pub fn detect_import_code(code: String) -> Result<DetectImportResult, String> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImportCodeResult {
-    Emperor {
-        result: ShareImportResult,
-    },
-    ThunderstoreProfile {
-        collection: InstalledCollection,
-    },
+    Emperor { result: ShareImportResult },
+    ThunderstoreProfile { collection: InstalledCollection },
 }
 
 #[tauri::command]
@@ -4292,11 +4424,14 @@ pub async fn import_share_code(
                     );
                 }
                 let _ = app.emit("downloads-changed", ());
+                let on_progress = progress_callback(Some(&app), dl_id.clone());
                 match client
-                    .download_file(gid, mid, Some(resolved_file), &dest)
+                    .download_file(gid, mid, Some(resolved_file), &dest, on_progress.as_ref())
                     .await
                 {
                     Ok(()) => {
+                        update_download(&state, &dl_id, "extracting", None);
+                        let _ = app.emit("downloads-changed", ());
                         let staged = mods::stage_modio_mod(
                             &state.paths,
                             &game_id,
@@ -4472,10 +4607,12 @@ pub fn save_collection_code(
 ) -> Result<SavedCollectionEntry, String> {
     let kind = share::detect_code_kind(code.trim());
     if kind != ImportCodeKind::Emperor {
-        return Err("Only Emperor share codes (#emperor1) can be saved to the local library.".into());
+        return Err(
+            "Only Emperor share codes (#emperor1) can be saved to the local library.".into(),
+        );
     }
-    let entry = share::entry_from_code(code.trim(), name, source_game_id)
-        .map_err(|e| e.to_string())?;
+    let entry =
+        share::entry_from_code(code.trim(), name, source_game_id).map_err(|e| e.to_string())?;
     share::add_saved_collection(&state.paths, entry).map_err(|e| e.to_string())
 }
 
@@ -4523,6 +4660,108 @@ pub fn set_load_order(
     mods::set_load_order(&state.paths, &game_id, &ordered_ids).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Serialize)]
+pub struct ModOptionsView {
+    pub set: ModOptionSet,
+    /// What is in effect right now: the stored picks, or the defaults when the
+    /// user has not opened the dialog yet.
+    pub selection: ModOptionSelection,
+}
+
+fn plugin_for_game(state: &AppState, game_id: &str) -> Result<&'static dyn GamePlugin, String> {
+    let cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let plugin_id = cfg
+        .managed_games
+        .iter()
+        .find(|g| g.id == game_id)
+        .map(|g| g.plugin_id.clone())
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    drop(cfg);
+    games::plugin_by_id(&plugin_id).ok_or_else(|| format!("Unknown game plugin: {plugin_id}"))
+}
+
+/// The staged content root a plugin inspects, i.e. what deploy would use.
+fn staged_content_root(staged: &StagedMod, plugin: &dyn GamePlugin) -> Option<PathBuf> {
+    let staging = PathBuf::from(&staged.staging_path);
+    if !staging.is_dir() {
+        return None;
+    }
+    games::normalize_staging_root(&staging, plugin).ok()
+}
+
+#[tauri::command]
+pub fn get_mod_options(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+) -> Result<Option<ModOptionsView>, String> {
+    let plugin = plugin_for_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == mod_id)
+        .ok_or_else(|| format!("Mod not found: {mod_id}"))?;
+    let Some(root) = staged_content_root(staged, plugin) else {
+        return Ok(None);
+    };
+    let Some(set) = plugin.mod_options(&root).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let selection = options::effective_selection(&set, staged.option_selection.as_ref());
+    Ok(Some(ModOptionsView { set, selection }))
+}
+
+#[tauri::command]
+pub fn set_mod_options(
+    state: State<'_, AppState>,
+    game_id: String,
+    mod_id: String,
+    selection: ModOptionSelection,
+) -> Result<ModOptionSelection, String> {
+    let plugin = plugin_for_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = order
+        .mods
+        .iter()
+        .find(|m| m.id == mod_id)
+        .ok_or_else(|| format!("Mod not found: {mod_id}"))?;
+    let root = staged_content_root(staged, plugin)
+        .ok_or_else(|| format!("Staging folder is missing for {}", staged.name))?;
+    let set = plugin
+        .mod_options(&root)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{} does not declare any options", staged.name))?;
+
+    // Store the repaired selection rather than what the UI sent, so a stale
+    // dialog cannot persist ids the manifest no longer has.
+    let normalized = options::normalize_selection(&set, &selection);
+    mods::set_mod_options(&state.paths, &game_id, &mod_id, normalized.clone())
+        .map_err(|e| e.to_string())?;
+    Ok(normalized)
+}
+
+/// Ids of staged mods that declare options, so the Mods list can show the
+/// button without asking about every row one at a time.
+#[tauri::command]
+pub fn list_mods_with_options(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<String>, String> {
+    let plugin = plugin_for_game(&state, &game_id)?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    Ok(order
+        .mods
+        .iter()
+        .filter(|staged| {
+            staged_content_root(staged, plugin)
+                .and_then(|root| plugin.mod_options(&root))
+                .is_some_and(|set| !set.is_empty())
+        })
+        .map(|staged| staged.id.clone())
+        .collect())
+}
+
 #[tauri::command]
 pub fn remove_mod(
     state: State<'_, AppState>,
@@ -4549,44 +4788,120 @@ pub fn remove_all_mods(state: State<'_, AppState>, game_id: String) -> Result<()
     .map_err(|e| e.to_string())
 }
 
+/// Download Thunderstore packages whose staging lost files, so a deploy links a
+/// complete mod instead of a partial one. Returns warnings for what could not
+/// be repaired.
+async fn repair_damaged_staging(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    game_id: &str,
+) -> Vec<String> {
+    let Ok(order) = mods::load_loadorder(&state.paths, game_id) else {
+        return Vec::new();
+    };
+    let damaged: Vec<StagedMod> = mods::damaged_staging(&order).into_iter().cloned().collect();
+    if damaged.is_empty() {
+        return Vec::new();
+    }
+    let client = match ThunderstoreClient::new() {
+        Ok(client) => client,
+        Err(e) => return vec![format!("Could not repair staged mods: {e}")],
+    };
+
+    let mut warnings = Vec::new();
+    for staged in damaged {
+        let (Some(ns), Some(name)) = (staged.ts_namespace.clone(), staged.ts_name.clone()) else {
+            warnings.push(format!(
+                "{} is missing staged files and has to be reinstalled by hand.",
+                staged.name
+            ));
+            continue;
+        };
+        let mut pkg = match client.get_package(&staged.domain, &ns, &name).await {
+            Ok(pkg) => pkg,
+            Err(e) => {
+                warnings.push(format!("Could not re-download {}: {e}", staged.name));
+                continue;
+            }
+        };
+        // Repair to the version that is recorded, not to the newest release.
+        if let Some(pos) = staged
+            .version
+            .as_deref()
+            .and_then(|want| pkg.versions.iter().position(|v| v.version_number == want))
+        {
+            let wanted = pkg.versions.remove(pos);
+            pkg.versions.insert(0, wanted);
+        }
+        if let Err(e) = stage_thunderstore_package(
+            app,
+            state,
+            &client,
+            game_id,
+            &staged.domain,
+            &pkg,
+            &staged.name,
+            Some(staged.enabled),
+            None,
+            StagePolicy::Force,
+        )
+        .await
+        {
+            warnings.push(format!("Could not re-download {}: {e}", staged.name));
+        }
+    }
+    warnings
+}
+
 #[tauri::command]
-pub fn deploy_mods(
+pub async fn deploy_mods(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     game_id: String,
 ) -> Result<mods::DeployResult, String> {
-    let cfg = state.config.lock().map_err(|e| e.to_string())?;
-    let game = cfg
-        .managed_games
-        .iter()
-        .find(|g| g.id == game_id)
-        .cloned()
-        .ok_or_else(|| "Managed game not found".to_string())?;
-    drop(cfg);
-    mods::deploy(
+    let game = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .cloned()
+            .ok_or_else(|| "Managed game not found".to_string())?
+    };
+    let repair_warnings = repair_damaged_staging(&app, &state, &game_id).await;
+    let mut result = mods::deploy(
         &state.paths,
         &game_id,
         &game.plugin_id,
         &PathBuf::from(&game.install_path),
         game.project_name.as_deref(),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    result.warnings.splice(0..0, repair_warnings);
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn purge_mods(state: State<'_, AppState>, game_id: String) -> Result<(), String> {
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
-    let install_path = cfg
+    let game = cfg
         .managed_games
         .iter()
         .find(|g| g.id == game_id)
-        .map(|g| g.install_path.clone());
+        .map(|g| (g.install_path.clone(), g.plugin_id.clone()));
     drop(cfg);
+    let install_path = game.as_ref().map(|(path, _)| path.clone());
     mods::purge_deploy(
         &state.paths,
         &game_id,
         install_path.as_deref().map(Path::new),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if let Some((install_path, plugin_id)) = game {
+        if let Some(plugin) = games::plugin_by_id(&plugin_id) {
+            mods::prune_empty_loader_dirs(plugin, Path::new(&install_path));
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -4595,21 +4910,22 @@ pub fn list_downloads(state: State<'_, AppState>) -> Result<Vec<DownloadItem>, S
 }
 
 #[tauri::command]
-pub fn clear_recent_downloads(state: State<'_, AppState>) -> Result<(), String> {
+pub fn clear_recent_downloads(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
     let removed_ids: Vec<String> = {
         let downloads = state.downloads.lock().map_err(|e| e.to_string())?;
         downloads
             .iter()
-            .filter(|d| !is_active_download_status(&d.status))
+            .filter(|d| ids.iter().any(|id| id == &d.id))
+            .filter(|d| is_finished_download_status(&d.status))
             .map(|d| d.id.clone())
             .collect()
     };
-    for id in removed_ids {
-        clear_restart_meta(&state, &id);
-        clear_download_job(&state, &id);
+    for id in &removed_ids {
+        clear_restart_meta(&state, id);
+        clear_download_job(&state, id);
     }
     let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
-    downloads.retain(|d| is_active_download_status(&d.status));
+    downloads.retain(|d| !removed_ids.iter().any(|id| id == &d.id));
     Ok(())
 }
 
@@ -5036,11 +5352,20 @@ async fn run_modio_download_restart(
         .ok_or_else(|| "mod.io API key required".to_string())?;
     let client = ModioClient::new(&key).map_err(|e| e.to_string())?;
 
+    let on_progress = progress_callback(Some(app), dl_id.to_string());
     match client
-        .download_file(modio_game_id, mod_id, Some(file_id), &dest)
+        .download_file(
+            modio_game_id,
+            mod_id,
+            Some(file_id),
+            &dest,
+            on_progress.as_ref(),
+        )
         .await
     {
         Ok(()) => {
+            update_download(state, dl_id, "extracting", None);
+            let _ = app.emit("downloads-changed", ());
             let staged = mods::stage_modio_mod(
                 &state.paths,
                 game_id,
@@ -5196,7 +5521,7 @@ pub fn restart_download(
                         .get_package(&community, &namespace, &name)
                         .await
                         .map_err(|e| e.to_string())?;
-                    stage_thunderstore_package_newest(
+                    stage_thunderstore_package(
                         &app_bg,
                         &*state,
                         &client,
@@ -5206,6 +5531,7 @@ pub fn restart_download(
                         &display_name,
                         enabled,
                         Some(queued_id.clone()),
+                        StagePolicy::KeepNewer,
                     )
                     .await
                 }
@@ -5240,14 +5566,7 @@ pub fn restart_download(
             }
         };
 
-        emit_download_outcome(
-            &app_bg,
-            &queued_id,
-            &result.1,
-            &result.2,
-            result.0,
-        )
-        .await;
+        emit_download_outcome(&app_bg, &queued_id, &result.1, &result.2, result.0).await;
     });
 
     Ok(())
@@ -5283,16 +5602,40 @@ pub fn force_reset_download(
 }
 
 #[cfg(test)]
+mod download_naming_tests {
+    use super::archive_extension;
+
+    #[test]
+    fn a_real_upload_name_supplies_the_extension() {
+        assert_eq!(
+            archive_extension(Some("Cool Mod-1034-1-0.7z")).as_deref(),
+            Some("7z")
+        );
+        // Lowercased so the loose-file check matches.
+        assert_eq!(
+            archive_extension(Some("Career.PACKAGE")).as_deref(),
+            Some("package")
+        );
+    }
+
+    #[test]
+    fn nothing_usable_leaves_the_download_name_alone() {
+        assert_eq!(archive_extension(None), None);
+        assert_eq!(archive_extension(Some("no-extension")), None);
+        // A separator would let a crafted name escape the downloads directory.
+        assert_eq!(archive_extension(Some("../../etc/passwd.zip")), None);
+        assert_eq!(archive_extension(Some("mod.tar gz")), None);
+    }
+}
+
+#[cfg(test)]
 mod catalog_filter_tests {
     use super::catalog_source_unavailable_error;
 
     #[test]
     fn no_sources_uses_generic_message() {
         let msg = catalog_source_unavailable_error("all", false, false, false, false);
-        assert!(
-            msg.contains("No catalog sources configured"),
-            "{msg}"
-        );
+        assert!(msg.contains("No catalog sources configured"), "{msg}");
     }
 
     #[test]
@@ -5300,10 +5643,7 @@ mod catalog_filter_tests {
         let msg = catalog_source_unavailable_error("modio", true, false, false, false);
         assert!(msg.contains("mod.io filter"), "{msg}");
         assert!(msg.contains("Nexus"), "{msg}");
-        assert!(
-            !msg.contains("No catalog sources configured"),
-            "{msg}"
-        );
+        assert!(!msg.contains("No catalog sources configured"), "{msg}");
     }
 
     #[test]

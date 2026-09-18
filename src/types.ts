@@ -300,6 +300,7 @@ export type ModDetail = {
 export type ModFileInfo = {
   file_id: number;
   name: string;
+  file_name: string | null;
   version: string | null;
   category_name: string | null;
   size_kb: number | null;
@@ -511,6 +512,42 @@ export type StagedMod = {
   collection_ids?: string[];
   independent?: boolean;
   depends_on?: string[];
+  option_selection?: ModOptionSelection | null;
+};
+
+export type ModSubOption = {
+  id: string;
+  name: string;
+  description: string | null;
+  /** Absolute path; render through convertFileSrc. */
+  image: string | null;
+  include: string[];
+};
+
+export type ModOption = {
+  id: string;
+  name: string;
+  description: string | null;
+  image: string | null;
+  include: string[];
+  sub_options: ModSubOption[];
+};
+
+export type ModOptionSet = {
+  description: string | null;
+  icon: string | null;
+  options: ModOption[];
+};
+
+export type ModOptionSelection = {
+  enabled_options: string[];
+  /** Option id -> chosen sub-option id. */
+  sub_choice: Record<string, string>;
+};
+
+export type ModOptionsView = {
+  set: ModOptionSet;
+  selection: ModOptionSelection;
 };
 
 export type StagedModUpdate = {

@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -208,9 +210,7 @@ impl ThunderstoreClient {
         let packages = self.list_packages(community).await?;
         let pkg = packages
             .into_iter()
-            .find(|p| {
-                p.owner.eq_ignore_ascii_case(namespace) && p.name.eq_ignore_ascii_case(name)
-            })
+            .find(|p| p.owner.eq_ignore_ascii_case(namespace) && p.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| anyhow!("Package {namespace}-{name} not found in {community}"))?;
         Ok(detail_from_package(community, pkg))
     }
@@ -264,6 +264,11 @@ impl ThunderstoreClient {
     }
 
     /// Resolve dependency closure (dependencies first). `root` is the leaf package.
+    ///
+    /// Thunderstore dependencies are exact pins (`Owner-Name-1.2.3`) and mod sets
+    /// are tested against them, so install the pinned version rather than the
+    /// newest release. When two packages pin the same dependency, the higher pin
+    /// wins, which is the version both of them can load.
     pub async fn resolve_install_order(
         &self,
         community: &str,
@@ -278,80 +283,24 @@ impl ThunderstoreClient {
             .collect();
 
         let root_key = format!("{namespace}-{name}").to_lowercase();
-        let root_pkg = by_key
-            .get(&root_key)
-            .ok_or_else(|| anyhow!("Package {namespace}-{name} not found"))?;
+        if !by_key.contains_key(&root_key) {
+            bail!("Package {namespace}-{name} not found");
+        }
+
+        let pins = resolve_dependency_pins(&root_key, version, &by_key)?;
 
         let mut ordered: Vec<TsPackageDetail> = Vec::new();
         let mut visiting: HashSet<String> = HashSet::new();
         let mut visited: HashSet<String> = HashSet::new();
-
-        fn visit(
-            key: &str,
-            preferred_version: Option<&str>,
-            by_key: &HashMap<String, TsPackage>,
-            community: &str,
-            visiting: &mut HashSet<String>,
-            visited: &mut HashSet<String>,
-            ordered: &mut Vec<TsPackageDetail>,
-        ) -> Result<()> {
-            let key_l = key.to_lowercase();
-            if visited.contains(&key_l) {
-                return Ok(());
-            }
-            if !visiting.insert(key_l.clone()) {
-                bail!("Circular Thunderstore dependency involving {key}");
-            }
-            let pkg = by_key
-                .get(&key_l)
-                .ok_or_else(|| anyhow!("Missing dependency package {key}"))?;
-            let ver = select_version(pkg, preferred_version)?;
-            for dep_raw in &ver.dependencies {
-                if let Some(dep) = TsDependency::parse(dep_raw) {
-                    let dep_key = format!("{}-{}", dep.namespace, dep.name);
-                    visit(
-                        &dep_key,
-                        Some(&dep.version),
-                        by_key,
-                        community,
-                        visiting,
-                        visited,
-                        ordered,
-                    )?;
-                }
-            }
-            visiting.remove(&key_l);
-            visited.insert(key_l);
-            let mut detail = detail_from_package(community, pkg.clone());
-            // Pin selected version as "latest" for download
-            detail.latest_version = Some(ver.version_number.clone());
-            if let Some(pos) = detail
-                .versions
-                .iter()
-                .position(|v| v.version_number == ver.version_number)
-            {
-                let selected = detail.versions.remove(pos);
-                detail.versions.insert(0, selected);
-            }
-            detail.description = Some(ver.description.clone());
-            detail.icon_url = Some(ver.icon.clone());
-            detail.downloads = ver.downloads;
-            ordered.push(detail);
-            Ok(())
-        }
-
-        visit(
+        collect_install_order(
             &root_key,
-            version,
+            &pins,
             &by_key,
             community,
             &mut visiting,
             &mut visited,
             &mut ordered,
         )?;
-
-        // Ensure root is last (visit already does deps-first)
-        let _ = root_pkg;
         Ok(ordered)
     }
 
@@ -360,6 +309,7 @@ impl ThunderstoreClient {
         version: &TsPackageVersion,
         dest: &Path,
         control: Option<&TransferControl>,
+        on_progress: Option<&Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>>,
     ) -> Result<()> {
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -373,6 +323,9 @@ impl ThunderstoreClient {
         if !resp.status().is_success() {
             bail!("Thunderstore download failed: {}", resp.status());
         }
+        let total = resp
+            .content_length()
+            .or_else(|| (version.file_size > 0).then_some(version.file_size));
         let mut stream = resp.bytes_stream();
         let mut file = OpenOptions::new()
             .create(true)
@@ -380,27 +333,131 @@ impl ThunderstoreClient {
             .truncate(true)
             .open(dest)
             .await?;
+        let mut downloaded: u64 = 0;
+        let started = Instant::now();
+        let mut last_report = started;
         while let Some(chunk) = stream.next().await {
             if let Some(ctrl) = control {
                 if ctrl.cancel.load(Ordering::Relaxed) {
                     bail!(CANCELLED_MSG);
                 }
                 if ctrl.pause.load(Ordering::Relaxed) {
+                    file.flush().await?;
+                    if let Some(cb) = on_progress {
+                        cb(downloaded, total, 0);
+                    }
                     bail!(PAUSED_MSG);
                 }
             }
             let chunk = chunk?;
             file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            let now = Instant::now();
+            if now.duration_since(last_report).as_millis() >= 150 {
+                if let Some(cb) = on_progress {
+                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                    cb(downloaded, total, (downloaded as f64 / elapsed) as u64);
+                }
+                last_report = now;
+            }
         }
         file.flush().await?;
+        if let Some(cb) = on_progress {
+            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+            cb(
+                downloaded,
+                total.or(Some(downloaded)),
+                (downloaded as f64 / elapsed) as u64,
+            );
+        }
         Ok(())
     }
 }
 
-fn select_version<'a>(
-    pkg: &'a TsPackage,
-    preferred: Option<&str>,
-) -> Result<&'a TsPackageVersion> {
+/// Highest pinned version per package across the whole dependency closure.
+fn resolve_dependency_pins(
+    root_key: &str,
+    root_version: Option<&str>,
+    by_key: &HashMap<String, TsPackage>,
+) -> Result<HashMap<String, String>> {
+    let mut pins: HashMap<String, String> = HashMap::new();
+    let mut pending: Vec<(String, Option<String>)> =
+        vec![(root_key.to_string(), root_version.map(str::to_string))];
+
+    while let Some((key, wanted)) = pending.pop() {
+        // Unknown packages are reported when building the install order.
+        let Some(pkg) = by_key.get(&key) else {
+            continue;
+        };
+        let ver = select_version(pkg, wanted.as_deref())?;
+        if !crate::mods::incoming_is_newer(pins.get(&key).map(String::as_str), &ver.version_number)
+        {
+            continue;
+        }
+        pins.insert(key.clone(), ver.version_number.clone());
+        for dep_raw in &ver.dependencies {
+            if let Some(dep) = TsDependency::parse(dep_raw) {
+                pending.push((
+                    format!("{}-{}", dep.namespace, dep.name).to_lowercase(),
+                    Some(dep.version),
+                ));
+            }
+        }
+    }
+    Ok(pins)
+}
+
+/// Emit packages dependencies-first, each at its resolved version.
+fn collect_install_order(
+    key: &str,
+    pins: &HashMap<String, String>,
+    by_key: &HashMap<String, TsPackage>,
+    community: &str,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    ordered: &mut Vec<TsPackageDetail>,
+) -> Result<()> {
+    let key_l = key.to_lowercase();
+    if visited.contains(&key_l) {
+        return Ok(());
+    }
+    if !visiting.insert(key_l.clone()) {
+        bail!("Circular Thunderstore dependency involving {key}");
+    }
+    let pkg = by_key
+        .get(&key_l)
+        .ok_or_else(|| anyhow!("Missing dependency package {key}"))?;
+    let ver = select_version(pkg, pins.get(&key_l).map(String::as_str))?;
+    for dep_raw in &ver.dependencies {
+        if let Some(dep) = TsDependency::parse(dep_raw) {
+            let dep_key = format!("{}-{}", dep.namespace, dep.name);
+            collect_install_order(
+                &dep_key, pins, by_key, community, visiting, visited, ordered,
+            )?;
+        }
+    }
+    visiting.remove(&key_l);
+    visited.insert(key_l);
+
+    let mut detail = detail_from_package(community, pkg.clone());
+    // Put the resolved version first so staging downloads that one.
+    detail.latest_version = Some(ver.version_number.clone());
+    if let Some(pos) = detail
+        .versions
+        .iter()
+        .position(|v| v.version_number == ver.version_number)
+    {
+        let selected = detail.versions.remove(pos);
+        detail.versions.insert(0, selected);
+    }
+    detail.description = Some(ver.description.clone());
+    detail.icon_url = Some(ver.icon.clone());
+    detail.downloads = ver.downloads;
+    ordered.push(detail);
+    Ok(())
+}
+
+fn select_version<'a>(pkg: &'a TsPackage, preferred: Option<&str>) -> Result<&'a TsPackageVersion> {
     if let Some(v) = preferred {
         if let Some(found) = pkg.versions.iter().find(|x| x.version_number == v) {
             return Ok(found);
@@ -468,11 +525,7 @@ fn profile_mod_enabled() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ProfileVersion {
-    Parts {
-        major: u64,
-        minor: u64,
-        patch: u64,
-    },
+    Parts { major: u64, minor: u64, patch: u64 },
     String(String),
 }
 
@@ -566,8 +619,7 @@ pub fn extract_profile_zip(bytes: &[u8], dest: &Path) -> Result<ProfileManifest>
     crate::mods::repair_backslash_entries(dest)?;
     let manifest_path = dest.join("export.r2x");
     let reader = fs::File::open(&manifest_path).context("missing export.r2x in profile")?;
-    let manifest: ProfileManifest =
-        serde_yaml::from_reader(reader).context("parse export.r2x")?;
+    let manifest: ProfileManifest = serde_yaml::from_reader(reader).context("parse export.r2x")?;
     let _ = fs::remove_file(&manifest_path);
     Ok(manifest)
 }
@@ -633,5 +685,136 @@ mod tests {
     fn community_slug_ignores_hyphens() {
         assert!(community_slug_matches("lethalcompany", "lethal-company"));
         assert!(!community_slug_matches("valheim", "lethal-company"));
+    }
+
+    fn version(number: &str, dependencies: &[&str]) -> TsPackageVersion {
+        TsPackageVersion {
+            name: "pkg".into(),
+            full_name: format!("pkg-{number}"),
+            description: String::new(),
+            icon: String::new(),
+            version_number: number.into(),
+            dependencies: dependencies.iter().map(|d| d.to_string()).collect(),
+            download_url: String::new(),
+            downloads: 0,
+            date_created: String::new(),
+            website_url: String::new(),
+            is_active: true,
+            uuid4: String::new(),
+            file_size: 0,
+        }
+    }
+
+    /// Newest first, as the Thunderstore API returns them.
+    fn package(owner: &str, name: &str, versions: Vec<TsPackageVersion>) -> TsPackage {
+        TsPackage {
+            name: name.into(),
+            full_name: format!("{owner}-{name}"),
+            owner: owner.into(),
+            package_url: String::new(),
+            date_created: String::new(),
+            date_updated: String::new(),
+            uuid4: String::new(),
+            rating_score: 0,
+            is_pinned: false,
+            is_deprecated: false,
+            has_nsfw_content: false,
+            categories: Vec::new(),
+            versions,
+        }
+    }
+
+    fn index(packages: Vec<TsPackage>) -> HashMap<String, TsPackage> {
+        packages
+            .into_iter()
+            .map(|p| (format!("{}-{}", p.owner, p.name).to_lowercase(), p))
+            .collect()
+    }
+
+    #[test]
+    fn pins_dependencies_to_the_version_they_were_tested_against() {
+        let by_key = index(vec![
+            package(
+                "Author",
+                "Mod",
+                vec![version("1.0.0", &["bbepis-BepInExPack-5.4.2120"])],
+            ),
+            package(
+                "bbepis",
+                "BepInExPack",
+                vec![version("5.4.2122", &[]), version("5.4.2120", &[])],
+            ),
+        ]);
+
+        let pins = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+
+        assert_eq!(pins.get("bbepis-bepinexpack").unwrap(), "5.4.2120");
+    }
+
+    #[test]
+    fn highest_pin_wins_when_packages_disagree() {
+        let by_key = index(vec![
+            package(
+                "Author",
+                "Mod",
+                vec![version(
+                    "1.0.0",
+                    &["Author-Shared-1.0.0", "Author-Other-2.0.0"],
+                )],
+            ),
+            package(
+                "Author",
+                "Other",
+                vec![version("2.0.0", &["Author-Shared-1.5.0"])],
+            ),
+            package(
+                "Author",
+                "Shared",
+                vec![
+                    version("2.0.0", &[]),
+                    version("1.5.0", &[]),
+                    version("1.0.0", &[]),
+                ],
+            ),
+        ]);
+
+        let pins = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+
+        // 1.5.0 satisfies both pins; 2.0.0 is newer than anything asked for.
+        assert_eq!(pins.get("author-shared").unwrap(), "1.5.0");
+    }
+
+    #[test]
+    fn install_order_lists_dependencies_first() {
+        let by_key = index(vec![
+            package(
+                "Author",
+                "Mod",
+                vec![version("1.0.0", &["Author-Lib-1.0.0"])],
+            ),
+            package(
+                "Author",
+                "Lib",
+                vec![version("1.1.0", &[]), version("1.0.0", &[])],
+            ),
+        ]);
+        let pins = resolve_dependency_pins("author-mod", None, &by_key).unwrap();
+
+        let mut ordered = Vec::new();
+        collect_install_order(
+            "author-mod",
+            &pins,
+            &by_key,
+            "riskofrain2",
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut ordered,
+        )
+        .unwrap();
+
+        let names: Vec<_> = ordered.iter().map(|p| p.full_name.clone()).collect();
+        assert_eq!(names, vec!["Author-Lib", "Author-Mod"]);
+        assert_eq!(ordered[0].latest_version.as_deref(), Some("1.0.0"));
+        assert_eq!(ordered[0].versions[0].version_number, "1.0.0");
     }
 }

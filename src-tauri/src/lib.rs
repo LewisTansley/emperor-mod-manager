@@ -16,8 +16,8 @@ mod linux_embed;
 #[cfg(target_os = "linux")]
 mod linux_startup;
 mod migration;
-mod mods;
 mod modio_api;
+mod mods;
 mod nexus;
 mod share;
 mod thunderstore;
@@ -125,6 +125,9 @@ pub fn run() {
             commands::record_nexus_collection,
             commands::set_mod_enabled,
             commands::set_load_order,
+            commands::get_mod_options,
+            commands::set_mod_options,
+            commands::list_mods_with_options,
             commands::remove_mod,
             commands::remove_all_mods,
             commands::deploy_mods,

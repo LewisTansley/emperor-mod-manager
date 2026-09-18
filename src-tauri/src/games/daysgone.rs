@@ -42,28 +42,15 @@ impl GamePlugin for DaysGonePlugin {
 fn resolve_paks_root(install_path: &Path) -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    if let Some(native) = native_paks_dir() {
-        candidates.push(native);
+    if let Some(appdata) = appdata_paks_dir(install_path) {
+        candidates.push(appdata);
     }
-    if let Some(proton) = proton_paks_dir(install_path) {
-        candidates.push(proton);
-    }
-    candidates.push(
-        install_path
-            .join("BendGame")
-            .join("Saved")
-            .join("Paks"),
-    );
+    candidates.push(install_path.join("BendGame").join("Saved").join("Paks"));
 
     candidates
         .into_iter()
         .find(|p| paks_candidate_usable(p))
-        .unwrap_or_else(|| {
-            install_path
-                .join("BendGame")
-                .join("Saved")
-                .join("Paks")
-        })
+        .unwrap_or_else(|| install_path.join("BendGame").join("Saved").join("Paks"))
 }
 
 fn paks_candidate_usable(paks: &Path) -> bool {
@@ -77,73 +64,14 @@ fn paks_candidate_usable(paks: &Path) -> bool {
         .any(|ancestor| ancestor.exists())
 }
 
-/// Native Windows LocalAppData Paks folder.
-fn native_paks_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-        Some(
-            local
-                .join("BendGame")
-                .join("Saved")
-                .join("Paks"),
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
-/// Derive Proton AppData Paks from a Steam install under steamapps/common.
-fn proton_paks_dir(install_path: &Path) -> Option<PathBuf> {
-    let steamapps = find_steamapps_dir(install_path)?;
-    let paks = steamapps
-        .join("compatdata")
-        .join(STEAM_APP_ID)
-        .join("pfx")
-        .join("drive_c")
-        .join("users")
-        .join("steamuser")
-        .join("AppData")
-        .join("Local")
-        .join("BendGame")
-        .join("Saved")
-        .join("Paks");
-    Some(paks)
-}
-
-fn find_steamapps_dir(install_path: &Path) -> Option<PathBuf> {
-    for ancestor in install_path.ancestors() {
-        if ancestor
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-        {
-            return Some(ancestor.to_path_buf());
-        }
-        // install is typically .../steamapps/common/Days Gone
-        if ancestor
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("common"))
-        {
-            if let Some(parent) = ancestor.parent() {
-                if parent
-                    .file_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-                {
-                    return Some(parent.to_path_buf());
-                }
-            }
-        }
-    }
-    None
+/// LocalAppData Paks folder for the profile that owns this install.
+fn appdata_paks_dir(install_path: &Path) -> Option<PathBuf> {
+    super::user_data::appdata_local_dir(install_path, STEAM_APP_ID)
+        .map(|local| local.join("BendGame").join("Saved").join("Paks"))
 }
 
 fn sfpaks_dir(install_path: &Path) -> PathBuf {
-    install_path
-        .join("BendGame")
-        .join("Content")
-        .join("sfpaks")
+    install_path.join("BendGame").join("Content").join("sfpaks")
 }
 
 fn sfpakss_dir(install_path: &Path) -> PathBuf {
@@ -215,10 +143,7 @@ mod tests {
         let dest = DaysGonePlugin
             .resolve_deploy_root(&install, Path::new("500-Test_P.pak"))
             .unwrap();
-        assert_eq!(
-            dest,
-            proton_saved.join("Paks").join("500-Test_P.pak")
-        );
+        assert_eq!(dest, proton_saved.join("Paks").join("500-Test_P.pak"));
     }
 
     #[test]

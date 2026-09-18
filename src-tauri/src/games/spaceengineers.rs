@@ -51,67 +51,8 @@ impl GamePlugin for SpaceEngineersPlugin {
 }
 
 fn mods_dir(install_path: &Path) -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Some(native) = native_mods_dir() {
-            return Some(native);
-        }
-    }
-    proton_mods_dir(install_path).or_else(native_mods_dir)
-}
-
-fn native_mods_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let appdata = std::env::var_os("APPDATA").map(PathBuf::from)?;
-        Some(appdata.join("SpaceEngineers").join("Mods"))
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
-fn proton_mods_dir(install_path: &Path) -> Option<PathBuf> {
-    let steamapps = find_steamapps_dir(install_path)?;
-    Some(
-        steamapps
-            .join("compatdata")
-            .join(STEAM_APP_ID)
-            .join("pfx")
-            .join("drive_c")
-            .join("users")
-            .join("steamuser")
-            .join("AppData")
-            .join("Roaming")
-            .join("SpaceEngineers")
-            .join("Mods"),
-    )
-}
-
-fn find_steamapps_dir(install_path: &Path) -> Option<PathBuf> {
-    for ancestor in install_path.ancestors() {
-        if ancestor
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-        {
-            return Some(ancestor.to_path_buf());
-        }
-        if ancestor
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("common"))
-        {
-            if let Some(parent) = ancestor.parent() {
-                if parent
-                    .file_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case("steamapps"))
-                {
-                    return Some(parent.to_path_buf());
-                }
-            }
-        }
-    }
-    None
+    super::user_data::appdata_roaming_dir(install_path, STEAM_APP_ID)
+        .map(|d| d.join("SpaceEngineers").join("Mods"))
 }
 
 fn resolve_se_deploy(install_path: &Path, relative: &Path) -> PathBuf {
