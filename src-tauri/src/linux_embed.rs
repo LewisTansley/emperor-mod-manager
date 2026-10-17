@@ -3,7 +3,9 @@
 //!
 //! Tauri packs Linux child webviews into the window `GtkBox` with expand=true,
 //! so `set_bounds` is ignored. We wrap the box in a `GtkOverlay` and reparent
-//! Assist into a `GtkLayout` whose bin window clips children to the host rect.
+//! Assist into a `GtkFixed`. The fixed is positioned over the host rect.
+//! WebKit is sized with GTK allocation only — moving its `GdkWindow` by hand
+//! leaves the page visible but drops pointer and keyboard input.
 
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc;
@@ -21,7 +23,7 @@ thread_local! {
 
 struct AssistOverlayHost {
     overlay: gtk::Overlay,
-    layout: gtk::Layout,
+    fixed: gtk::Fixed,
     main_webview: gtk::Widget,
     bounds: AssistBounds,
     visible: bool,
@@ -51,64 +53,76 @@ fn find_main_webview(vbox: &gtk::Box) -> Result<gtk::Widget, String> {
         .ok_or_else(|| "Main webview widget not found".to_string())
 }
 
-fn clamp_layout_children(layout: &gtk::Layout, alloc: &gtk::Allocation) {
+fn enable_assist_input(widget: &gtk::Widget) {
+    widget.set_can_focus(true);
+    widget.set_focus_on_click(true);
+    // Keep the WebKit widget's own visible flag set. Hiding is done by the
+    // overlay fixed; unmapping WebKit itself leaves a later show() blank.
+    widget.show();
+}
+
+fn raise_widget_window(widget: &gtk::Widget) {
+    if widget.is_realized() {
+        if let Some(win) = widget.window() {
+            win.raise();
+        }
+    }
+}
+
+fn size_assist_children(fixed: &gtk::Fixed, bounds: AssistBounds) {
     if CLAMPING.get() {
         return;
     }
     CLAMPING.set(true);
-    let w = alloc.width().max(1);
-    let h = alloc.height().max(1);
-    let clip = gtk::Allocation::new(0, 0, w, h);
-    for child in layout.children() {
+    let w = bounds.width.max(1.0).floor() as i32;
+    let h = bounds.height.max(1.0).floor() as i32;
+    let alloc = gtk::Allocation::new(0, 0, w, h);
+    for child in fixed.children() {
         child.set_hexpand(false);
         child.set_vexpand(false);
         child.set_halign(gtk::Align::Fill);
         child.set_valign(gtk::Align::Fill);
         child.set_size_request(w, h);
-        child.size_allocate(&clip);
-        child.set_clip(&clip);
-        layout.move_(&child, 0, 0);
-        let mut surface_w = 0;
-        let mut surface_h = 0;
-        if child.has_window() && child.is_realized() {
-            if let Some(win) = child.window() {
-                win.move_resize(0, 0, w, h);
-                surface_w = win.width();
-                surface_h = win.height();
-            }
-        }
+        fixed.move_(&child, 0, 0);
+        child.size_allocate(&alloc);
+        enable_assist_input(&child);
+        raise_widget_window(&child);
         let ca = child.allocation();
         log::debug!(
-            "assist overlay clamp requested={}x{} layout_alloc={}x{}@{},{} child={}x{}@{},{} has_window={} realized={} surface={}x{}",
-            w,
-            h,
-            alloc.width(),
-            alloc.height(),
-            alloc.x(),
-            alloc.y(),
+            "assist overlay child alloc={}x{}@{},{} has_window={} realized={} requested={}x{}",
             ca.width(),
             ca.height(),
             ca.x(),
             ca.y(),
             child.has_window(),
             child.is_realized(),
-            surface_w,
-            surface_h
+            w,
+            h
         );
     }
     CLAMPING.set(false);
 }
 
-fn make_clip_layout() -> gtk::Layout {
-    let layout = gtk::Layout::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    layout.set_hexpand(false);
-    layout.set_vexpand(false);
-    layout.set_halign(gtk::Align::Start);
-    layout.set_valign(gtk::Align::Start);
-    layout.connect_size_allocate(|layout, alloc| {
-        clamp_layout_children(layout, alloc);
+fn make_assist_fixed() -> gtk::Fixed {
+    let fixed = gtk::Fixed::new();
+    fixed.set_hexpand(false);
+    fixed.set_vexpand(false);
+    fixed.set_halign(gtk::Align::Start);
+    fixed.set_valign(gtk::Align::Start);
+    fixed.connect_size_allocate(|fixed, _alloc| {
+        let (bounds, visible) = GEOM.with(|geom| *geom.borrow());
+        if !visible {
+            return;
+        }
+        size_assist_children(fixed, bounds);
     });
-    layout
+    fixed.connect_map(|fixed| {
+        for child in fixed.children() {
+            enable_assist_input(&child);
+            raise_widget_window(&child);
+        }
+    });
+    fixed
 }
 
 fn ensure_host(window: &tauri::Window) -> Result<(), String> {
@@ -128,18 +142,19 @@ fn ensure_host(window: &tauri::Window) -> Result<(), String> {
     gtk_window.remove(&vbox);
     overlay.add(&vbox);
 
-    let layout = make_clip_layout();
-    overlay.add_overlay(&layout);
+    let fixed = make_assist_fixed();
+    overlay.add_overlay(&fixed);
+    overlay.set_overlay_pass_through(&fixed, false);
 
     gtk_window.add(&overlay);
     overlay.show_all();
-    layout.hide();
+    fixed.hide();
 
-    let position_layout = layout.clone();
+    let position_fixed = fixed.clone();
     let position_overlay = overlay.clone();
     let position_main = main_webview.clone();
     overlay.connect_get_child_position(move |_overlay, widget| {
-        if widget != position_layout.upcast_ref::<gtk::Widget>() {
+        if widget != position_fixed.upcast_ref::<gtk::Widget>() {
             return None;
         }
         let (bounds, visible) = GEOM.with(|geom| *geom.borrow());
@@ -172,7 +187,7 @@ fn ensure_host(window: &tauri::Window) -> Result<(), String> {
     HOST.with(|slot| {
         *slot.borrow_mut() = Some(AssistOverlayHost {
             overlay,
-            layout,
+            fixed,
             main_webview,
             bounds: AssistBounds::default(),
             visible: false,
@@ -191,51 +206,21 @@ fn apply_host_geometry(host: &AssistOverlayHost) -> gtk::Overlay {
     GEOM.with(|geom| *geom.borrow_mut() = (host.bounds, host.visible));
     let w = host.bounds.width.max(1.0).floor() as i32;
     let h = host.bounds.height.max(1.0).floor() as i32;
-    host.layout.set_size(w.max(0) as u32, h.max(0) as u32);
-    host.layout.set_size_request(w, h);
-    if host.visible && !host.layout.children().is_empty() {
-        host.layout.show_all();
-        let alloc = host.layout.allocation();
-        clamp_layout_children(
-            &host.layout,
-            &gtk::Allocation::new(alloc.x(), alloc.y(), w, h),
-        );
+    host.fixed.set_size_request(w, h);
+    if host.visible && !host.fixed.children().is_empty() {
+        // show_all maps an already-visible WebKit child. Do not hide that child.
+        host.fixed.show_all();
+        size_assist_children(&host.fixed, host.bounds);
         log::debug!(
-            "assist overlay bounds requested={}x{}@{},{} layout={}x{}@{},{} children={}",
+            "assist overlay bounds requested={}x{}@{},{} children={}",
             w,
             h,
             host.bounds.x,
             host.bounds.y,
-            alloc.width(),
-            alloc.height(),
-            alloc.x(),
-            alloc.y(),
-            host.layout.children().len()
+            host.fixed.children().len()
         );
-        for child in host.layout.children() {
-            let ca = child.allocation();
-            let (surface_w, surface_h) = if child.has_window() {
-                child
-                    .window()
-                    .map(|win| (win.width(), win.height()))
-                    .unwrap_or((0, 0))
-            } else {
-                (0, 0)
-            };
-            log::debug!(
-                "assist overlay child alloc={}x{}@{},{} has_window={} realized={} surface={}x{}",
-                ca.width(),
-                ca.height(),
-                ca.x(),
-                ca.y(),
-                child.has_window(),
-                child.is_realized(),
-                surface_w,
-                surface_h
-            );
-        }
     } else {
-        host.layout.hide();
+        host.fixed.hide();
         log::debug!("assist overlay hidden requested={}x{}", w, h);
     }
     host.overlay.clone()
@@ -254,7 +239,7 @@ pub fn prepare(window: &tauri::Window) -> Result<(), String> {
     })?
 }
 
-/// Reparent the Assist webview into the clipping overlay layout.
+/// Reparent the Assist webview into the overlay fixed.
 pub fn attach_assist(window: &tauri::Window, bounds: AssistBounds) -> Result<(), String> {
     let window = window.clone();
     run_on_gtk(&window, {
@@ -271,16 +256,27 @@ pub fn attach_assist(window: &tauri::Window, bounds: AssistBounds) -> Result<(),
                     return Err("Assist webview was not packed into the window box".to_string());
                 };
                 vbox.remove(&assist);
-                for child in host.layout.children() {
-                    host.layout.remove(&child);
+                for child in host.fixed.children() {
+                    host.fixed.remove(&child);
                 }
                 assist.set_hexpand(false);
                 assist.set_vexpand(false);
                 assist.set_halign(gtk::Align::Fill);
                 assist.set_valign(gtk::Align::Fill);
-                host.layout.put(&assist, 0, 0);
+                enable_assist_input(&assist);
+                assist.connect_map(|widget| {
+                    enable_assist_input(widget);
+                    raise_widget_window(widget);
+                });
+                host.fixed.put(&assist, 0, 0);
                 host.bounds = bounds;
-                // Visibility is owned by set_visible / desired-visible flag, not size.
+                // Map once so WebKit realizes with its visible flag set, then
+                // let desired visibility hide the fixed only.
+                host.fixed.show_all();
+                if !assist.is_realized() {
+                    assist.realize();
+                }
+                size_assist_children(&host.fixed, bounds);
                 let overlay = apply_host_geometry(host);
                 drop(slot);
                 queue_overlay_resize(overlay);
@@ -311,7 +307,10 @@ pub fn set_visible(window: &tauri::Window, visible: bool) -> Result<(), String> 
     run_on_gtk(&window, move || {
         let overlay = HOST.with(|slot| {
             slot.borrow_mut().as_mut().map(|host| {
-                host.visible = visible && !host.layout.children().is_empty();
+                host.visible = visible && !host.fixed.children().is_empty();
+                for child in host.fixed.children() {
+                    enable_assist_input(&child);
+                }
                 apply_host_geometry(host)
             })
         });

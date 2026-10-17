@@ -948,9 +948,20 @@ fn apply_assist_desired_visible(app: &tauri::AppHandle, state: &AppState) -> Res
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    if let Ok(window) = main_window(app) {
-        crate::linux_embed::set_visible(&window, visible)?;
+    {
+        // The overlay hides its GtkFixed only. Unmapping the WebKit widget
+        // itself leaves it blank the next time Downloads is shown.
+        if let Ok(window) = main_window(app) {
+            crate::linux_embed::set_visible(&window, visible)?;
+        }
     }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
     if let Some(webview) = app.get_webview(ASSIST_LABEL) {
         if visible {
             webview.show().map_err(|e| e.to_string())?;

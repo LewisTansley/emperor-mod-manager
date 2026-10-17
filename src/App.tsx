@@ -1733,10 +1733,8 @@ export default function App() {
     const host = assistHostRef.current;
     if (!host || tabRef.current !== "downloads") return;
     const rect = host.getBoundingClientRect();
-    if (rect.width < 8 || rect.height < 8) {
-      api.setAssistVisible(false).catch(() => {});
-      return;
-    }
+    // Not laid out yet. A hide here sticks if a later show loses the race.
+    if (rect.width < 8 || rect.height < 8) return;
     const cs = getComputedStyle(host);
     const bl = parseFloat(cs.borderLeftWidth) || 0;
     const bt = parseFloat(cs.borderTopWidth) || 0;
@@ -1775,10 +1773,7 @@ export default function App() {
 
     const width = Math.max(0, Math.floor(right - left));
     const height = Math.max(0, Math.floor(bottom - top));
-    if (width < 8 || height < 8) {
-      api.setAssistVisible(false).catch(() => {});
-      return;
-    }
+    if (width < 8 || height < 8) return;
 
     try {
       await api.setAssistBounds({
@@ -1787,8 +1782,8 @@ export default function App() {
         width,
         height,
       });
+      // A superseded sync must not hide the embed. Only leaving Downloads does.
       if (gen !== assistSyncGenRef.current || tabRef.current !== "downloads") {
-        api.setAssistVisible(false).catch(() => {});
         return;
       }
       await api.setAssistVisible(true);
@@ -1803,7 +1798,6 @@ export default function App() {
       api.setAssistVisible(false).catch(() => {});
       return;
     }
-    api.setAssistVisible(true).catch(() => {});
     const syncSoon = () => {
       requestAnimationFrame(() => {
         if (tabRef.current !== "downloads") return;
