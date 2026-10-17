@@ -22,8 +22,10 @@ target/
 
 # Local caches and scratch dirs
 .cargo-tmp/
+.npm-cache/
 .tmp/
 .cache/
+.build-tmp/
 
 # Logs
 logs/
@@ -51,4 +53,3 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
-/.build-tmp

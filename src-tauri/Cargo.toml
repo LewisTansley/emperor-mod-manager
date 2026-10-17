@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.4.5"
+version = "0.5.0"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+wreq = "0.16"
+wreq-util = "0.2"
 directories = "5"
 toml = "0.8"
 thiserror = "2"

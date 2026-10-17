@@ -58,8 +58,7 @@ fn strackers_loader_present(install_path: &Path) -> bool {
         if let Ok(entries) = std::fs::read_dir(&plugins) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_lowercase();
-                if name.contains("stracker")
-                    || (name.contains("loader") && name.ends_with(".dll"))
+                if name.contains("stracker") || (name.contains("loader") && name.ends_with(".dll"))
                 {
                     return true;
                 }

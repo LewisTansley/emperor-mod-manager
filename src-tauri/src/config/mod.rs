@@ -49,6 +49,9 @@ pub struct AppConfig {
     pub theme: ThemePreference,
     /// Whether Install switches to the Downloads tab or keeps the current tab.
     pub install_click_behavior: InstallClickBehavior,
+    /// How many finished downloads to keep in the Recent list.
+    #[serde(default = "default_recent_downloads_limit")]
+    pub recent_downloads_limit: u32,
     /// Set after the first import of managed games from legacy nexus-manager config.
     #[serde(default)]
     pub legacy_games_merged: bool,
@@ -97,6 +100,17 @@ fn default_use_global() -> bool {
     true
 }
 
+pub const MIN_RECENT_DOWNLOADS_LIMIT: u32 = 1;
+pub const MAX_RECENT_DOWNLOADS_LIMIT: u32 = 500;
+
+fn default_recent_downloads_limit() -> u32 {
+    50
+}
+
+pub fn clamp_recent_downloads_limit(limit: u32) -> u32 {
+    limit.clamp(MIN_RECENT_DOWNLOADS_LIMIT, MAX_RECENT_DOWNLOADS_LIMIT)
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -106,6 +120,7 @@ impl Default for AppConfig {
             autoclick_free_download: true,
             theme: ThemePreference::System,
             install_click_behavior: InstallClickBehavior::Downloads,
+            recent_downloads_limit: default_recent_downloads_limit(),
             legacy_games_merged: false,
             tools: ToolsConfig::default(),
         }
@@ -169,6 +184,11 @@ impl Paths {
         self.cache_dir.join("downloads")
     }
 
+    /// Finished downloads shown in the Recent list.
+    pub fn recent_downloads_file(&self) -> PathBuf {
+        self.data_dir.join("recent_downloads.json")
+    }
+
     /// Persistent WebKit profile for Download Assist (Nexus website cookies).
     pub fn assist_webview_dir(&self) -> PathBuf {
         self.data_dir.join("assist-webview")
@@ -221,6 +241,21 @@ impl Paths {
 
     pub fn autohdr_vk_config_file(&self) -> PathBuf {
         self.autohdr_vk_install_dir().join("conf.toml")
+    }
+
+    /// Cached legacy Mod Engine (`dinput8.dll`) packs per FromSoft plugin id.
+    pub fn fromsoft_legacy_modengine_dir(&self, plugin_id: &str) -> PathBuf {
+        self.tools_dir()
+            .join("fromsoft-modengine-legacy")
+            .join(plugin_id)
+    }
+
+    pub fn modengine2_install_dir(&self) -> PathBuf {
+        self.tools_dir().join("modengine2")
+    }
+
+    pub fn me3_install_dir(&self) -> PathBuf {
+        self.tools_dir().join("me3")
     }
 }
 

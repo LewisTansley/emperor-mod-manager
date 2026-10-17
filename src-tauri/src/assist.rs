@@ -580,6 +580,20 @@ const CDN_HOOK_JS: &str = r#"
 })();
 "#;
 
+/// What to do with the archive Download Assist captures.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistPurpose {
+    /// Stage into the managed game's mod list (normal free/premium assist).
+    #[default]
+    StageMod,
+    /// Extract legacy Mod Engine (`dinput8.dll`) into the game folder.
+    FromsoftLegacyLoader {
+        plugin_id: String,
+        install_path: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AssistContext {
     pub game_id: String,
@@ -591,6 +605,11 @@ pub struct AssistContext {
     pub batch_id: Option<String>,
     /// When set, staging replaces this existing staged mod (e.g. free-account update).
     pub replace_staged_id: Option<String>,
+    /// Version recorded on the staged row after a free-account install.
+    pub version: Option<String>,
+    /// File chooser title or archive name, when it differs from the mod title.
+    pub file_name: Option<String>,
+    pub purpose: AssistPurpose,
 }
 
 pub fn set_assist_context(state: &AppState, ctx: AssistContext) {
@@ -991,24 +1010,59 @@ pub async fn open_download_assist(
     name: String,
     batch_id: Option<String>,
     replace_staged_id: Option<String>,
+    version: Option<String>,
+    file_name: Option<String>,
+    purpose: Option<AssistPurpose>,
+) -> Result<(), String> {
+    open_download_assist_inner(
+        &app,
+        &state,
+        game_id,
+        domain,
+        mod_id,
+        file_id,
+        name,
+        batch_id,
+        replace_staged_id,
+        version,
+        file_name,
+        purpose.unwrap_or_default(),
+    )
+    .await
+}
+
+/// Open Download Assist with an explicit purpose (used by FromSoft loader install).
+pub async fn open_download_assist_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    game_id: String,
+    domain: String,
+    mod_id: u64,
+    file_id: u64,
+    name: String,
+    batch_id: Option<String>,
+    replace_staged_id: Option<String>,
+    version: Option<String>,
+    file_name: Option<String>,
+    purpose: AssistPurpose,
 ) -> Result<(), String> {
     // Close → wait → open next so SPA state / autoclick flags cannot leak across mods.
     if app.get_webview(ASSIST_LABEL).is_some() {
-        let gen = peek_assist_context(&state)
+        let gen = peek_assist_context(state)
             .map(|c| c.generation)
             .unwrap_or_else(|| state.assist_window_gen.load(Ordering::SeqCst));
         state.assist_closed_gen.store(gen, Ordering::SeqCst);
-        let _ = take_assist_context(&state);
-        let _ = close_assist_webview(&app);
-        wait_assist_webview_gone(&app).await;
+        let _ = take_assist_context(state);
+        let _ = close_assist_webview(app);
+        wait_assist_webview_gone(app).await;
     }
 
     let generation = state.assist_window_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let autoclick = autoclick_enabled(&state);
-    let bounds = stored_bounds(&state);
+    let autoclick = autoclick_enabled(state);
+    let bounds = stored_bounds(state);
 
     set_assist_context(
-        &state,
+        state,
         AssistContext {
             game_id,
             label: name.clone(),
@@ -1018,6 +1072,9 @@ pub async fn open_download_assist(
             generation,
             batch_id,
             replace_staged_id,
+            version,
+            file_name,
+            purpose,
         },
     );
 
@@ -1030,7 +1087,7 @@ pub async fn open_download_assist(
     let download_dir = state.paths.downloads_dir();
     let _ = fs::create_dir_all(&download_dir);
 
-    let window = main_window(&app)?;
+    let window = main_window(app)?;
 
     let mut builder = WebviewBuilder::new(ASSIST_LABEL, WebviewUrl::External(parsed))
         .data_directory(assist_dir)
@@ -1137,11 +1194,18 @@ pub async fn open_download_assist(
     ))]
     crate::linux_embed::attach_assist(&window, bounds)?;
 
-    apply_assist_bounds(&app, &webview, bounds)?;
-    // Queue can advance while browsing other tabs; only show on Downloads.
-    apply_assist_desired_visible(&app, &state)?;
+    apply_assist_bounds(app, &webview, bounds)?;
+    // Loader installs run mid-deploy: force the panel visible. Normal assist still
+    // respects the Downloads-tab desired-visible flag.
+    if matches!(
+        peek_assist_context(state).as_ref().map(|c| &c.purpose),
+        Some(AssistPurpose::FromsoftLegacyLoader { .. })
+    ) {
+        state.assist_desired_visible.store(true, Ordering::SeqCst);
+    }
+    apply_assist_desired_visible(app, state)?;
 
-    emit_assist_opened(&app, autoclick, &domain, mod_id, file_id);
+    emit_assist_opened(app, autoclick, &domain, mod_id, file_id);
     Ok(())
 }
 
@@ -1195,9 +1259,10 @@ mod tests {
 
     #[test]
     fn rejects_non_nxm_sentinel_payload() {
-        let parsed =
-            url::Url::parse("https://emperor-mod-manager.invalid/capture-nxm?url=https://example.com")
-                .unwrap();
+        let parsed = url::Url::parse(
+            "https://emperor-mod-manager.invalid/capture-nxm?url=https://example.com",
+        )
+        .unwrap();
         assert!(extract_sentinel_nxm(&parsed).is_none());
     }
 
@@ -1269,5 +1334,12 @@ mod tests {
         let js = assist_context_js(3518, 63684);
         assert!(js.contains("fileId: 63684"));
         assert!(js.contains("modId: 3518"));
+    }
+
+    #[test]
+    fn assist_purpose_defaults_to_stage_mod() {
+        assert!(matches!(AssistPurpose::default(), AssistPurpose::StageMod));
+        let json = serde_json::to_string(&AssistPurpose::default()).unwrap();
+        assert_eq!(json, "\"stage_mod\"");
     }
 }

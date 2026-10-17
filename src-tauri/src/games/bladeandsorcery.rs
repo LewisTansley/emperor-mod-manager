@@ -16,11 +16,7 @@ impl GamePlugin for BladeAndSorceryPlugin {
             id: "bladeandsorcery",
             display_name: "Blade & Sorcery",
             nexus_domain: "bladeandsorcery",
-            match_names: &[
-                "blade & sorcery",
-                "blade and sorcery",
-                "bladeandsorcery",
-            ],
+            match_names: &["blade & sorcery", "blade and sorcery", "bladeandsorcery"],
         }
     }
 
@@ -88,7 +84,9 @@ fn looks_like_overwrite_relative(originals: &[std::ffi::OsString]) -> bool {
     originals.iter().any(|s| {
         let n = s.to_string_lossy().to_lowercase();
         n == "default" || n.ends_with(".asset") || n.ends_with(".bundle")
-    }) && !originals.iter().any(|s| s.to_string_lossy().eq_ignore_ascii_case("Mods"))
+    }) && !originals
+        .iter()
+        .any(|s| s.to_string_lossy().eq_ignore_ascii_case("Mods"))
 }
 
 fn data_dir(install_path: &Path) -> PathBuf {
@@ -122,10 +120,7 @@ mod tests {
         std::fs::write(dir.path().join("manifest.json"), "{}").unwrap();
         assert!(plugin().should_wrap_as_mod_folder(dir.path()));
         let dest = plugin()
-            .resolve_deploy_root(
-                Path::new("/game"),
-                Path::new("MyMod/manifest.json"),
-            )
+            .resolve_deploy_root(Path::new("/game"), Path::new("MyMod/manifest.json"))
             .unwrap();
         assert_eq!(
             dest,
@@ -136,10 +131,7 @@ mod tests {
     #[test]
     fn preserves_mods_prefix() {
         let dest = plugin()
-            .resolve_deploy_root(
-                Path::new("/game"),
-                Path::new("Mods/MyMod/manifest.json"),
-            )
+            .resolve_deploy_root(Path::new("/game"), Path::new("Mods/MyMod/manifest.json"))
             .unwrap();
         assert_eq!(
             dest,
@@ -157,7 +149,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             dest,
-            data.join("StreamingAssets").join("Mods").join("Cool").join("manifest.json")
+            data.join("StreamingAssets")
+                .join("Mods")
+                .join("Cool")
+                .join("manifest.json")
         );
     }
 }

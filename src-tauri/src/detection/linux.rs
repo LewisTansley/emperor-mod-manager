@@ -22,17 +22,18 @@ pub fn scan_games() -> Vec<DetectedGame> {
             .as_ref()
             .or(game.path_icon.as_ref())
             .map(|p| p.to_string_lossy().to_string());
-        out.push(finish_detected(game.title, launcher, install_path, cover_path));
+        out.push(finish_detected(
+            game.title,
+            launcher,
+            install_path,
+            cover_path,
+        ));
     }
 
     out.sort_by(|a, b| {
         b.supported
             .cmp(&a.supported)
-            .then_with(|| {
-                b.engine_hint
-                    .is_some()
-                    .cmp(&a.engine_hint.is_some())
-            })
+            .then_with(|| b.engine_hint.is_some().cmp(&a.engine_hint.is_some()))
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
     out

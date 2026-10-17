@@ -54,9 +54,10 @@ fn health_for_managed(game: &ManagedGame, detected: &[DetectedGame]) -> GameHeal
         };
     }
 
-    if let Some(candidate) = detected.iter().find(|d| {
-        games_match(&game.title, &game.launcher, &d.title, &d.launcher)
-    }) {
+    if let Some(candidate) = detected
+        .iter()
+        .find(|d| games_match(&game.title, &game.launcher, &d.title, &d.launcher))
+    {
         return GameHealth {
             game_id: game.id.clone(),
             status: GameHealthStatus::RelocateCandidate,
@@ -160,19 +161,22 @@ fn migrate_game_data_dir(paths: &Paths, old_id: &str, new_id: &str) -> Result<()
 
     if game_data_dir_is_empty(&new_dir) {
         copy_dir_contents(&old_dir, &new_dir)?;
-        fs::remove_dir_all(&old_dir).with_context(|| format!("removing old game data {}", old_dir.display()))?;
+        fs::remove_dir_all(&old_dir)
+            .with_context(|| format!("removing old game data {}", old_dir.display()))?;
         return Ok(());
     }
 
     copy_dir_contents(&old_dir, &new_dir)?;
-    fs::remove_dir_all(&old_dir).with_context(|| format!("removing old game data {}", old_dir.display()))?;
+    fs::remove_dir_all(&old_dir)
+        .with_context(|| format!("removing old game data {}", old_dir.display()))?;
     Ok(())
 }
 
 fn game_data_dir_is_empty(dir: &Path) -> bool {
     !dir.join("loadorder.json").exists()
         && !dir.join("deployed.json").exists()
-        && dir.join("mods")
+        && dir
+            .join("mods")
             .read_dir()
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true)
@@ -285,12 +289,7 @@ mod tests {
         let new_entry = sample_managed("new_id", "Game", "/new");
         games.retain(|g| {
             g.id == new_entry.id
-                || !games_match(
-                    &g.title,
-                    &g.launcher,
-                    &new_entry.title,
-                    &new_entry.launcher,
-                )
+                || !games_match(&g.title, &g.launcher, &new_entry.title, &new_entry.launcher)
         });
         games.push(new_entry);
         assert_eq!(games.len(), 2);
@@ -331,12 +330,16 @@ mod tests {
             &new_install.to_string_lossy(),
         )];
 
-        let updated = relink_managed_game(&paths, &mut config, "old_id", "new_id", &detected).unwrap();
+        let updated =
+            relink_managed_game(&paths, &mut config, "old_id", "new_id", &detected).unwrap();
         assert_eq!(updated.id, "new_id");
         assert_eq!(updated.install_path, new_install.to_string_lossy());
         assert_eq!(config.managed_games.len(), 1);
         assert_eq!(config.last_active_game_id.as_deref(), Some("new_id"));
         assert!(!paths.game_data_dir("old_id").exists());
-        assert!(paths.game_data_dir("new_id").join("loadorder.json").is_file());
+        assert!(paths
+            .game_data_dir("new_id")
+            .join("loadorder.json")
+            .is_file());
     }
 }

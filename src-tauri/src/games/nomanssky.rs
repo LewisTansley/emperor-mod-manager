@@ -100,31 +100,19 @@ mod tests {
         let dest = NoMansSkyPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("CoolMod/foo.EXML"))
             .unwrap();
-        assert_eq!(
-            dest,
-            PathBuf::from("/game/GAMEDATA/MODS/CoolMod/foo.EXML")
-        );
+        assert_eq!(dest, PathBuf::from("/game/GAMEDATA/MODS/CoolMod/foo.EXML"));
     }
 
     #[test]
     fn preserves_gamedata_and_mods_prefix() {
         let dest = NoMansSkyPlugin
-            .resolve_deploy_root(
-                Path::new("/game"),
-                Path::new("GAMEDATA/MODS/Cool/foo.MBIN"),
-            )
+            .resolve_deploy_root(Path::new("/game"), Path::new("GAMEDATA/MODS/Cool/foo.MBIN"))
             .unwrap();
-        assert_eq!(
-            dest,
-            PathBuf::from("/game/GAMEDATA/MODS/Cool/foo.MBIN")
-        );
+        assert_eq!(dest, PathBuf::from("/game/GAMEDATA/MODS/Cool/foo.MBIN"));
         let dest = NoMansSkyPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("MODS/Cool/foo.MBIN"))
             .unwrap();
-        assert_eq!(
-            dest,
-            PathBuf::from("/game/GAMEDATA/MODS/Cool/foo.MBIN")
-        );
+        assert_eq!(dest, PathBuf::from("/game/GAMEDATA/MODS/Cool/foo.MBIN"));
     }
 
     #[test]

@@ -20,9 +20,11 @@ pub fn extract_archive(bytes: &[u8], name: &str, dest: &Path) -> Result<()> {
 
     if name.ends_with(".tar.xz") {
         extract_tar_xz(bytes, dest)?;
+    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_tar_gz(bytes, dest)?;
     } else if name.ends_with(".tar.zst") {
         return Err(anyhow!(
-            "zstd archives are not supported yet; use .tar.xz release"
+            "zstd archives are not supported yet; use .tar.xz or .tar.gz release"
         ));
     } else if name.ends_with(".zip") {
         extract_zip(bytes, dest)?;
@@ -36,6 +38,13 @@ fn extract_tar_xz(bytes: &[u8], dest: &Path) -> Result<()> {
     let decoder = xz2::read::XzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
     archive.unpack(dest).context("extracting tar.xz")?;
+    Ok(())
+}
+
+fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest).context("extracting tar.gz")?;
     Ok(())
 }
 

@@ -188,17 +188,14 @@ pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
         .ok_or_else(|| anyhow!("not an Emperor share code (missing #emperor1 prefix)"))?;
     let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded.trim().as_bytes())
-        .or_else(|_| {
-            base64::engine::general_purpose::STANDARD.decode(encoded.trim().as_bytes())
-        })
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded.trim().as_bytes()))
         .context("decode share payload")?;
     let mut decoder = DeflateDecoder::new(compressed.as_slice());
     let mut json = Vec::new();
     decoder
         .read_to_end(&mut json)
         .context("inflate share payload")?;
-    let manifest: ShareManifest =
-        serde_json::from_slice(&json).context("parse share manifest")?;
+    let manifest: ShareManifest = serde_json::from_slice(&json).context("parse share manifest")?;
     if manifest.v != 1 {
         bail!("unsupported share format version {}", manifest.v);
     }
@@ -380,7 +377,10 @@ pub fn build_manifest_from_loadorder(
         match m.source {
             ModSource::Nexus => {
                 if m.nexus_mod_id == 0 || m.nexus_file_id == 0 {
-                    skipped.push(format!("{} (manual/imported Nexus archive)", display_name(m)));
+                    skipped.push(format!(
+                        "{} (manual/imported Nexus archive)",
+                        display_name(m)
+                    ));
                     continue;
                 }
                 mods.push(ShareModEntry {
@@ -481,8 +481,8 @@ pub fn load_saved_collections(paths: &Paths) -> Result<SavedCollectionsStore> {
     if !file.exists() {
         return Ok(SavedCollectionsStore::default());
     }
-    let raw = std::fs::read_to_string(&file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let raw =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     Ok(serde_json::from_str(&raw)?)
 }
 
@@ -506,7 +506,11 @@ pub fn add_saved_collection(
     Ok(entry)
 }
 
-pub fn rename_saved_collection(paths: &Paths, id: &str, name: &str) -> Result<SavedCollectionEntry> {
+pub fn rename_saved_collection(
+    paths: &Paths,
+    id: &str,
+    name: &str,
+) -> Result<SavedCollectionEntry> {
     let mut store = load_saved_collections(paths)?;
     let entry = store
         .collections

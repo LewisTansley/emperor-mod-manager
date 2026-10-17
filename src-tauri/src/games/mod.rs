@@ -3,15 +3,17 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::mods::options::ModOptionSet;
 
 mod baldursgate3;
 mod bladeandsorcery;
+mod controlresonant;
 mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
+mod fromsoft_loaders;
 mod fromsoftware;
 mod helldivers2;
 mod kingdomcome;
@@ -38,11 +40,16 @@ mod witcher3;
 
 pub use baldursgate3::BaldursGate3Plugin;
 pub use bladeandsorcery::BladeAndSorceryPlugin;
+pub use controlresonant::ControlResonantPlugin;
 pub use creation_engine::{
     Fallout4Plugin, OblivionRemasteredPlugin, SkyrimSpecialEditionPlugin, StarfieldPlugin,
 };
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
+pub use fromsoft_loaders::{
+    ensure_fromsoft_loaders, finish_legacy_after_assist, install_legacy_from_archive,
+    is_fromsoft_plugin, legacy_loader_ready, EnsureLoadersOutcome, LegacyAssistRequest,
+};
 pub use fromsoftware::{
     DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
 };
@@ -188,6 +195,18 @@ pub trait GamePlugin: Send + Sync {
     ) -> Result<Vec<String>> {
         Ok(vec![])
     }
+
+    /// Plugins left out of the load order because a master file is missing.
+    fn plugin_skips(&self, _install_path: &Path) -> Vec<PluginSkip> {
+        Vec::new()
+    }
+}
+
+/// A plugin omitted at deploy because one of its masters is not loadable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSkip {
+    pub plugin: String,
+    pub missing_master: String,
 }
 
 pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
@@ -198,6 +217,7 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &BaldursGate3Plugin,
         &Cyberpunk2077Plugin,
         &Witcher3Plugin,
+        &ControlResonantPlugin,
         &DaysGonePlugin,
         &Warhammer40kDarktidePlugin,
         &Helldivers2Plugin,
@@ -582,6 +602,12 @@ mod tests {
             match_plugin("My Summer Car", None).unwrap().id,
             "mysummercar"
         );
+        assert_eq!(
+            match_plugin("CONTROL Resonant", None).unwrap().id,
+            "controlresonant"
+        );
+        assert!(match_plugin("Control", None).is_none());
+        assert!(match_plugin("Control Ultimate Edition", None).is_none());
         assert_eq!(
             match_plugin("Monster Hunter: World", None).unwrap().id,
             "monsterhunterworld"

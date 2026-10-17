@@ -110,6 +110,12 @@ mod tests {
         let dest = RimWorldPlugin
             .resolve_deploy_root(&app, Path::new("Cool/About/About.xml"))
             .unwrap();
-        assert_eq!(dest, app.join("Mods").join("Cool").join("About").join("About.xml"));
+        assert_eq!(
+            dest,
+            app.join("Mods")
+                .join("Cool")
+                .join("About")
+                .join("About.xml")
+        );
     }
 }

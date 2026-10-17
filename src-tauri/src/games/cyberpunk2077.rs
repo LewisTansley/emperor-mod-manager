@@ -267,9 +267,6 @@ mod tests {
     #[test]
     fn normalize_relative_splits_backslashes() {
         let p = PathBuf::from(r"bin\x64\version.dll");
-        assert_eq!(
-            normalize_relative(&p),
-            PathBuf::from("bin/x64/version.dll")
-        );
+        assert_eq!(normalize_relative(&p), PathBuf::from("bin/x64/version.dll"));
     }
 }

@@ -138,8 +138,7 @@ impl AutoHdrVkConfig {
     }
 
     pub fn remove_profile(&mut self, exe: &str) {
-        self.profiles
-            .retain(|p| !p.exe.eq_ignore_ascii_case(exe));
+        self.profiles.retain(|p| !p.exe.eq_ignore_ascii_case(exe));
     }
 
     pub fn to_dto(&self) -> AutoHdrVkConfigDto {

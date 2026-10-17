@@ -81,8 +81,8 @@ pub fn steam_userdata_dirs() -> Vec<PathBuf> {
                 }
             }
         }
-        let flatpak = PathBuf::from(&home)
-            .join(".var/app/com.valvesoftware.Steam/.steam/steam/userdata");
+        let flatpak =
+            PathBuf::from(&home).join(".var/app/com.valvesoftware.Steam/.steam/steam/userdata");
         if flatpak.is_dir() {
             if let Ok(entries) = fs::read_dir(&flatpak) {
                 for entry in entries.flatten() {
@@ -97,29 +97,87 @@ pub fn steam_userdata_dirs() -> Vec<PathBuf> {
 }
 
 pub fn read_launch_options(app_id: &str) -> Result<Option<String>> {
+    // Prefer accounts that already have a non-empty LaunchOptions line for this app.
+    let mut fallback = None;
     for userdata in steam_userdata_dirs() {
         let path = userdata.join("config/localconfig.vdf");
         if !path.exists() {
             continue;
         }
         if let Some(opts) = read_launch_from_vdf(&path, app_id)? {
-            return Ok(Some(opts));
+            if !opts.trim().is_empty() {
+                return Ok(Some(opts));
+            }
+            if fallback.is_none() {
+                fallback = Some(opts);
+            }
         }
     }
-    Ok(None)
+    Ok(fallback)
 }
 
 fn read_launch_from_vdf(path: &Path, app_id: &str) -> Result<Option<String>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let pattern = format!(
-        r#"(?s)"{app_id}"\s*\{{.*?"LaunchOptions"\s+"([^"]*)""#
-    );
-    let re = Regex::new(&pattern).context("compiling launch options regex")?;
-    Ok(re
-        .captures(&content)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string()))
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(extract_launch_options_for_app(&content, app_id))
+}
+
+/// Escape-aware LaunchOptions parser for a Steam app block.
+pub fn extract_launch_options_for_app(content: &str, app_id: &str) -> Option<String> {
+    let app_pattern = format!(r#"(?s)("{}")\s*(\{{)"#, regex::escape(app_id));
+    let re_app = Regex::new(&app_pattern).ok()?;
+    let caps = re_app.captures(content)?;
+    let open_brace = caps.get(2)?.end();
+    let block_end = find_matching_brace(content, open_brace - 1)?;
+    let block = &content[caps.get(0)?.start()..=block_end];
+    extract_launch_options_value(block)
+}
+
+/// Parse `"LaunchOptions" "…"` allowing `\"` escapes inside the value.
+pub fn extract_launch_options_value(block: &str) -> Option<String> {
+    let key = "\"LaunchOptions\"";
+    let idx = block.find(key)?;
+    let after = block[idx + key.len()..].trim_start();
+    if !after.starts_with('"') {
+        return None;
+    }
+    Some(unescape_vdf_quoted(&after[1..])?.0)
+}
+
+fn unescape_vdf_quoted(s: &str) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some((_, '\\')) => out.push('\\'),
+                Some((_, 'n')) => out.push('\n'),
+                Some((_, 't')) => out.push('\t'),
+                Some((_, '"')) => out.push('"'),
+                Some((_, other)) => out.push(other),
+                None => break,
+            }
+        } else if c == '"' {
+            return Some((out, i + 1));
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+pub fn escape_vdf_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn write_launch_options(app_id: &str, launch_options: &str) -> Result<()> {
@@ -127,61 +185,122 @@ pub fn write_launch_options(app_id: &str, launch_options: &str) -> Result<()> {
     if userdata_dirs.is_empty() {
         return Err(anyhow!("Steam userdata directory not found"));
     }
-    let mut wrote = false;
-    for userdata in userdata_dirs {
+    // Prefer the userdata that already has a real LaunchOptions value for this app
+    // so we do not corrupt idle/secondary Steam accounts.
+    let mut preferred = Vec::new();
+    let mut others = Vec::new();
+    for userdata in &userdata_dirs {
         let path = userdata.join("config/localconfig.vdf");
         if !path.exists() {
             continue;
         }
+        match read_launch_from_vdf(&path, app_id) {
+            Ok(Some(opts)) if !opts.trim().is_empty() => preferred.push(path),
+            Ok(Some(_)) | Ok(None) => {
+                // Still a candidate if the app block exists (write_launch_to_vdf returns false otherwise).
+                others.push(path);
+            }
+            Err(_) => others.push(path),
+        }
+    }
+    let mut wrote = false;
+    for path in preferred.into_iter().chain(others) {
         if write_launch_to_vdf(&path, app_id, launch_options)? {
             wrote = true;
+            // One successful preferred/secondary write is enough when preferred was used;
+            // still write all preferred accounts (usually one), skip blank secondary corruption
+            // by stopping after the first successful write if it came from preferred set.
+            break;
         }
     }
     if wrote {
         Ok(())
     } else {
-        Err(anyhow!("could not update Steam launch options for app {app_id}"))
+        Err(anyhow!(
+            "could not update Steam launch options for app {app_id}"
+        ))
     }
 }
 
 fn write_launch_to_vdf(path: &Path, app_id: &str, launch_options: &str) -> Result<bool> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let app_pattern = format!(r#"(?s)("{}")\s*(\{{)"#, regex::escape(app_id));
-    let re_app = Regex::new(&app_pattern).context("compiling app block regex")?;
-    let Some(caps) = re_app.captures(&content) else {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let Some(updated) = replace_launch_options_in_vdf(&content, app_id, launch_options) else {
         return Ok(false);
     };
-    let block_start = caps.get(0).unwrap().start();
-    let open_brace = caps.get(2).unwrap().end();
-    let block_end = find_matching_brace(&content, open_brace - 1)
-        .ok_or_else(|| anyhow!("malformed VDF for app {app_id}"))?;
-    let mut block = content[block_start..=block_end].to_string();
+    fs::write(path, updated).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
 
-    let launch_re = Regex::new(r#"(?m)^\s*"LaunchOptions"\s+"[^"]*"\s*$"#)
-        .context("compiling LaunchOptions regex")?;
-    if launch_options.trim().is_empty() {
-        block = launch_re.replace(&block, "").to_string();
-    } else if launch_re.is_match(&block) {
-        block = launch_re
-            .replace(
-                &block,
-                format!(r#""LaunchOptions"		"{launch_options}""#),
-            )
-            .to_string();
-    } else {
-        let insert = format!(r#"
-		"LaunchOptions"		"{launch_options}""#);
-        let close = block.rfind('}').unwrap_or(block.len());
-        block.insert_str(close, &insert);
-    }
+/// Replace or insert LaunchOptions for `app_id`. Returns None when the app block is missing.
+pub fn replace_launch_options_in_vdf(
+    content: &str,
+    app_id: &str,
+    launch_options: &str,
+) -> Option<String> {
+    let app_pattern = format!(r#"(?s)("{}")\s*(\{{)"#, regex::escape(app_id));
+    let re_app = Regex::new(&app_pattern).ok()?;
+    let caps = re_app.captures(content)?;
+    let block_start = caps.get(0)?.start();
+    let open_brace = caps.get(2)?.end();
+    let block_end = find_matching_brace(content, open_brace - 1)?;
+    let mut block = content[block_start..=block_end].to_string();
+    block = set_launch_options_in_block(&block, launch_options);
 
     let mut out = String::new();
     out.push_str(&content[..block_start]);
     out.push_str(&block);
     out.push_str(&content[block_end + 1..]);
-    fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
-    Ok(true)
+    Some(out)
+}
+
+fn set_launch_options_in_block(block: &str, launch_options: &str) -> String {
+    let key = "\"LaunchOptions\"";
+    if let Some(idx) = block.find(key) {
+        let after_key = idx + key.len();
+        let rest = &block[after_key..];
+        let trimmed_start = rest.len() - rest.trim_start().len();
+        let value_start = after_key + trimmed_start;
+        if !block[value_start..].starts_with('"') {
+            return block.to_string();
+        }
+        let Some((_, consumed)) = unescape_vdf_quoted(&block[value_start + 1..]) else {
+            return block.to_string();
+        };
+        let value_end = value_start + 1 + consumed;
+        if launch_options.trim().is_empty() {
+            // Drop the whole LaunchOptions line (from prior newline if present).
+            let line_start = block[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let mut line_end = value_end;
+            if block[line_end..].starts_with('\n') {
+                line_end += 1;
+            }
+            let mut out = String::new();
+            out.push_str(&block[..line_start]);
+            out.push_str(&block[line_end..]);
+            return out;
+        }
+        let escaped = escape_vdf_string(launch_options);
+        let mut out = String::new();
+        out.push_str(&block[..value_start]);
+        out.push('"');
+        out.push_str(&escaped);
+        out.push('"');
+        out.push_str(&block[value_end..]);
+        return out;
+    }
+
+    if launch_options.trim().is_empty() {
+        return block.to_string();
+    }
+    let escaped = escape_vdf_string(launch_options);
+    let insert = format!("\n\t\t\"LaunchOptions\"\t\t\"{escaped}\"");
+    let close = block.rfind('}').unwrap_or(block.len());
+    let mut out = String::new();
+    out.push_str(&block[..close]);
+    out.push_str(&insert);
+    out.push_str(&block[close..]);
+    out
 }
 
 fn find_matching_brace(content: &str, open_idx: usize) -> Option<usize> {
@@ -203,4 +322,86 @@ fn find_matching_brace(content: &str, open_idx: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_escaped_winedlloverrides_quotes() {
+        let vdf = r#"
+"UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"335670"
+					{
+						"LaunchOptions"		"WINEDLLOVERRIDES=\"dinput8=n,b\" %command%"
+					}
+				}
+			}
+		}
+	}
+}
+"#;
+        let opts = extract_launch_options_for_app(vdf, "335670").unwrap();
+        assert_eq!(opts, r#"WINEDLLOVERRIDES="dinput8=n,b" %command%"#);
+        assert!(opts.contains("dinput8=n,b"));
+    }
+
+    #[test]
+    fn writes_unquoted_override_round_trip() {
+        let vdf = r#"
+"UserLocalConfigStore"
+{
+	"apps"
+	{
+		"335670"
+		{
+			"LaunchOptions"		"PROTON_ENABLE_WAYLAND=1 %command%"
+		}
+	}
+}
+"#;
+        let updated =
+            replace_launch_options_in_vdf(vdf, "335670", "WINEDLLOVERRIDES=dinput8=n,b %command%")
+                .unwrap();
+        let opts = extract_launch_options_for_app(&updated, "335670").unwrap();
+        assert_eq!(opts, "WINEDLLOVERRIDES=dinput8=n,b %command%");
+        // Value stored without needing nested quote escapes when unquoted.
+        assert!(updated.contains(r#""LaunchOptions"		"WINEDLLOVERRIDES=dinput8=n,b %command%""#));
+    }
+
+    #[test]
+    fn round_trips_quoted_value_with_escapes() {
+        let vdf = r#"
+"apps"
+{
+	"1"
+	{
+		"LaunchOptions"		"old"
+	}
+}
+"#;
+        let written = r#"WINEDLLOVERRIDES="dinput8=n,b" %command%"#;
+        let updated = replace_launch_options_in_vdf(vdf, "1", written).unwrap();
+        assert!(updated.contains(r#"WINEDLLOVERRIDES=\"dinput8=n,b\""#));
+        let opts = extract_launch_options_for_app(&updated, "1").unwrap();
+        assert_eq!(opts, written);
+    }
+
+    #[test]
+    fn escape_vdf_string_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            escape_vdf_string(r#"WINEDLLOVERRIDES="dinput8=n,b""#),
+            r#"WINEDLLOVERRIDES=\"dinput8=n,b\""#
+        );
+    }
 }

@@ -16,13 +16,8 @@ use anyhow::Result;
 
 use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
 
-pub const MELONLOADER_PRESERVE_ROOTS: &[&str] = &[
-    "MelonLoader",
-    "Mods",
-    "Plugins",
-    "UserLibs",
-    "UserData",
-];
+pub const MELONLOADER_PRESERVE_ROOTS: &[&str] =
+    &["MelonLoader", "Mods", "Plugins", "UserLibs", "UserData"];
 
 const LOADER_FILES: &[&str] = &[
     "version.dll",

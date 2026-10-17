@@ -7,6 +7,7 @@ use std::{
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{bail, Context, Result};
@@ -80,6 +81,13 @@ pub struct StagedMod {
     /// options, or the user has not touched the defaults yet.
     #[serde(default)]
     pub option_selection: Option<ModOptionSelection>,
+    /// Name of the file that was staged, when it is distinct from the mod title.
+    /// The file chooser's title is preferred; the archive name is the fallback.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// Catalog poster. `None` has not been looked up. `Some("")` has no image.
+    #[serde(default)]
+    pub picture_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -110,8 +118,39 @@ impl Default for StagedMod {
             depends_on: Vec::new(),
             staged_file_count: None,
             option_selection: None,
+            file_name: None,
+            picture_url: None,
         }
     }
+}
+
+/// Prefer a freshly known poster. An empty incoming value keeps the replaced row's URL.
+fn resolve_picture_url(incoming: Option<String>, removed: &[StagedMod]) -> Option<String> {
+    let incoming = incoming.filter(|url| !url.trim().is_empty());
+    if incoming.is_some() {
+        incoming
+    } else {
+        removed.iter().find_map(|m| m.picture_url.clone())
+    }
+}
+
+/// Label that tells two files of one mod apart. The file chooser's title wins.
+/// A blank name, or one that only repeats the mod title, is dropped so the UI
+/// can show the version and the existing source line instead.
+pub fn pick_staged_file_name(
+    mod_name: &str,
+    chooser_name: Option<&str>,
+    archive_name: Option<&str>,
+) -> Option<String> {
+    fn distinct(mod_name: &str, candidate: Option<&str>) -> Option<String> {
+        let name = candidate?.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case(mod_name.trim()) {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+    distinct(mod_name, chooser_name).or_else(|| distinct(mod_name, archive_name))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -190,9 +229,51 @@ pub struct DeployResult {
     pub file_count: usize,
     pub enabled_mods: usize,
     pub warnings: Vec<String>,
+    /// Plugins omitted because a master is missing. Empty for games that do not
+    /// write a plugin load order.
+    #[serde(default)]
+    pub plugin_skips: Vec<crate::games::PluginSkip>,
+    /// Nexus requirements of the staged mods that contain those plugins.
+    #[serde(default)]
+    pub missing_requirements: crate::nexus::MissingRequirements,
 }
 
-pub fn load_loadorder(paths: &Paths, game_id: &str) -> Result<LoadOrder> {
+/// Per-game lock around load-order read/modify/write. Installs run side by side
+/// (Assist moves on before staging finishes), and the last save used to drop
+/// or duplicate rows.
+#[derive(Clone)]
+pub struct GameOrderLocks {
+    inner: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+impl GameOrderLocks {
+    pub fn with_game<T>(&self, game_id: &str, f: impl FnOnce() -> T) -> T {
+        let game_lock = {
+            let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(game_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = game_lock.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+}
+
+static ORDER_LOCKS: OnceLock<GameOrderLocks> = OnceLock::new();
+
+pub fn shared_order_locks() -> GameOrderLocks {
+    ORDER_LOCKS
+        .get_or_init(|| GameOrderLocks {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        })
+        .clone()
+}
+
+pub fn with_game_order<T>(game_id: &str, f: impl FnOnce() -> T) -> T {
+    shared_order_locks().with_game(game_id, f)
+}
+
+fn read_loadorder(paths: &Paths, game_id: &str) -> Result<LoadOrder> {
     let file = paths.loadorder_file(game_id);
     if !file.exists() {
         return Ok(LoadOrder::default());
@@ -201,12 +282,42 @@ pub fn load_loadorder(paths: &Paths, game_id: &str) -> Result<LoadOrder> {
     Ok(serde_json::from_str(&raw)?)
 }
 
-pub fn save_loadorder(paths: &Paths, game_id: &str, order: &LoadOrder) -> Result<()> {
+fn write_loadorder(paths: &Paths, game_id: &str, order: &LoadOrder) -> Result<()> {
     crate::config::ensure_game_dirs(paths, game_id)?;
     let file = paths.loadorder_file(game_id);
     let raw = serde_json::to_string_pretty(order)?;
-    fs::write(file, raw)?;
+    let tmp = file.with_extension("json.tmp");
+    fs::write(&tmp, &raw)?;
+    fs::rename(&tmp, &file)?;
     Ok(())
+}
+
+pub fn load_loadorder(paths: &Paths, game_id: &str) -> Result<LoadOrder> {
+    with_game_order(game_id, || {
+        let mut order = read_loadorder(paths, game_id)?;
+        if collapse_load_order(paths, game_id, &mut order)? {
+            write_loadorder(paths, game_id, &order)?;
+        }
+        Ok(order)
+    })
+}
+
+pub fn save_loadorder(paths: &Paths, game_id: &str, order: &LoadOrder) -> Result<()> {
+    with_game_order(game_id, || write_loadorder(paths, game_id, order))
+}
+
+fn mutate_load_order<T>(
+    paths: &Paths,
+    game_id: &str,
+    f: impl FnOnce(&mut LoadOrder) -> Result<T>,
+) -> Result<T> {
+    with_game_order(game_id, || {
+        let mut order = read_loadorder(paths, game_id)?;
+        collapse_load_order(paths, game_id, &mut order)?;
+        let out = f(&mut order)?;
+        write_loadorder(paths, game_id, &order)?;
+        Ok(out)
+    })
 }
 
 pub fn load_collections(paths: &Paths, game_id: &str) -> Result<InstalledCollections> {
@@ -309,6 +420,10 @@ pub struct NexusFileMeta {
     pub category_name: Option<String>,
     pub uploaded_timestamp: Option<u64>,
     pub is_primary: bool,
+    /// Chosen file label (`pick_staged_file_name`), when one exists.
+    pub file_name: Option<String>,
+    /// Nexus display title. Empty when the caller has no title to compare.
+    pub name: String,
 }
 
 /// Available remote update for a staged mod.
@@ -323,6 +438,9 @@ pub struct StagedModUpdate {
     pub ts_version: Option<String>,
     #[serde(default)]
     pub modio_file_id: Option<u64>,
+    /// File label to store on the replacement row.
+    #[serde(default)]
+    pub file_name: Option<String>,
 }
 
 fn category_key(name: Option<&str>) -> String {
@@ -339,6 +457,68 @@ fn nexus_file_is_newer(candidate: &NexusFileMeta, baseline: &NexusFileMeta) -> b
         (Some(ta), Some(tb)) if ta != tb => ta > tb,
         _ => candidate.file_id > baseline.file_id,
     }
+}
+
+/// Lowercased title with version tokens removed, so "BepInEx 1.2" and "BepInEx" match.
+fn file_variant_key(name: &str) -> String {
+    let chars: Vec<char> = name.trim().to_lowercase().chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let boundary = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+        if boundary {
+            if let Some(next) = skip_version_token(&chars, i) {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                i = next;
+                continue;
+            }
+        }
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        i += 1;
+    }
+    out.trim().to_string()
+}
+
+/// `v1.2`, `1.2.3`, and `1-0-7`. A bare number stays, so loader majors are kept.
+fn skip_version_token(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut saw_v = false;
+    if chars.get(i) == Some(&'v') && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+        saw_v = true;
+        i += 1;
+    }
+    if !chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+        i += 1;
+    }
+    let mut groups = 1;
+    while matches!(chars.get(i), Some('.' | '-')) {
+        let mut j = i + 1;
+        if !chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+            break;
+        }
+        while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+            j += 1;
+        }
+        groups += 1;
+        i = j;
+    }
+    (saw_v || groups >= 2).then_some(i)
+}
+
+fn same_file_variant(staged: &NexusFileMeta, other: &NexusFileMeta) -> bool {
+    let staged_key = file_variant_key(&staged.name);
+    let other_key = file_variant_key(&other.name);
+    staged_key.is_empty() || other_key.is_empty() || staged_key == other_key
 }
 
 fn newest_nexus_file<'a, F>(files: &'a [NexusFileMeta], pred: F) -> Option<&'a NexusFileMeta>
@@ -364,8 +544,12 @@ pub fn nexus_update_candidate<'a>(
     let staged = files.iter().find(|f| f.file_id == staged_file_id);
     let candidate = if let Some(staged) = staged {
         let cat = category_key(staged.category_name.as_deref());
-        newest_nexus_file(files, |f| category_key(f.category_name.as_deref()) == cat)
-            .or_else(|| newest_nexus_file(files, |f| f.is_primary))
+        // A different title in the same category is another main file, not a
+        // newer upload of the one that is installed. Don't fall through to
+        // whichever file happens to be primary.
+        newest_nexus_file(files, |f| {
+            category_key(f.category_name.as_deref()) == cat && same_file_variant(staged, f)
+        })
     } else {
         newest_nexus_file(files, |f| f.is_primary)
             .or_else(|| newest_nexus_file(files, |f| is_main_category(f.category_name.as_deref())))
@@ -376,20 +560,55 @@ pub fn nexus_update_candidate<'a>(
         return None;
     }
 
-    let version_newer = candidate
-        .version
-        .as_deref()
-        .filter(|v| !v.is_empty())
-        .map(|v| incoming_is_newer(staged_version, v))
-        .unwrap_or(false);
-    let upload_newer = match staged {
-        Some(s) => nexus_file_is_newer(candidate, s),
-        None => true,
-    };
-    if version_newer || upload_newer {
-        Some(candidate)
-    } else {
-        None
+    // A newer upload of an older version is a different file in the same
+    // category, not an update of the one that is installed.
+    match version_against_staged(staged_version, candidate.version.as_deref()) {
+        VersionOrder::Newer => Some(candidate),
+        VersionOrder::Older => None,
+        VersionOrder::UseUpload => {
+            let upload_newer = match staged {
+                Some(s) => nexus_file_is_newer(candidate, s),
+                None => true,
+            };
+            upload_newer.then_some(candidate)
+        }
+    }
+}
+
+enum VersionOrder {
+    Newer,
+    Older,
+    UseUpload,
+}
+
+fn version_against_staged(staged: Option<&str>, candidate: Option<&str>) -> VersionOrder {
+    let staged = staged.unwrap_or("").trim();
+    let candidate = candidate.unwrap_or("").trim();
+    if staged.is_empty() || candidate.is_empty() {
+        return VersionOrder::UseUpload;
+    }
+    if incoming_is_newer(Some(staged), candidate) {
+        return VersionOrder::Newer;
+    }
+    if incoming_is_newer(Some(candidate), staged) {
+        return VersionOrder::Older;
+    }
+    VersionOrder::UseUpload
+}
+
+/// Same mod.io file stays. A different file replaces the staged one, including
+/// when the incoming version string is missing.
+pub fn keep_existing_modio_file(
+    same_file: bool,
+    existing_version: Option<&str>,
+    incoming_version: Option<&str>,
+) -> bool {
+    if same_file {
+        return true;
+    }
+    match incoming_version.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(incoming) => !incoming_is_newer(existing_version, incoming),
+        None => false,
     }
 }
 
@@ -415,7 +634,134 @@ fn rewrite_depends_on(order: &mut LoadOrder, old_id: &str, new_id: &str) {
     }
 }
 
-fn provenance_from_removed(old: Option<StagedMod>, new_staging: &Path) -> StagingProvenance {
+fn rewrite_collection_mod_id(
+    paths: &Paths,
+    game_id: &str,
+    old_id: &str,
+    new_id: &str,
+) -> Result<()> {
+    if old_id == new_id || old_id.is_empty() {
+        return Ok(());
+    }
+    let mut store = load_collections(paths, game_id)?;
+    let mut changed = false;
+    for collection in &mut store.collections {
+        let mut seen = HashSet::new();
+        let mut next = Vec::new();
+        for id in collection.mod_ids.drain(..) {
+            let id = if id == old_id {
+                changed = true;
+                new_id.to_string()
+            } else {
+                id
+            };
+            if seen.insert(id.clone()) {
+                next.push(id);
+            } else {
+                changed = true;
+            }
+        }
+        collection.mod_ids = next;
+    }
+    if changed {
+        save_collections(paths, game_id, &store)?;
+    }
+    Ok(())
+}
+
+fn nexus_file_key(staged: &StagedMod) -> Option<(String, u64, u64)> {
+    if staged.source != ModSource::Nexus || staged.nexus_mod_id == 0 {
+        return None;
+    }
+    Some((
+        staged.domain.to_lowercase(),
+        staged.nexus_mod_id,
+        staged.nexus_file_id,
+    ))
+}
+
+struct RowCollapse {
+    rewrites: Vec<(String, String)>,
+    unused_staging: Vec<PathBuf>,
+}
+
+/// Drop rows that share an id or the same Nexus file. The last row wins.
+/// Different file ids of the same mod are left alone.
+fn collapse_duplicate_rows(order: &mut LoadOrder) -> RowCollapse {
+    let mut winner_for_id: HashMap<String, usize> = HashMap::new();
+    let mut winner_for_file: HashMap<(String, u64, u64), usize> = HashMap::new();
+    for (index, staged) in order.mods.iter().enumerate() {
+        winner_for_id.insert(staged.id.clone(), index);
+        if let Some(key) = nexus_file_key(staged) {
+            winner_for_file.insert(key, index);
+        }
+    }
+    let mut drop_idx = HashSet::new();
+    let mut rewrites = Vec::new();
+    for (index, staged) in order.mods.iter().enumerate() {
+        let id_winner = winner_for_id.get(&staged.id).copied();
+        let file_winner = nexus_file_key(staged).and_then(|key| winner_for_file.get(&key).copied());
+        let winner = match (id_winner, file_winner) {
+            (Some(id_at), Some(file_at)) => Some(id_at.max(file_at)),
+            (Some(id_at), None) => Some(id_at),
+            (None, Some(file_at)) => Some(file_at),
+            (None, None) => None,
+        };
+        if let Some(winner) = winner {
+            if winner != index {
+                drop_idx.insert(index);
+                let new_id = order.mods[winner].id.clone();
+                if staged.id != new_id {
+                    rewrites.push((staged.id.clone(), new_id));
+                }
+            }
+        }
+    }
+    let kept_paths: HashSet<String> = order
+        .mods
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !drop_idx.contains(index))
+        .map(|(_, staged)| staged.staging_path.clone())
+        .collect();
+    let unused_staging = order
+        .mods
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| drop_idx.contains(index))
+        .map(|(_, staged)| PathBuf::from(&staged.staging_path))
+        .filter(|path| !kept_paths.contains(&path.to_string_lossy().to_string()))
+        .collect();
+    let mut kept = Vec::new();
+    for (index, staged) in order.mods.drain(..).enumerate() {
+        if !drop_idx.contains(&index) {
+            kept.push(staged);
+        }
+    }
+    order.mods = kept;
+    RowCollapse {
+        rewrites,
+        unused_staging,
+    }
+}
+
+fn collapse_load_order(paths: &Paths, game_id: &str, order: &mut LoadOrder) -> Result<bool> {
+    let before = order.mods.len();
+    let collapse = collapse_duplicate_rows(order);
+    let changed = order.mods.len() != before;
+    for (old_id, new_id) in &collapse.rewrites {
+        rewrite_depends_on(order, old_id, new_id);
+        rewrite_collection_mod_id(paths, game_id, old_id, new_id)?;
+    }
+    for path in collapse.unused_staging {
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+    Ok(changed)
+}
+
+fn provenance_from_removed(old: Option<StagedMod>, _new_staging: &Path) -> StagingProvenance {
     let Some(old) = old else {
         return StagingProvenance {
             independent: true,
@@ -423,10 +769,6 @@ fn provenance_from_removed(old: Option<StagedMod>, new_staging: &Path) -> Stagin
             ..Default::default()
         };
     };
-    let old_path = PathBuf::from(&old.staging_path);
-    if old_path != new_staging && old_path.exists() {
-        let _ = fs::remove_dir_all(&old_path);
-    }
     StagingProvenance {
         collection_ids: old.collection_ids,
         independent: old.independent,
@@ -440,37 +782,96 @@ fn provenance_from_removed(old: Option<StagedMod>, new_staging: &Path) -> Stagin
     }
 }
 
+fn take_rows<F>(order: &mut LoadOrder, mut pred: F) -> Vec<StagedMod>
+where
+    F: FnMut(&StagedMod) -> bool,
+{
+    let mut kept = Vec::new();
+    let mut taken = Vec::new();
+    for staged in order.mods.drain(..) {
+        if pred(&staged) {
+            taken.push(staged);
+        } else {
+            kept.push(staged);
+        }
+    }
+    order.mods = kept;
+    taken
+}
+
+fn discard_unreferenced_staging(order: &LoadOrder, paths: &[PathBuf], keep: &Path) {
+    let used: HashSet<PathBuf> = order
+        .mods
+        .iter()
+        .map(|staged| PathBuf::from(&staged.staging_path))
+        .collect();
+    for path in paths {
+        if path == keep || used.contains(path) {
+            continue;
+        }
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn finish_replacement(
+    paths: &Paths,
+    game_id: &str,
+    order: &mut LoadOrder,
+    removed: &[StagedMod],
+    staged: StagedMod,
+) -> Result<StagedMod> {
+    let new_staging = PathBuf::from(&staged.staging_path);
+    let old_paths: Vec<PathBuf> = removed
+        .iter()
+        .map(|old| PathBuf::from(&old.staging_path))
+        .collect();
+    for old in removed {
+        if old.id != staged.id {
+            rewrite_depends_on(order, &old.id, &staged.id);
+            rewrite_collection_mod_id(paths, game_id, &old.id, &staged.id)?;
+        }
+    }
+    discard_unreferenced_staging(order, &old_paths, &new_staging);
+    order.mods.push(staged.clone());
+    Ok(staged)
+}
+
+fn temp_extract_dir(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "staging".into());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dest.with_file_name(format!(".{nanos}.{name}"))
+}
+
+fn swap_extracted_dir(temp: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        fs::remove_dir_all(dest)?;
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(temp, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_dir_all(temp, dest)?;
+            let _ = fs::remove_dir_all(temp);
+            Ok(())
+        }
+    }
+}
+
 fn take_row_by_id(order: &mut LoadOrder, id: &str) -> Option<StagedMod> {
     order
         .mods
         .iter()
         .position(|m| m.id == id)
-        .map(|pos| order.mods.remove(pos))
-}
-
-fn take_nexus_row(order: &mut LoadOrder, mod_id: u64, file_id: u64) -> Option<StagedMod> {
-    order
-        .mods
-        .iter()
-        .position(|m| {
-            m.source == ModSource::Nexus && m.nexus_mod_id == mod_id && m.nexus_file_id == file_id
-        })
-        .map(|pos| order.mods.remove(pos))
-}
-
-fn take_modio_row(
-    order: &mut LoadOrder,
-    modio_game_id: u32,
-    modio_mod_id: u64,
-) -> Option<StagedMod> {
-    order
-        .mods
-        .iter()
-        .position(|m| {
-            m.source == ModSource::Modio
-                && m.modio_game_id == Some(modio_game_id)
-                && m.modio_mod_id == Some(modio_mod_id)
-        })
         .map(|pos| order.mods.remove(pos))
 }
 
@@ -510,6 +911,19 @@ pub fn find_nexus_file<'a>(
     })
 }
 
+/// Any staged file of a Nexus mod, matched by domain and mod id.
+pub fn find_nexus_mod<'a>(
+    order: &'a LoadOrder,
+    domain: &str,
+    nexus_mod_id: u64,
+) -> Option<&'a StagedMod> {
+    order.mods.iter().find(|m| {
+        m.source == ModSource::Nexus
+            && m.nexus_mod_id == nexus_mod_id
+            && m.domain.eq_ignore_ascii_case(domain)
+    })
+}
+
 pub fn merge_mod_meta(
     paths: &Paths,
     game_id: &str,
@@ -519,25 +933,24 @@ pub fn merge_mod_meta(
     independent: Option<bool>,
     enabled: Option<bool>,
 ) -> Result<Option<StagedMod>> {
-    let mut order = load_loadorder(paths, game_id)?;
-    let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
-        return Ok(None);
-    };
-    for id in extra_collection_ids {
-        push_unique(&mut m.collection_ids, id.clone());
-    }
-    for id in extra_depends_on {
-        push_unique(&mut m.depends_on, id.clone());
-    }
-    if let Some(flag) = independent {
-        m.independent = flag;
-    }
-    if let Some(flag) = enabled {
-        m.enabled = flag;
-    }
-    let cloned = m.clone();
-    save_loadorder(paths, game_id, &order)?;
-    Ok(Some(cloned))
+    mutate_load_order(paths, game_id, |order| {
+        let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+            return Ok(None);
+        };
+        for id in extra_collection_ids {
+            push_unique(&mut m.collection_ids, id.clone());
+        }
+        for id in extra_depends_on {
+            push_unique(&mut m.depends_on, id.clone());
+        }
+        if let Some(flag) = independent {
+            m.independent = flag;
+        }
+        if let Some(flag) = enabled {
+            m.enabled = flag;
+        }
+        Ok(Some(m.clone()))
+    })
 }
 
 pub fn record_installed_collection(
@@ -549,17 +962,23 @@ pub fn record_installed_collection(
     if collection.installed_at.is_empty() {
         collection.installed_at = chrono::Utc::now().to_rfc3339();
     }
-    let mut order = load_loadorder(paths, game_id)?;
     let new_set: HashSet<&str> = new_mod_ids.iter().map(|s| s.as_str()).collect();
-    for m in &mut order.mods {
-        if collection.mod_ids.iter().any(|id| id == &m.id) {
-            push_unique(&mut m.collection_ids, collection.id.clone());
-            if new_set.contains(m.id.as_str()) {
-                m.independent = false;
+    let collection_id = collection.id.clone();
+    let member_ids = collection.mod_ids.clone();
+    with_game_order(game_id, || {
+        let mut order = read_loadorder(paths, game_id)?;
+        collapse_load_order(paths, game_id, &mut order)?;
+        for m in &mut order.mods {
+            if member_ids.iter().any(|id| id == &m.id) {
+                push_unique(&mut m.collection_ids, collection_id.clone());
+                if new_set.contains(m.id.as_str()) {
+                    m.independent = false;
+                }
             }
         }
-    }
-    save_loadorder(paths, game_id, &order)?;
+        write_loadorder(paths, game_id, &order)?;
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     let mut store = load_collections(paths, game_id)?;
     if let Some(existing) = store.collections.iter_mut().find(|c| c.id == collection.id) {
@@ -619,32 +1038,35 @@ fn delete_staged_row(m: &StagedMod) -> Result<()> {
 }
 
 pub fn uninstall_collection(paths: &Paths, game_id: &str, collection_id: &str) -> Result<usize> {
-    let mut store = load_collections(paths, game_id)?;
-    if !store.collections.iter().any(|c| c.id == collection_id) {
-        bail!("collection not found: {collection_id}");
-    }
-    store.collections.retain(|c| c.id != collection_id);
-    let mut order = load_loadorder(paths, game_id)?;
-    drop_collection_from_mods(&mut order, collection_id);
-    let keep = reachable_mod_ids(&order, &store);
-    let mut removed = 0usize;
-    let mut remaining = Vec::new();
-    for m in order.mods.drain(..) {
-        if keep.contains(&m.id) {
-            remaining.push(m);
-        } else {
-            delete_staged_row(&m)?;
-            removed += 1;
+    with_game_order(game_id, || {
+        let mut order = read_loadorder(paths, game_id)?;
+        collapse_load_order(paths, game_id, &mut order)?;
+        let mut store = load_collections(paths, game_id)?;
+        if !store.collections.iter().any(|c| c.id == collection_id) {
+            bail!("collection not found: {collection_id}");
         }
-    }
-    order.mods = remaining;
-    for c in &mut store.collections {
-        c.mod_ids
-            .retain(|id| order.mods.iter().any(|m| &m.id == id));
-    }
-    save_loadorder(paths, game_id, &order)?;
-    save_collections(paths, game_id, &store)?;
-    Ok(removed)
+        store.collections.retain(|c| c.id != collection_id);
+        drop_collection_from_mods(&mut order, collection_id);
+        let keep = reachable_mod_ids(&order, &store);
+        let mut removed = 0usize;
+        let mut remaining = Vec::new();
+        for m in order.mods.drain(..) {
+            if keep.contains(&m.id) {
+                remaining.push(m);
+            } else {
+                delete_staged_row(&m)?;
+                removed += 1;
+            }
+        }
+        order.mods = remaining;
+        for c in &mut store.collections {
+            c.mod_ids
+                .retain(|id| order.mods.iter().any(|m| &m.id == id));
+        }
+        write_loadorder(paths, game_id, &order)?;
+        save_collections(paths, game_id, &store)?;
+        Ok(removed)
+    })
 }
 
 pub fn list_installed_collections(
@@ -688,34 +1110,42 @@ pub fn stage_overlay_dir(
     crate::config::ensure_game_dirs(paths, game_id)?;
     let safe = sanitize_filename::sanitize(name);
     let staging = paths.mods_dir(game_id).join(format!("{safe}_{id}"));
-    copy_dir_all(source_dir, &staging)?;
-
-    let mut order = load_loadorder(paths, game_id)?;
-    let old = take_row_by_id(&mut order, id);
-    let provenance = provenance_from_removed(old, &staging);
-    let next_order = provenance
-        .order
-        .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
-    let staged = StagedMod {
-        id: id.to_string(),
-        name: name.to_string(),
-        source: ModSource::Thunderstore,
-        version: None,
-        domain: "profile".into(),
-        staging_path: staging.to_string_lossy().to_string(),
-        enabled: provenance.enabled,
-        order: next_order,
-        ts_namespace: Some("profile".into()),
-        ts_name: Some(name.to_string()),
-        collection_ids: provenance.collection_ids,
-        independent: provenance.independent,
-        depends_on: provenance.depends_on,
-        option_selection: provenance.option_selection,
-        ..Default::default()
-    };
-    order.mods.push(staged.clone());
-    save_loadorder(paths, game_id, &order)?;
-    Ok(staged)
+    let temp = temp_extract_dir(&staging);
+    if let Err(e) = copy_dir_all(source_dir, &temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(e);
+    }
+    let committed = mutate_load_order(paths, game_id, |order| {
+        swap_extracted_dir(&temp, &staging)?;
+        let removed = take_rows(order, |m| m.id == id);
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let next_order = provenance
+            .order
+            .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
+        let staged = StagedMod {
+            id: id.to_string(),
+            name: name.to_string(),
+            source: ModSource::Thunderstore,
+            version: None,
+            domain: "profile".into(),
+            staging_path: staging.to_string_lossy().to_string(),
+            enabled: provenance.enabled,
+            order: next_order,
+            ts_namespace: Some("profile".into()),
+            ts_name: Some(name.to_string()),
+            collection_ids: provenance.collection_ids,
+            independent: provenance.independent,
+            depends_on: provenance.depends_on,
+            option_selection: provenance.option_selection,
+            picture_url: resolve_picture_url(None, &removed),
+            ..Default::default()
+        };
+        finish_replacement(paths, game_id, order, &removed, staged)
+    });
+    if committed.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    committed
 }
 
 /// Mod payloads that are single files rather than archives (e.g. Sims `.package`
@@ -1012,10 +1442,11 @@ pub fn stage_mod(
     mod_id: u64,
     file_id: u64,
     version: Option<String>,
+    file_name: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
     stage_mod_inner(
-        paths, game_id, None, name, domain, mod_id, file_id, version, archive,
+        paths, game_id, None, name, domain, mod_id, file_id, version, file_name, archive,
     )
 }
 
@@ -1029,6 +1460,7 @@ pub fn stage_mod_replacing(
     mod_id: u64,
     file_id: u64,
     version: Option<String>,
+    file_name: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
     stage_mod_inner(
@@ -1040,6 +1472,7 @@ pub fn stage_mod_replacing(
         mod_id,
         file_id,
         version,
+        file_name,
         archive,
     )
 }
@@ -1053,6 +1486,7 @@ fn stage_mod_inner(
     mod_id: u64,
     file_id: u64,
     version: Option<String>,
+    file_name: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
@@ -1060,49 +1494,99 @@ fn stage_mod_inner(
     let staging = paths
         .mods_dir(game_id)
         .join(format!("{safe}_{mod_id}_{file_id}"));
-    extract_archive(archive, &staging)?;
-
-    let mut order = load_loadorder(paths, game_id)?;
-    let old = if let Some(id) = replace_id {
-        take_row_by_id(&mut order, id)
-    } else {
-        take_nexus_row(&mut order, mod_id, file_id)
-    };
-    let old_id = old.as_ref().map(|m| m.id.clone());
-    let provenance = provenance_from_removed(old, &staging);
-    let new_id = format!("{mod_id}_{file_id}");
-    if let Some(old_id) = old_id {
-        rewrite_depends_on(&mut order, &old_id, &new_id);
+    let temp = temp_extract_dir(&staging);
+    if let Err(e) = extract_archive(archive, &temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(e);
     }
-    let next_order = provenance
-        .order
-        .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
-    let staged = StagedMod {
-        id: new_id,
-        name: name.to_string(),
-        source: ModSource::Nexus,
-        nexus_mod_id: mod_id,
-        nexus_file_id: file_id,
-        version,
-        domain: domain.to_string(),
-        staging_path: staging.to_string_lossy().to_string(),
-        enabled: provenance.enabled,
-        order: next_order,
-        ts_namespace: None,
-        ts_name: None,
-        ts_package_uuid: None,
-        modio_game_id: None,
-        modio_mod_id: None,
-        modio_file_id: None,
-        collection_ids: provenance.collection_ids,
-        independent: provenance.independent,
-        depends_on: provenance.depends_on,
-        staged_file_count: Some(count_staged_files(&staging)),
-        option_selection: provenance.option_selection,
-    };
-    order.mods.push(staged.clone());
-    save_loadorder(paths, game_id, &order)?;
-    Ok(staged)
+
+    let new_id = format!("{mod_id}_{file_id}");
+    let domain_key = domain.to_lowercase();
+    let committed = mutate_load_order(paths, game_id, |order| {
+        swap_extracted_dir(&temp, &staging)?;
+        let mut removed = Vec::new();
+        if let Some(id) = replace_id {
+            if let Some(row) = take_row_by_id(order, id) {
+                removed.push(row);
+            }
+        }
+        removed.extend(take_rows(order, |m| m.id == new_id));
+        removed.extend(take_rows(order, |m| {
+            m.source == ModSource::Nexus
+                && m.nexus_mod_id == mod_id
+                && m.nexus_file_id == file_id
+                && m.domain.to_lowercase() == domain_key
+        }));
+        let stored_file_name = file_name.clone().or_else(|| {
+            removed.first().and_then(|old| {
+                (old.nexus_mod_id == mod_id && old.nexus_file_id == file_id)
+                    .then(|| old.file_name.clone())
+                    .flatten()
+            })
+        });
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let next_order = provenance
+            .order
+            .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
+        let staged = StagedMod {
+            id: new_id.clone(),
+            name: name.to_string(),
+            source: ModSource::Nexus,
+            nexus_mod_id: mod_id,
+            nexus_file_id: file_id,
+            version: version.clone(),
+            domain: domain.to_string(),
+            staging_path: staging.to_string_lossy().to_string(),
+            enabled: provenance.enabled,
+            order: next_order,
+            ts_namespace: None,
+            ts_name: None,
+            ts_package_uuid: None,
+            modio_game_id: None,
+            modio_mod_id: None,
+            modio_file_id: None,
+            collection_ids: provenance.collection_ids,
+            independent: provenance.independent,
+            depends_on: provenance.depends_on,
+            staged_file_count: Some(count_staged_files(&staging)),
+            option_selection: provenance.option_selection,
+            file_name: stored_file_name,
+            picture_url: resolve_picture_url(None, &removed),
+        };
+        finish_replacement(paths, game_id, order, &removed, staged)
+    });
+    if committed.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    committed
+}
+
+/// Record a file label on a staged row that does not have one yet.
+pub fn remember_file_name_if_missing(
+    paths: &Paths,
+    game_id: &str,
+    staged_id: &str,
+    file_name: &str,
+) -> Result<bool> {
+    let label = file_name.trim();
+    if label.is_empty() {
+        return Ok(false);
+    }
+    mutate_load_order(paths, game_id, |order| {
+        let Some(row) = order.mods.iter_mut().find(|m| m.id == staged_id) else {
+            return Ok(false);
+        };
+        if row
+            .file_name
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        row.file_name = Some(label.to_string());
+        Ok(true)
+    })
 }
 
 /// Files currently present in a staging folder.
@@ -1141,6 +1625,8 @@ pub fn stage_thunderstore_mod(
     version: &str,
     package_uuid: Option<String>,
     display_name: &str,
+    file_name: Option<String>,
+    picture_url: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
@@ -1151,41 +1637,51 @@ pub fn stage_thunderstore_mod(
     let staging = paths
         .mods_dir(game_id)
         .join(format!("{safe}_{ns_safe}_{name_safe}_{ver_safe}"));
-    extract_archive(archive, &staging)?;
+    let temp = temp_extract_dir(&staging);
+    if let Err(e) = extract_archive(archive, &temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(e);
+    }
 
-    let mut order = load_loadorder(paths, game_id)?;
     let id = thunderstore_mod_id(namespace, name);
-    let old = take_row_by_id(&mut order, &id);
-    let provenance = provenance_from_removed(old, &staging);
-    let next_order = provenance
-        .order
-        .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
-    let staged = StagedMod {
-        id,
-        name: display_name.to_string(),
-        source: ModSource::Thunderstore,
-        nexus_mod_id: 0,
-        nexus_file_id: 0,
-        version: Some(version.to_string()),
-        domain: community.to_string(),
-        staging_path: staging.to_string_lossy().to_string(),
-        enabled: provenance.enabled,
-        order: next_order,
-        ts_namespace: Some(namespace.to_string()),
-        ts_name: Some(name.to_string()),
-        ts_package_uuid: package_uuid,
-        modio_game_id: None,
-        modio_mod_id: None,
-        modio_file_id: None,
-        collection_ids: provenance.collection_ids,
-        independent: provenance.independent,
-        depends_on: provenance.depends_on,
-        staged_file_count: Some(count_staged_files(&staging)),
-        option_selection: provenance.option_selection,
-    };
-    order.mods.push(staged.clone());
-    save_loadorder(paths, game_id, &order)?;
-    Ok(staged)
+    let committed = mutate_load_order(paths, game_id, |order| {
+        swap_extracted_dir(&temp, &staging)?;
+        let removed = take_rows(order, |m| m.id == id);
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let next_order = provenance
+            .order
+            .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
+        let staged = StagedMod {
+            id: id.clone(),
+            name: display_name.to_string(),
+            source: ModSource::Thunderstore,
+            nexus_mod_id: 0,
+            nexus_file_id: 0,
+            version: Some(version.to_string()),
+            domain: community.to_string(),
+            staging_path: staging.to_string_lossy().to_string(),
+            enabled: provenance.enabled,
+            order: next_order,
+            ts_namespace: Some(namespace.to_string()),
+            ts_name: Some(name.to_string()),
+            ts_package_uuid: package_uuid.clone(),
+            modio_game_id: None,
+            modio_mod_id: None,
+            modio_file_id: None,
+            collection_ids: provenance.collection_ids,
+            independent: provenance.independent,
+            depends_on: provenance.depends_on,
+            staged_file_count: Some(count_staged_files(&staging)),
+            option_selection: provenance.option_selection,
+            file_name,
+            picture_url: resolve_picture_url(picture_url, &removed),
+        };
+        finish_replacement(paths, game_id, order, &removed, staged)
+    });
+    if committed.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    committed
 }
 
 pub fn stage_modio_mod(
@@ -1196,6 +1692,8 @@ pub fn stage_modio_mod(
     modio_file_id: u64,
     name: &str,
     version: Option<String>,
+    file_name: Option<String>,
+    picture_url: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
@@ -1203,45 +1701,78 @@ pub fn stage_modio_mod(
     let staging = paths.mods_dir(game_id).join(format!(
         "{safe}_{modio_game_id}_{modio_mod_id}_{modio_file_id}"
     ));
-    extract_archive(archive, &staging)?;
-
-    let mut order = load_loadorder(paths, game_id)?;
-    let id = modio_identity_id(modio_game_id, modio_mod_id);
-    let old = take_modio_row(&mut order, modio_game_id, modio_mod_id);
-    let old_id = old.as_ref().map(|m| m.id.clone());
-    let provenance = provenance_from_removed(old, &staging);
-    if let Some(old_id) = old_id {
-        rewrite_depends_on(&mut order, &old_id, &id);
+    let temp = temp_extract_dir(&staging);
+    if let Err(e) = extract_archive(archive, &temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(e);
     }
-    let next_order = provenance
-        .order
-        .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
-    let staged = StagedMod {
-        id,
-        name: name.to_string(),
-        source: ModSource::Modio,
-        nexus_mod_id: 0,
-        nexus_file_id: 0,
-        version,
-        domain: format!("modio:{modio_game_id}"),
-        staging_path: staging.to_string_lossy().to_string(),
-        enabled: provenance.enabled,
-        order: next_order,
-        ts_namespace: None,
-        ts_name: None,
-        ts_package_uuid: None,
-        modio_game_id: Some(modio_game_id),
-        modio_mod_id: Some(modio_mod_id),
-        modio_file_id: Some(modio_file_id),
-        collection_ids: provenance.collection_ids,
-        independent: provenance.independent,
-        depends_on: provenance.depends_on,
-        staged_file_count: Some(count_staged_files(&staging)),
-        option_selection: provenance.option_selection,
-    };
-    order.mods.push(staged.clone());
-    save_loadorder(paths, game_id, &order)?;
-    Ok(staged)
+
+    let id = modio_identity_id(modio_game_id, modio_mod_id);
+    let committed = mutate_load_order(paths, game_id, |order| {
+        swap_extracted_dir(&temp, &staging)?;
+        let mut removed = take_rows(order, |m| m.id == id);
+        removed.extend(take_rows(order, |m| {
+            m.source == ModSource::Modio
+                && m.modio_game_id == Some(modio_game_id)
+                && m.modio_mod_id == Some(modio_mod_id)
+        }));
+        let provenance = provenance_from_removed(removed.first().cloned(), &staging);
+        let next_order = provenance
+            .order
+            .unwrap_or_else(|| order.mods.iter().map(|m| m.order).max().unwrap_or(0) + 1);
+        let staged = StagedMod {
+            id: id.clone(),
+            name: name.to_string(),
+            source: ModSource::Modio,
+            nexus_mod_id: 0,
+            nexus_file_id: 0,
+            version: version.clone(),
+            domain: format!("modio:{modio_game_id}"),
+            staging_path: staging.to_string_lossy().to_string(),
+            enabled: provenance.enabled,
+            order: next_order,
+            ts_namespace: None,
+            ts_name: None,
+            ts_package_uuid: None,
+            modio_game_id: Some(modio_game_id),
+            modio_mod_id: Some(modio_mod_id),
+            modio_file_id: Some(modio_file_id),
+            collection_ids: provenance.collection_ids,
+            independent: provenance.independent,
+            depends_on: provenance.depends_on,
+            staged_file_count: Some(count_staged_files(&staging)),
+            option_selection: provenance.option_selection,
+            file_name,
+            picture_url: resolve_picture_url(picture_url, &removed),
+        };
+        finish_replacement(paths, game_id, order, &removed, staged)
+    });
+    if committed.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    committed
+}
+
+/// Record posters for rows that do not have one yet. An empty string means the
+/// catalog was checked and the mod has no image.
+pub fn apply_staged_pictures(
+    paths: &Paths,
+    game_id: &str,
+    pictures: &HashMap<String, String>,
+) -> Result<Vec<StagedMod>> {
+    mutate_load_order(paths, game_id, |order| {
+        for staged in &mut order.mods {
+            if staged.picture_url.is_some() {
+                continue;
+            }
+            if let Some(url) = pictures.get(&staged.id) {
+                staged.picture_url = Some(url.clone());
+            }
+        }
+        let mut mods = order.mods.clone();
+        mods.sort_by_key(|m| m.order);
+        Ok(mods)
+    })
 }
 
 /// True when a Thunderstore package (any version) is already staged.
@@ -1270,12 +1801,13 @@ pub fn has_modio_mod(paths: &Paths, game_id: &str, modio_mod_id: u64) -> Result<
 }
 
 pub fn set_enabled(paths: &Paths, game_id: &str, mod_uid: &str, enabled: bool) -> Result<()> {
-    let mut order = load_loadorder(paths, game_id)?;
-    let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
-        bail!("mod not found: {mod_uid}");
-    };
-    m.enabled = enabled;
-    save_loadorder(paths, game_id, &order)
+    mutate_load_order(paths, game_id, |order| {
+        let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+            bail!("mod not found: {mod_uid}");
+        };
+        m.enabled = enabled;
+        Ok(())
+    })
 }
 
 pub fn set_mod_options(
@@ -1284,58 +1816,64 @@ pub fn set_mod_options(
     mod_uid: &str,
     selection: ModOptionSelection,
 ) -> Result<()> {
-    let mut order = load_loadorder(paths, game_id)?;
-    let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
-        bail!("mod not found: {mod_uid}");
-    };
-    m.option_selection = Some(selection);
-    save_loadorder(paths, game_id, &order)
+    mutate_load_order(paths, game_id, |order| {
+        let Some(m) = order.mods.iter_mut().find(|m| m.id == mod_uid) else {
+            bail!("mod not found: {mod_uid}");
+        };
+        m.option_selection = Some(selection);
+        Ok(())
+    })
 }
 
 pub fn set_load_order(paths: &Paths, game_id: &str, ordered_ids: &[String]) -> Result<()> {
-    let mut order = load_loadorder(paths, game_id)?;
-    let mut by_id: HashMap<String, StagedMod> =
-        order.mods.drain(..).map(|m| (m.id.clone(), m)).collect();
-    let mut new_mods = Vec::new();
-    for (i, id) in ordered_ids.iter().enumerate() {
-        if let Some(mut m) = by_id.remove(id) {
-            m.order = (i as u32) + 1;
+    mutate_load_order(paths, game_id, |order| {
+        let mut by_id: HashMap<String, StagedMod> =
+            order.mods.drain(..).map(|m| (m.id.clone(), m)).collect();
+        let mut new_mods = Vec::new();
+        for (i, id) in ordered_ids.iter().enumerate() {
+            if let Some(mut m) = by_id.remove(id) {
+                m.order = (i as u32) + 1;
+                new_mods.push(m);
+            }
+        }
+        for (_, mut m) in by_id {
+            m.order = (new_mods.len() as u32) + 1;
             new_mods.push(m);
         }
-    }
-    // Append any leftovers
-    for (_, mut m) in by_id {
-        m.order = (new_mods.len() as u32) + 1;
-        new_mods.push(m);
-    }
-    order.mods = new_mods;
-    save_loadorder(paths, game_id, &order)
+        order.mods = new_mods;
+        Ok(())
+    })
 }
 
 pub fn remove_mod(paths: &Paths, game_id: &str, mod_uid: &str) -> Result<()> {
-    let mut order = load_loadorder(paths, game_id)?;
-    if let Some(pos) = order.mods.iter().position(|m| m.id == mod_uid) {
-        let m = order.mods.remove(pos);
-        delete_staged_row(&m)?;
-        save_loadorder(paths, game_id, &order)?;
-        let mut store = load_collections(paths, game_id)?;
-        for c in &mut store.collections {
-            c.mod_ids.retain(|id| id != mod_uid);
+    with_game_order(game_id, || {
+        let mut order = read_loadorder(paths, game_id)?;
+        collapse_load_order(paths, game_id, &mut order)?;
+        if let Some(pos) = order.mods.iter().position(|m| m.id == mod_uid) {
+            let m = order.mods.remove(pos);
+            delete_staged_row(&m)?;
+            write_loadorder(paths, game_id, &order)?;
+            let mut store = load_collections(paths, game_id)?;
+            for c in &mut store.collections {
+                c.mod_ids.retain(|id| id != mod_uid);
+            }
+            save_collections(paths, game_id, &store)?;
         }
-        save_collections(paths, game_id, &store)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn remove_all_mods(paths: &Paths, game_id: &str, install_path: Option<&Path>) -> Result<()> {
     purge_deploy(paths, game_id, install_path)?;
-    let order = load_loadorder(paths, game_id)?;
-    for m in &order.mods {
-        delete_staged_row(m)?;
-    }
-    save_loadorder(paths, game_id, &LoadOrder::default())?;
-    save_collections(paths, game_id, &InstalledCollections::default())?;
-    Ok(())
+    with_game_order(game_id, || {
+        let order = read_loadorder(paths, game_id)?;
+        for m in &order.mods {
+            delete_staged_row(m)?;
+        }
+        write_loadorder(paths, game_id, &LoadOrder::default())?;
+        save_collections(paths, game_id, &InstalledCollections::default())?;
+        Ok(())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1706,6 +2244,7 @@ pub fn deploy(
     }
 
     warnings.extend(plugin.after_deploy(install_path, &enabled_mod_folders)?);
+    let plugin_skips = plugin.plugin_skips(install_path);
 
     // Warn about the tree we just produced, not the one we started from: a pack
     // that failed to land leaves an install that cannot load anything, and a
@@ -1729,6 +2268,8 @@ pub fn deploy(
         file_count: count,
         enabled_mods,
         warnings,
+        plugin_skips,
+        missing_requirements: crate::nexus::MissingRequirements::default(),
     })
 }
 
@@ -2057,6 +2598,7 @@ mod tests {
             "helldivers2",
             1,
             2,
+            None,
             None,
             &archive,
         )
@@ -3238,7 +3780,59 @@ mod tests {
             category_name: Some(category.into()),
             uploaded_timestamp: Some(uploaded),
             is_primary,
+            file_name: None,
+            name: String::new(),
         }
+    }
+
+    fn named(mut file: NexusFileMeta, name: &str) -> NexusFileMeta {
+        file.name = name.to_string();
+        file
+    }
+
+    #[test]
+    fn pick_staged_file_name_prefers_the_chooser_title() {
+        assert_eq!(
+            pick_staged_file_name("Cool Mod", Some("Optional patch"), Some("cool.zip")).as_deref(),
+            Some("Optional patch")
+        );
+        assert_eq!(
+            pick_staged_file_name("Cool Mod", Some("Cool Mod"), Some("cool.zip")).as_deref(),
+            Some("cool.zip")
+        );
+        assert_eq!(
+            pick_staged_file_name("Cool Mod", Some("cool mod"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn remember_file_name_fills_a_row_saved_without_one() {
+        let (tmp, paths) = test_paths();
+        let game_id = "file_name_backfill";
+        let archive = tmp.path().join("mod.zip");
+        write_zip(&archive, "readme.txt", b"v1");
+        let staged = stage_mod(
+            &paths,
+            game_id,
+            "Cool Mod",
+            "skyrim",
+            1,
+            10,
+            Some("1.0".into()),
+            None,
+            &archive,
+        )
+        .unwrap();
+        assert!(staged.file_name.is_none());
+        assert!(
+            remember_file_name_if_missing(&paths, game_id, &staged.id, "Optional patch").unwrap()
+        );
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods[0].file_name.as_deref(), Some("Optional patch"));
+        assert!(!remember_file_name_if_missing(&paths, game_id, &staged.id, "other.zip").unwrap());
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods[0].file_name.as_deref(), Some("Optional patch"));
     }
 
     #[test]
@@ -3277,6 +3871,283 @@ mod tests {
         ];
         let c = nexus_update_candidate(99, Some("1.0.0"), &files).unwrap();
         assert_eq!(c.file_id, 20);
+    }
+
+    #[test]
+    fn nexus_older_version_with_newer_upload_is_not_an_update() {
+        let files = vec![
+            nexus_file(10, "2.0.0", "MAIN", 100, true),
+            nexus_file(20, "1.0.0", "MAIN", 300, false),
+        ];
+        assert!(nexus_update_candidate(10, Some("2.0.0"), &files).is_none());
+    }
+
+    #[test]
+    fn nexus_same_version_reupload_is_an_update() {
+        let files = vec![
+            nexus_file(10, "1.0.0", "MAIN", 100, true),
+            nexus_file(20, "1.0.0", "MAIN", 200, false),
+        ];
+        let c = nexus_update_candidate(10, Some("1.0.0"), &files).unwrap();
+        assert_eq!(c.file_id, 20);
+    }
+
+    #[test]
+    fn file_variant_key_strips_version_tokens() {
+        assert_eq!(file_variant_key("BepInEx"), "bepinex");
+        assert_eq!(file_variant_key("BepInEx 1.2"), "bepinex");
+        assert_eq!(file_variant_key("Cool Mod v1.2.3"), "cool mod");
+        assert_eq!(file_variant_key("Pack 1-0-7"), "pack");
+        assert_eq!(file_variant_key("MelonLoader"), "melonloader");
+        assert_eq!(file_variant_key(""), "");
+    }
+
+    #[test]
+    fn nexus_sibling_main_is_not_an_update() {
+        let files = vec![
+            named(nexus_file(10, "1.0.0", "MAIN", 100, false), "BepInEx"),
+            named(nexus_file(20, "3.0.0", "MAIN", 300, true), "MelonLoader"),
+        ];
+        assert!(nexus_update_candidate(10, Some("1.0.0"), &files).is_none());
+    }
+
+    #[test]
+    fn nexus_same_title_update_ignores_newer_sibling() {
+        let files = vec![
+            named(nexus_file(10, "1.0.0", "MAIN", 100, false), "BepInEx"),
+            named(nexus_file(20, "1.2.0", "MAIN", 200, false), "BepInEx 1.2"),
+            named(nexus_file(30, "3.0.0", "MAIN", 400, true), "MelonLoader"),
+        ];
+        let c = nexus_update_candidate(10, Some("1.0.0"), &files).unwrap();
+        assert_eq!(c.file_id, 20);
+        assert_eq!(c.version.as_deref(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn keep_existing_modio_file_replaces_a_different_file_without_a_version() {
+        assert!(keep_existing_modio_file(true, Some("1.0"), None));
+        assert!(!keep_existing_modio_file(false, Some("1.0"), None));
+        assert!(keep_existing_modio_file(false, Some("2.0"), Some("1.0")));
+        assert!(!keep_existing_modio_file(false, Some("1.0"), Some("2.0")));
+    }
+
+    fn write_zip(path: &Path, entry: &str, bytes: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>(entry, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn nexus_update_replaces_one_row_and_rewrites_references() {
+        let (tmp, paths) = test_paths();
+        let game_id = "nexus_update";
+        let archive = tmp.path().join("mod.zip");
+        write_zip(&archive, "readme.txt", b"v1");
+        let staged = stage_mod(
+            &paths,
+            game_id,
+            "Mod",
+            "skyrim",
+            1,
+            10,
+            Some("1.0".into()),
+            Some("Optional patch".into()),
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(staged.id, "1_10");
+        assert_eq!(staged.file_name.as_deref(), Some("Optional patch"));
+
+        let mut order = load_loadorder(&paths, game_id).unwrap();
+        order.mods.push(StagedMod {
+            id: "other".into(),
+            name: "Other".into(),
+            domain: "skyrim".into(),
+            staging_path: paths
+                .mods_dir(game_id)
+                .join("other")
+                .to_string_lossy()
+                .into(),
+            enabled: true,
+            order: 2,
+            depends_on: vec!["1_10".into()],
+            ..Default::default()
+        });
+        order.mods.push(StagedMod {
+            id: "1_20".into(),
+            name: "Mod copy".into(),
+            source: ModSource::Nexus,
+            nexus_mod_id: 1,
+            nexus_file_id: 20,
+            domain: "skyrim".into(),
+            staging_path: paths
+                .mods_dir(game_id)
+                .join("Mod_1_20")
+                .to_string_lossy()
+                .into(),
+            enabled: true,
+            order: 3,
+            ..Default::default()
+        });
+        save_loadorder(&paths, game_id, &order).unwrap();
+        save_collections(
+            &paths,
+            game_id,
+            &InstalledCollections {
+                collections: vec![InstalledCollection {
+                    id: "col".into(),
+                    source: CollectionSource::Nexus,
+                    kind: CollectionKind::Collection,
+                    name: "Col".into(),
+                    slug: None,
+                    namespace: None,
+                    package_name: None,
+                    community: None,
+                    revision: None,
+                    version: None,
+                    profile_code: None,
+                    mod_ids: vec!["1_10".into(), "1_20".into()],
+                    installed_at: "t".into(),
+                }],
+            },
+        )
+        .unwrap();
+
+        write_zip(&archive, "readme.txt", b"v2");
+        let updated = stage_mod_replacing(
+            &paths,
+            game_id,
+            "1_10",
+            "Mod",
+            "skyrim",
+            1,
+            20,
+            Some("2.0".into()),
+            Some("Cool Mod-1-2-0.zip".into()),
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(updated.id, "1_20");
+        assert_eq!(updated.version.as_deref(), Some("2.0"));
+        assert_eq!(updated.file_name.as_deref(), Some("Cool Mod-1-2-0.zip"));
+        assert_eq!(updated.order, staged.order);
+
+        let order = load_loadorder(&paths, game_id).unwrap();
+        let nexus: Vec<_> = order.mods.iter().filter(|m| m.nexus_mod_id == 1).collect();
+        assert_eq!(nexus.len(), 1);
+        assert_eq!(nexus[0].nexus_file_id, 20);
+        let other = order.mods.iter().find(|m| m.id == "other").unwrap();
+        assert_eq!(other.depends_on, vec!["1_20".to_string()]);
+        let collections = load_collections(&paths, game_id).unwrap();
+        assert_eq!(collections.collections[0].mod_ids, vec!["1_20".to_string()]);
+    }
+
+    #[test]
+    fn load_collapses_duplicate_ids_and_keeps_distinct_files() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "dup_rows";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let raw = r#"{
+            "mods": [
+                {"id":"1_10","name":"Old","version":"1","domain":"skyrim","staging_path":"/no/old","enabled":true,"order":1,"source":"nexus","nexus_mod_id":1,"nexus_file_id":10},
+                {"id":"1_11","name":"Optional","version":"1","domain":"skyrim","staging_path":"/no/opt","enabled":true,"order":2,"source":"nexus","nexus_mod_id":1,"nexus_file_id":11},
+                {"id":"1_10","name":"New","version":"2","domain":"skyrim","staging_path":"/no/new","enabled":true,"order":3,"source":"nexus","nexus_mod_id":1,"nexus_file_id":10}
+            ]
+        }"#;
+        std::fs::write(paths.loadorder_file(game_id), raw).unwrap();
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods.len(), 2);
+        assert_eq!(order.mods[0].name, "Optional");
+        assert_eq!(order.mods[1].name, "New");
+        assert!(order.mods.iter().all(|m| m.picture_url.is_none()));
+    }
+
+    #[test]
+    fn modio_update_without_version_replaces_the_existing_row() {
+        let (tmp, paths) = test_paths();
+        let game_id = "modio_update";
+        let archive = tmp.path().join("mod.zip");
+        write_zip(&archive, "plugin.dll", b"old");
+        stage_modio_mod(
+            &paths,
+            game_id,
+            7,
+            42,
+            1,
+            "Widget",
+            Some("1.0".into()),
+            Some("widget-1.zip".into()),
+            Some("https://cdn.example/widget.png".into()),
+            &archive,
+        )
+        .unwrap();
+        write_zip(&archive, "plugin.dll", b"new");
+        let updated = stage_modio_mod(
+            &paths, game_id, 7, 42, 2, "Widget", None, None, None, &archive,
+        )
+        .unwrap();
+        assert_eq!(updated.modio_file_id, Some(2));
+        assert!(updated.version.is_none());
+        assert_eq!(
+            updated.picture_url.as_deref(),
+            Some("https://cdn.example/widget.png")
+        );
+        let order = load_loadorder(&paths, game_id).unwrap();
+        assert_eq!(order.mods.len(), 1);
+        assert_eq!(order.mods[0].id, "modio_7_42");
+        assert_eq!(order.mods[0].modio_file_id, Some(2));
+        assert_eq!(
+            order.mods[0].picture_url.as_deref(),
+            Some("https://cdn.example/widget.png")
+        );
+    }
+
+    #[test]
+    fn apply_staged_pictures_fills_only_missing_rows() {
+        let (_tmp, paths) = test_paths();
+        let game_id = "posters";
+        crate::config::ensure_game_dirs(&paths, game_id).unwrap();
+        let order = LoadOrder {
+            mods: vec![
+                StagedMod {
+                    id: "known".into(),
+                    name: "Known".into(),
+                    order: 1,
+                    picture_url: Some("https://cdn.example/kept.png".into()),
+                    ..Default::default()
+                },
+                StagedMod {
+                    id: "missing".into(),
+                    name: "Missing".into(),
+                    order: 2,
+                    ..Default::default()
+                },
+            ],
+        };
+        save_loadorder(&paths, game_id, &order).unwrap();
+        let mut pictures = HashMap::new();
+        pictures.insert("known".into(), "https://cdn.example/new.png".into());
+        pictures.insert("missing".into(), String::new());
+        let mods = apply_staged_pictures(&paths, game_id, &pictures).unwrap();
+        assert_eq!(
+            mods.iter()
+                .find(|m| m.id == "known")
+                .unwrap()
+                .picture_url
+                .as_deref(),
+            Some("https://cdn.example/kept.png")
+        );
+        assert_eq!(
+            mods.iter()
+                .find(|m| m.id == "missing")
+                .unwrap()
+                .picture_url
+                .as_deref(),
+            Some("")
+        );
     }
 
     #[test]

@@ -31,18 +31,21 @@ if [ ${#missing[@]} -gt 0 ]; then
   die "missing build tools (${missing[*]}); install them with: sudo pacman -S --needed base-devel"
 fi
 
-# `curl | bash` leaves stdin on the pipe, so pacman's prompts would read EOF.
-if [ ! -t 0 ] && [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
-  exec </dev/tty
-fi
+# Do not redirect stdin here. `curl | bash` reads this script from stdin, so
+# `exec </dev/tty` abandons the rest of the script. sudo prompts on the tty
+# itself, and makepkg gets --noconfirm when stdin is not a terminal.
 
 version="${EMM_VERSION:-}"
 if [ -z "$version" ]; then
   info "Resolving the latest release"
-  version="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' |
-    head -n1)"
-  [ -n "$version" ] || die "could not resolve the latest release tag; set EMM_VERSION=<x.y.z> and retry"
+  # Follow /releases/latest to /releases/tag/vX.Y.Z. The REST API is rate-limited
+  # for unauthenticated callers and would fail the installer with no release.
+  latest="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" ||
+    die "could not resolve the latest release; set EMM_VERSION=<x.y.z> and retry"
+  version="${latest##*/}"
+  version="${version#v}"
+  [ -n "$version" ] && [ "$version" != "latest" ] ||
+    die "could not resolve the latest release tag; set EMM_VERSION=<x.y.z> and retry"
 fi
 tag="v${version#v}"
 version="${version#v}"

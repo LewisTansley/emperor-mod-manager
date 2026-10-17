@@ -276,12 +276,19 @@ export type ModSearchHit = {
   tags?: string[];
 };
 
+export type ModGalleryImage = {
+  url: string;
+  caption?: string | null;
+};
+
 export type ModDetail = {
   mod_id: number;
   name: string;
   summary: string | null;
   description: string | null;
   picture_url: string | null;
+  /** Nexus author gallery, in carousel order. */
+  image_urls?: ModGalleryImage[];
   author: string | null;
   version: string | null;
   downloads: number | null;
@@ -513,6 +520,10 @@ export type StagedMod = {
   independent?: boolean;
   depends_on?: string[];
   option_selection?: ModOptionSelection | null;
+  /** File chooser title or archive name, when it differs from the mod title. */
+  file_name?: string | null;
+  /** Catalog poster. Null means not looked up yet; empty means there is no image. */
+  picture_url?: string | null;
 };
 
 export type ModSubOption = {
@@ -557,6 +568,7 @@ export type StagedModUpdate = {
   nexus_file_id?: number | null;
   ts_version?: string | null;
   modio_file_id?: number | null;
+  file_name?: string | null;
 };
 
 export type ModioModDetail = {
@@ -585,10 +597,52 @@ export type ModioFileInfo = {
   date_added: number;
 };
 
+export type NexusRequirementDownload = {
+  domain: string;
+  mod_id: number;
+  file_id: number;
+  name: string;
+  version: string | null;
+  file_name?: string | null;
+  notes: string | null;
+  url: string;
+  required_by: string[];
+  required_by_names: string[];
+};
+
+export type ExternalRequirementLink = {
+  name: string;
+  url: string;
+  notes: string | null;
+  required_by: string[];
+  required_by_names: string[];
+};
+
+export type DlcRequirementNote = {
+  name: string;
+  notes: string | null;
+  required_by: string[];
+  required_by_names: string[];
+};
+
+export type MissingRequirements = {
+  nexus: NexusRequirementDownload[];
+  external: ExternalRequirementLink[];
+  dlc: DlcRequirementNote[];
+  error?: string | null;
+};
+
+export type PluginSkip = {
+  plugin: string;
+  missing_master: string;
+};
+
 export type DeployResult = {
   file_count: number;
   enabled_mods: number;
   warnings: string[];
+  plugin_skips?: PluginSkip[];
+  missing_requirements?: MissingRequirements;
 };
 
 export type RecoveryReport = {
@@ -604,6 +658,32 @@ export type OrphanScan = {
   deploy_without_loadorder: string[];
 };
 
+export type ClearDownloadCacheResult = {
+  files_removed: number;
+  bytes_freed: number;
+};
+
+export type DownloadPageTarget =
+  | {
+      source: "nexus";
+      game_id: string;
+      domain: string;
+      mod_id: number;
+    }
+  | {
+      source: "thunderstore";
+      game_id: string;
+      community: string;
+      namespace: string;
+      package_name: string;
+    }
+  | {
+      source: "modio";
+      game_id: string;
+      modio_game_id: number;
+      modio_mod_id: number;
+    };
+
 export type DownloadItem = {
   id: string;
   label: string;
@@ -614,6 +694,8 @@ export type DownloadItem = {
   speed_bps: number;
   batch_id: string | null;
   can_restart?: boolean;
+  file_name?: string | null;
+  page?: DownloadPageTarget | null;
 };
 
 export type Settings = {
@@ -622,6 +704,7 @@ export type Settings = {
   last_active_game_id: string | null;
   theme?: ThemePreference;
   install_click_behavior?: InstallClickBehavior;
+  recent_downloads_limit?: number;
   has_api_key: boolean;
   has_modio_api_key?: boolean;
   user: NexusUser | null;

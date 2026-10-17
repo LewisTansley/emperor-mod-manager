@@ -15,7 +15,11 @@ pub fn detect_executables(install_path: &str, max: usize) -> Vec<String> {
         return Vec::new();
     }
     let mut found = Vec::new();
-    for entry in WalkDir::new(root).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(root)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -28,8 +32,7 @@ pub fn detect_executables(install_path: &str, max: usize) -> Vec<String> {
             || lower.contains("setup")
             || lower.contains("redist")
             || lower.contains("crash")
-            || lower.contains("launcher")
-            && !lower.contains("shipping")
+            || lower.contains("launcher") && !lower.contains("shipping")
         {
             continue;
         }

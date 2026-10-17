@@ -8,7 +8,9 @@ use super::{
     autohdr_vk::AutoHdrVkConfig,
     executables::{detect_executables, profile_name_for_game, steam_app_id_from_install},
     lsfg_vk::{LsfgVkConfig, LsfgVkProfile},
-    steam_launch::{LaunchEnvBlock, LsfgLaunch, merge_launch_options, read_launch_options, write_launch_options},
+    steam_launch::{
+        merge_launch_options, read_launch_options, write_launch_options, LaunchEnvBlock, LsfgLaunch,
+    },
 };
 
 pub fn sync_game_tools(paths: &Paths, game: &ManagedGame) -> Result<()> {
@@ -93,7 +95,9 @@ fn sync_steam_launch(
         return Ok(());
     };
 
-    let existing = read_launch_options(&app_id).unwrap_or(None).unwrap_or_default();
+    let existing = read_launch_options(&app_id)
+        .unwrap_or(None)
+        .unwrap_or_default();
     let profile_name = profile_name_for_game(&game.id);
 
     let block = LaunchEnvBlock {
@@ -116,11 +120,7 @@ fn sync_steam_launch(
     Ok(())
 }
 
-pub fn set_game_tool_state(
-    overrides: &mut GameToolOverrides,
-    tool: &str,
-    state: ToolGameState,
-) {
+pub fn set_game_tool_state(overrides: &mut GameToolOverrides, tool: &str, state: ToolGameState) {
     match tool {
         "lsfg_vk" => overrides.lsfg_vk = state,
         "autohdr_vk" => overrides.autohdr_vk = state,

@@ -104,10 +104,7 @@ impl LsfgVkConfig {
     }
 
     pub fn default_profile(&self) -> LsfgVkProfile {
-        self.profiles
-            .first()
-            .cloned()
-            .unwrap_or_default()
+        self.profiles.first().cloned().unwrap_or_default()
     }
 
     pub fn to_dto(&self) -> LsfgVkConfigDto {

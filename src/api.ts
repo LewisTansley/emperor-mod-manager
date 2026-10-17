@@ -17,6 +17,7 @@ import type {
   ManagedGame,
   ModDetail,
   ModFileInfo,
+  MissingRequirements,
   ModioFileInfo,
   ModioModDetail,
   ModOptionSelection,
@@ -25,6 +26,7 @@ import type {
   NexusUser,
   OrphanScan,
   RecoveryReport,
+  ClearDownloadCacheResult,
   Settings,
   StagedMod,
   StagedModUpdate,
@@ -67,7 +69,11 @@ export const api = {
   setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
   setInstallClickBehavior: (behavior: InstallClickBehavior) =>
     invoke<void>("set_install_click_behavior", { behavior }),
+  setRecentDownloadsLimit: (limit: number) =>
+    invoke<void>("set_recent_downloads_limit", { limit }),
   scanModOrphans: () => invoke<OrphanScan>("scan_mod_orphans"),
+  clearDownloadCache: () =>
+    invoke<ClearDownloadCacheResult>("clear_download_cache"),
   recoverLegacyModData: () =>
     invoke<RecoveryReport>("recover_legacy_mod_data"),
   scanGames: () => invoke<DetectedGame[]>("scan_games"),
@@ -169,6 +175,33 @@ export const api = {
   }) => invoke<StagedMod[]>("download_modio_mod", args),
   getMod: (domain: string, modId: number) =>
     invoke<ModDetail>("get_mod", { domain, modId }),
+  missingNexusRequirements: (gameId: string, stagedId?: string | null) =>
+    invoke<MissingRequirements>("missing_nexus_requirements", {
+      gameId,
+      stagedId: stagedId ?? null,
+    }),
+  nexusModRequirements: (args: {
+    gameId: string;
+    domain: string;
+    modId: number;
+    name: string;
+  }) =>
+    invoke<MissingRequirements>("nexus_mod_requirements", {
+      gameId: args.gameId,
+      domain: args.domain,
+      modId: args.modId,
+      name: args.name,
+    }),
+  linkStagedRequirements: (
+    gameId: string,
+    requirementId: string,
+    requiredBy: string[],
+  ) =>
+    invoke<void>("link_staged_requirements", {
+      gameId,
+      requirementId,
+      requiredBy,
+    }),
   getGame: (domain: string) => invoke<GameInfo>("get_game", { domain }),
   modFiles: (domain: string, modId: number) =>
     invoke<ModFileInfo[]>("mod_files", { domain, modId }),
@@ -218,7 +251,19 @@ export const api = {
     fileId: number;
     name: string;
     version?: string | null;
-  }) => invoke<StagedMod>("download_mod", args),
+    replaceStagedId?: string | null;
+    fileName?: string | null;
+  }) =>
+    invoke<StagedMod>("download_mod", {
+      gameId: args.gameId,
+      domain: args.domain,
+      modId: args.modId,
+      fileId: args.fileId,
+      name: args.name,
+      version: args.version ?? null,
+      replaceStagedId: args.replaceStagedId ?? null,
+      fileName: args.fileName ?? null,
+    }),
   openDownloadAssist: (args: {
     gameId: string;
     domain: string;
@@ -227,6 +272,8 @@ export const api = {
     name: string;
     batchId?: string | null;
     replaceStagedId?: string | null;
+    version?: string | null;
+    fileName?: string | null;
   }) =>
     invoke<void>("open_download_assist", {
       gameId: args.gameId,
@@ -236,6 +283,8 @@ export const api = {
       name: args.name,
       batchId: args.batchId ?? null,
       replaceStagedId: args.replaceStagedId ?? null,
+      version: args.version ?? null,
+      fileName: args.fileName ?? null,
     }),
   setAssistBounds: (bounds: {
     x: number;
@@ -348,8 +397,10 @@ export const api = {
     fileId?: number | null;
   }) => invoke<StagedMod>("import_mod_archive", args),
   importAssistDownload: (path: string) =>
-    invoke<StagedMod>("import_assist_download", { path }),
+    invoke<StagedMod | null>("import_assist_download", { path }),
   listMods: (gameId: string) => invoke<StagedMod[]>("list_mods", { gameId }),
+  fillStagedPictures: (gameId: string) =>
+    invoke<StagedMod[]>("fill_staged_pictures", { gameId }),
   checkStagedModUpdates: (gameId: string) =>
     invoke<StagedModUpdate[]>("check_staged_mod_updates", { gameId }),
   updateStagedMod: (gameId: string, stagedId: string) =>

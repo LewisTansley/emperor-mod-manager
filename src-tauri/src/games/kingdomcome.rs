@@ -51,8 +51,7 @@ fn looks_like_kcd_mod(content_root: &Path) -> bool {
 
 pub fn write_mod_order(install_path: &Path, enabled_mod_folders: &[String]) -> Result<()> {
     let mods_dir = install_path.join("Mods");
-    std::fs::create_dir_all(&mods_dir)
-        .with_context(|| format!("create {}", mods_dir.display()))?;
+    std::fs::create_dir_all(&mods_dir).with_context(|| format!("create {}", mods_dir.display()))?;
     let path = mods_dir.join("mod_order.txt");
     let mut body = String::new();
     for name in enabled_mod_folders {
@@ -182,9 +181,7 @@ mod tests {
             "kingdomcomedeliverance2"
         );
         assert_eq!(
-            match_plugin("Kingdom Come: Deliverance", None)
-                .unwrap()
-                .id,
+            match_plugin("Kingdom Come: Deliverance", None).unwrap().id,
             "kingdomcomedeliverance"
         );
     }

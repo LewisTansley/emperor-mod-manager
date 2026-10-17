@@ -34,9 +34,7 @@ fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
 fn is_newer(latest: &str, current: &str) -> bool {
     match (parse_semver(latest), parse_semver(current)) {
         (Some(l), Some(c)) => l > c,
-        _ => {
-            latest.trim().trim_start_matches('v') != current.trim().trim_start_matches('v')
-        }
+        _ => latest.trim().trim_start_matches('v') != current.trim().trim_start_matches('v'),
     }
 }
 
@@ -109,16 +107,10 @@ pub async fn install_app_update(
     }
 
     let os = std::env::consts::OS;
-    let asset = github_release::pick_app_asset(&release, os).ok_or_else(|| {
-        match os {
-            "linux" => {
-                "No .AppImage asset found on the latest GitHub release".to_string()
-            }
-            "windows" => {
-                "No NSIS setup (.exe) asset found on the latest GitHub release".to_string()
-            }
-            other => format!("In-app updates are not supported on {other}"),
-        }
+    let asset = github_release::pick_app_asset(&release, os).ok_or_else(|| match os {
+        "linux" => "No .AppImage asset found on the latest GitHub release".to_string(),
+        "windows" => "No NSIS setup (.exe) asset found on the latest GitHub release".to_string(),
+        other => format!("In-app updates are not supported on {other}"),
     })?;
 
     let updates_dir = state.paths.cache_dir.join("app-updates");
@@ -169,14 +161,8 @@ async fn apply_linux(app: &AppHandle, downloaded: &Path) -> Result<AppInstallRes
         let file_name = current
             .file_name()
             .ok_or_else(|| "Invalid APPIMAGE path".to_string())?;
-        let staging = parent.join(format!(
-            "{}.new",
-            file_name.to_string_lossy()
-        ));
-        let backup = parent.join(format!(
-            "{}.old",
-            file_name.to_string_lossy()
-        ));
+        let staging = parent.join(format!("{}.new", file_name.to_string_lossy()));
+        let backup = parent.join(format!("{}.old", file_name.to_string_lossy()));
 
         std::fs::copy(downloaded, &staging).map_err(|e| e.to_string())?;
         let meta = std::fs::metadata(&staging).map_err(|e| e.to_string())?;

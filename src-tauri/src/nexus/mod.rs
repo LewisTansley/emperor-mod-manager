@@ -18,6 +18,9 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::{APP_NAME, APP_VERSION};
 
+pub mod requirements;
+pub use requirements::{collect_missing, MissingRequirements, RequirementRoot};
+
 const REST_BASE: &str = "https://api.nexusmods.com/v1";
 const GQL_URL: &str = "https://api.nexusmods.com/v2/graphql";
 
@@ -36,6 +39,10 @@ pub struct TransferControl {
 #[derive(Clone)]
 pub struct NexusClient {
     http: reqwest::Client,
+    /// Public mod pages sit behind a Cloudflare check that rejects the API
+    /// client's rustls fingerprint. This client impersonates Chrome and does
+    /// not carry the API key.
+    page_http: wreq::Client,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +99,14 @@ pub struct NexusGameEntry {
     pub domain_name: String,
 }
 
+/// One slide from the author gallery on the Nexus mod page.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModGalleryImage {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModDetail {
     pub mod_id: u64,
@@ -99,6 +114,10 @@ pub struct ModDetail {
     pub summary: Option<String>,
     pub description: Option<String>,
     pub picture_url: Option<String>,
+    /// Author gallery from the mod page carousel, in page order. Empty when
+    /// that page could not be read.
+    #[serde(default)]
+    pub image_urls: Vec<ModGalleryImage>,
     pub author: Option<String>,
     pub version: Option<String>,
     pub downloads: Option<u64>,
@@ -265,7 +284,13 @@ impl NexusClient {
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { http })
+        let page_http = wreq::Client::builder()
+            .emulation(wreq_util::Emulation::Chrome136)
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
+            .build()
+            .context("chrome page client")?;
+        Ok(Self { http, page_http })
     }
 
     pub async fn validate(&self) -> Result<NexusUser> {
@@ -606,6 +631,7 @@ impl NexusClient {
                 .get("picture_url")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            image_urls: Vec::new(),
             author: n.get("author").and_then(|v| v.as_str()).map(str::to_string),
             version: n
                 .get("version")
@@ -635,6 +661,26 @@ impl NexusClient {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         })
+    }
+
+    /// Author image carousel from the public mod page. The REST mod payload
+    /// only includes the primary `picture_url`.
+    pub async fn mod_page_gallery(
+        &self,
+        domain: &str,
+        mod_id: u64,
+    ) -> Result<Vec<ModGalleryImage>> {
+        let domain = domain.trim();
+        if domain.is_empty() || !domain.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            bail!("invalid nexus domain");
+        }
+        let url = format!("https://www.nexusmods.com/{domain}/mods/{mod_id}");
+        let resp = self.page_http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            bail!("mod page gallery failed ({})", resp.status());
+        }
+        let body = resp.text().await?;
+        Ok(parse_mod_gallery(&body))
     }
 
     pub async fn list_mod_files(&self, domain: &str, mod_id: u64) -> Result<Vec<ModFileInfo>> {
@@ -1451,7 +1497,7 @@ impl NexusClient {
             .collect())
     }
 
-    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+    pub(super) async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let resp = self
             .http
             .post(GQL_URL)
@@ -1471,6 +1517,253 @@ impl NexusClient {
             .cloned()
             .ok_or_else(|| anyhow!("GraphQL response missing data"))
     }
+}
+
+/// Images from the author carousel (`ul.thumbgallery`) on a Nexus mod page.
+fn parse_mod_gallery(html: &str) -> Vec<ModGalleryImage> {
+    let Some(open) = thumbgallery_ul(html) else {
+        return Vec::new();
+    };
+    let Some(inner) = element_inner(html, open) else {
+        return Vec::new();
+    };
+    let mut images: Vec<ModGalleryImage> = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let is_li = bytes[i] == b'<'
+            && bytes[i + 1].eq_ignore_ascii_case(&b'l')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'i')
+            && matches!(bytes[i + 3], b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/');
+        if !is_li {
+            i += 1;
+            continue;
+        }
+        let Some(end) = opening_tag_end(inner, i) else {
+            break;
+        };
+        let tag = &inner[i..=end];
+        if let Some(url) = attr_value(tag, "data-src").and_then(normalize_image_url) {
+            if !images.iter().any(|image| image.url == url) {
+                images.push(ModGalleryImage {
+                    url,
+                    caption: attr_value(tag, "data-sub-html").and_then(caption_text),
+                });
+            }
+        }
+        i = end + 1;
+    }
+    images
+}
+
+fn thumbgallery_ul(html: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(at) = find_ignore_ascii_case(&html[search..], "thumbgallery") {
+        let abs = search + at;
+        if let Some(open) = html[..abs].rfind('<') {
+            let tag = html.as_bytes();
+            if tag
+                .get(open + 1)
+                .is_some_and(|b| b.eq_ignore_ascii_case(&b'u'))
+                && tag
+                    .get(open + 2)
+                    .is_some_and(|b| b.eq_ignore_ascii_case(&b'l'))
+                && tag
+                    .get(open + 3)
+                    .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+            {
+                return Some(open);
+            }
+        }
+        search = abs + "thumbgallery".len();
+    }
+    None
+}
+
+fn element_inner(html: &str, open_at: usize) -> Option<&str> {
+    let gt = opening_tag_end(html, open_at)?;
+    let mut depth = 1usize;
+    let mut i = gt + 1;
+    let bytes = html.as_bytes();
+    while i + 4 < bytes.len() {
+        if bytes[i] == b'<'
+            && bytes[i + 1].eq_ignore_ascii_case(&b'u')
+            && bytes[i + 2].eq_ignore_ascii_case(&b'l')
+            && (bytes[i + 3].is_ascii_whitespace() || bytes[i + 3] == b'>')
+        {
+            depth += 1;
+            i += 3;
+            continue;
+        }
+        if bytes[i] == b'<'
+            && bytes[i + 1] == b'/'
+            && bytes[i + 2].eq_ignore_ascii_case(&b'u')
+            && bytes[i + 3].eq_ignore_ascii_case(&b'l')
+        {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&html[gt + 1..i]);
+            }
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn opening_tag_end(html: &str, start: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = start;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = Some(c);
+        } else if c == b'>' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=");
+    let mut search = 0;
+    while let Some(rel) = find_ignore_ascii_case(&tag[search..], &needle) {
+        let at = search + rel;
+        if at > 0 {
+            let prev = tag.as_bytes()[at - 1];
+            if !prev.is_ascii_whitespace() && prev != b'<' {
+                search = at + needle.len();
+                continue;
+            }
+        }
+        let rest = &tag[at + needle.len()..];
+        let bytes = rest.as_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        if bytes[0] == b'"' || bytes[0] == b'\'' {
+            let q = bytes[0] as char;
+            let val = &rest[1..];
+            let end = val.find(q)?;
+            return Some(&val[..end]);
+        }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(rest.len());
+        return Some(&rest[..end]);
+    }
+    None
+}
+
+fn normalize_image_url(raw: &str) -> Option<String> {
+    let decoded = decode_entities(raw.trim());
+    let url = if let Some(rest) = decoded.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        decoded
+    };
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+fn caption_text(raw: &str) -> Option<String> {
+    let decoded = decode_entities(raw);
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in decoded.chars() {
+        if c == '<' {
+            in_tag = true;
+            continue;
+        }
+        if c == '>' {
+            in_tag = false;
+            continue;
+        }
+        if !in_tag {
+            out.push(c);
+        }
+    }
+    let trimmed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn decode_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let Some(semi) = after.find(';') else {
+            out.push('&');
+            rest = after;
+            continue;
+        };
+        if semi > 16 {
+            out.push('&');
+            rest = after;
+            continue;
+        }
+        if let Some(ch) = decode_one(&after[..semi]) {
+            out.push(ch);
+            rest = &after[semi + 1..];
+        } else {
+            out.push('&');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_one(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "nbsp" => Some(' '),
+        _ => {
+            let num = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|num| num.parse().ok()))?;
+            char::from_u32(num)
+        }
+    }
+}
+
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let last = haystack.len() - needle.len();
+    let mut i = 0;
+    while i <= last {
+        if haystack[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn normalize_sort(sort: &str) -> String {
@@ -1852,6 +2145,49 @@ pub fn load_api_key_file(path: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_current_and_legacy_gallery_urls() {
+        let html = r#"
+            <div class="clearfix modimages">
+              <img data-src="https://example.com/not-in-gallery.jpg" alt="">
+              <ul class="thumbgallery gallery clearfix">
+                <li class="thumb"
+                    data-src="https://staticdelivery.nexusmods.com/mods/1704/images/12604/12604-1774526205-321078529.png"
+                    data-sub-html="New &amp; shiny">
+                </li>
+                <li class="thumb"
+                    data-sub-html="Inventory Comparison"
+                    data-src="https://staticdelivery.nexusmods.com/mods/1704/images/12604-1-1506820354.jpg">
+                </li>
+                <li data-src="//staticdelivery.nexusmods.com/mods/1704/images/12604/12604-1774526205-321078529.png"></li>
+              </ul>
+            </div>
+        "#;
+        let images = parse_mod_gallery(html);
+        assert_eq!(
+            images,
+            vec![
+                ModGalleryImage {
+                    url: "https://staticdelivery.nexusmods.com/mods/1704/images/12604/12604-1774526205-321078529.png".into(),
+                    caption: Some("New & shiny".into()),
+                },
+                ModGalleryImage {
+                    url: "https://staticdelivery.nexusmods.com/mods/1704/images/12604-1-1506820354.jpg".into(),
+                    caption: Some("Inventory Comparison".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_or_unrelated_page_has_no_gallery() {
+        assert!(parse_mod_gallery("<p>Just a moment...</p>").is_empty());
+        assert!(parse_mod_gallery(
+            r#"<ul class="other"><li data-src="https://example.com/a.jpg"></li></ul>"#
+        )
+        .is_empty());
+    }
 
     #[test]
     fn a_short_body_is_an_error_not_a_finished_download() {

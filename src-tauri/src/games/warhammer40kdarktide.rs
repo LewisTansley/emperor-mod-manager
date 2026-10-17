@@ -248,9 +248,7 @@ fn bundle_already_patched(install_path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(&db) else {
         return false;
     };
-    bytes
-        .windows(PATCH_MARKER.len())
-        .any(|w| w == PATCH_MARKER)
+    bytes.windows(PATCH_MARKER.len()).any(|w| w == PATCH_MARKER)
 }
 
 /// Run `dtkit-patch --patch bundle`. Returns Ok(Some(warning)) for soft issues.
@@ -435,8 +433,11 @@ mod tests {
         let install = Path::new("/game");
         let p = plugin();
         assert_eq!(
-            p.resolve_deploy_root(install, Path::new("scoreboard/scripts/mods/scoreboard/scoreboard.lua"))
-                .unwrap(),
+            p.resolve_deploy_root(
+                install,
+                Path::new("scoreboard/scripts/mods/scoreboard/scoreboard.lua")
+            )
+            .unwrap(),
             PathBuf::from("/game/mods/scoreboard/scripts/mods/scoreboard/scoreboard.lua")
         );
     }
@@ -509,7 +510,9 @@ mod tests {
         let cmd = resolve_patcher_command(install.path());
         #[cfg(windows)]
         {
-            assert!(matches!(cmd, Some(PatcherCommand::Native(p)) if p.ends_with("dtkit-patch.exe")));
+            assert!(
+                matches!(cmd, Some(PatcherCommand::Native(p)) if p.ends_with("dtkit-patch.exe"))
+            );
         }
         #[cfg(not(windows))]
         {

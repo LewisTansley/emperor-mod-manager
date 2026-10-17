@@ -1,14 +1,13 @@
 //! Vulkan tool integration (lsfg-vk, AutoHDR-VK).
 
 mod autohdr_vk;
-mod executables;
+pub(crate) mod executables;
 mod lsfg_vk;
 mod manifest;
 
+pub(crate) mod install;
 #[cfg(target_os = "linux")]
-mod install;
-#[cfg(target_os = "linux")]
-mod steam_launch;
+pub(crate) mod steam_launch;
 #[cfg(target_os = "linux")]
 mod sync;
 
@@ -19,10 +18,7 @@ pub use manifest::{ToolInstallRecord, ToolsManifest};
 use serde::Serialize;
 use tauri::State;
 
-use crate::{
-    commands::AppState,
-    config::GameToolOverrides,
-};
+use crate::{commands::AppState, config::GameToolOverrides};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolStatus {
@@ -111,19 +107,18 @@ fn stub_tool_status(config_path: String) -> ToolStatus {
 pub fn get_tools_status(state: State<'_, AppState>) -> Result<ToolsStatusResponse, String> {
     let (lsfg_vk_repo, autohdr_vk_repo) = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
-        (cfg.tools.lsfg_vk_repo.clone(), cfg.tools.autohdr_vk_repo.clone())
+        (
+            cfg.tools.lsfg_vk_repo.clone(),
+            cfg.tools.autohdr_vk_repo.clone(),
+        )
     };
     #[cfg(target_os = "linux")]
     {
-        let manifest = ToolsManifest::load(&state.paths.tools_manifest_file())
-            .map_err(|e| e.to_string())?;
+        let manifest =
+            ToolsManifest::load(&state.paths.tools_manifest_file()).map_err(|e| e.to_string())?;
         Ok(ToolsStatusResponse {
             platform_linux: true,
-            lsfg_vk: tool_status_local(
-                &manifest,
-                "lsfg_vk",
-                state.paths.lsfg_vk_config_file(),
-            ),
+            lsfg_vk: tool_status_local(&manifest, "lsfg_vk", state.paths.lsfg_vk_config_file()),
             autohdr_vk: tool_status_local(
                 &manifest,
                 "autohdr_vk",
@@ -157,10 +152,13 @@ pub async fn check_tool_updates(state: State<'_, AppState>) -> Result<ToolUpdate
     {
         let (lsfg_vk_repo, autohdr_vk_repo) = {
             let cfg = state.config.lock().map_err(|e| e.to_string())?;
-            (cfg.tools.lsfg_vk_repo.clone(), cfg.tools.autohdr_vk_repo.clone())
+            (
+                cfg.tools.lsfg_vk_repo.clone(),
+                cfg.tools.autohdr_vk_repo.clone(),
+            )
         };
-        let manifest = ToolsManifest::load(&state.paths.tools_manifest_file())
-            .map_err(|e| e.to_string())?;
+        let manifest =
+            ToolsManifest::load(&state.paths.tools_manifest_file()).map_err(|e| e.to_string())?;
         let lsfg_latest = crate::github_release::fetch_latest_release(&lsfg_vk_repo)
             .await
             .map_err(|e| e.to_string())?
@@ -227,9 +225,8 @@ pub async fn install_tool(
                     install_dir.display()
                 )
             })?;
-        let asset = crate::github_release::pick_linux_asset(&release, tool_key).ok_or_else(|| {
-            format!("No Linux release asset found for {}", release.tag_name)
-        })?;
+        let asset = crate::github_release::pick_linux_asset(&release, tool_key)
+            .ok_or_else(|| format!("No Linux release asset found for {}", release.tag_name))?;
         let bytes = crate::github_release::download_bytes(&asset.browser_download_url)
             .await
             .map_err(|e| e.to_string())?;
@@ -267,7 +264,10 @@ pub fn get_lsfg_vk_config(state: State<'_, AppState>) -> Result<LsfgVkConfigDto,
 }
 
 #[tauri::command]
-pub fn set_lsfg_vk_config(state: State<'_, AppState>, config: LsfgVkConfigDto) -> Result<(), String> {
+pub fn set_lsfg_vk_config(
+    state: State<'_, AppState>,
+    config: LsfgVkConfigDto,
+) -> Result<(), String> {
     std::fs::create_dir_all(state.paths.lsfg_vk_install_dir()).map_err(|e| e.to_string())?;
     LsfgVkConfig::from_dto(config)
         .save(&state.paths.lsfg_vk_config_file())
@@ -318,7 +318,10 @@ pub fn detect_game_executables(
 }
 
 #[tauri::command]
-pub fn get_game_tools(state: State<'_, AppState>, game_id: String) -> Result<GameToolsResponse, String> {
+pub fn get_game_tools(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<GameToolsResponse, String> {
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
     let game = cfg
         .managed_games
@@ -392,7 +395,10 @@ pub fn set_game_tools(
 }
 
 #[tauri::command]
-pub fn sync_game_tools(state: State<'_, AppState>, game_id: String) -> Result<GameToolsResponse, String> {
+pub fn sync_game_tools(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<GameToolsResponse, String> {
     #[cfg(target_os = "linux")]
     {
         let game = {

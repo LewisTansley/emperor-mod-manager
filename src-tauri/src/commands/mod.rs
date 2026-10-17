@@ -12,6 +12,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use walkdir::WalkDir;
 
 use crate::{
     assist::{AssistBounds, AssistContext},
@@ -28,7 +29,8 @@ use crate::{
     },
     nexus::{
         self, stream_url_to_file, CollectionDetail, CollectionModFile, GameInfo, ModDetail,
-        ModFileInfo, NexusClient, NexusUser, TransferControl, CANCELLED_MSG, PAUSED_MSG,
+        ModFileInfo, ModGalleryImage, NexusClient, NexusUser, TransferControl, CANCELLED_MSG,
+        PAUSED_MSG,
     },
     share::{
         self, DetectImportResult, ExportShareResult, ImportCodeKind, SavedCollectionDetail,
@@ -50,6 +52,7 @@ pub enum DownloadResumeSource {
         nxm_key: Option<String>,
         nxm_expires: Option<u64>,
         replace_staged_id: Option<String>,
+        file_name: Option<String>,
     },
     Cdn {
         url: String,
@@ -59,7 +62,9 @@ pub enum DownloadResumeSource {
         mod_id: u64,
         file_id: u64,
         label: String,
+        version: Option<String>,
         replace_staged_id: Option<String>,
+        file_name: Option<String>,
     },
     Thunderstore {
         game_id: String,
@@ -126,12 +131,36 @@ pub struct AppState {
     /// downloads at once, and saturating the connection is what makes CDN
     /// streams stall and end short in the first place.
     pub download_slots: tokio::sync::Semaphore,
+    /// Same per-game lock the staging functions take.
+    pub order_locks: mods::GameOrderLocks,
 }
 
 /// Enough to keep a fast link busy without starving any single transfer.
 const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
-#[derive(Debug, Clone, Serialize)]
+/// Catalog identity for opening a download's mod page. Absent for loader installs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum DownloadPageTarget {
+    Nexus {
+        game_id: String,
+        domain: String,
+        mod_id: u64,
+    },
+    Thunderstore {
+        game_id: String,
+        community: String,
+        namespace: String,
+        package_name: String,
+    },
+    Modio {
+        game_id: String,
+        modio_game_id: u32,
+        modio_mod_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadItem {
     pub id: String,
     pub label: String,
@@ -141,11 +170,24 @@ pub struct DownloadItem {
     pub bytes_total: Option<u64>,
     pub speed_bps: u64,
     pub batch_id: Option<String>,
+    #[serde(default)]
     pub can_restart: bool,
+    /// Chosen file name, when it is distinct from the mod title.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// Where to open this download's mod page. Missing for loader installs.
+    #[serde(default)]
+    pub page: Option<DownloadPageTarget>,
 }
 
 impl DownloadItem {
-    fn new(id: String, label: String, status: &str, batch_id: Option<String>) -> Self {
+    fn new(
+        id: String,
+        label: String,
+        status: &str,
+        batch_id: Option<String>,
+        page: Option<DownloadPageTarget>,
+    ) -> Self {
         Self {
             id,
             label,
@@ -156,8 +198,49 @@ impl DownloadItem {
             speed_bps: 0,
             batch_id,
             can_restart: false,
+            file_name: None,
+            page,
         }
     }
+}
+
+async fn modio_file_label(
+    client: &ModioClient,
+    game_id: u32,
+    mod_id: u64,
+    file_id: u64,
+    primary_file_id: Option<u64>,
+    mod_name: &str,
+) -> Option<String> {
+    let files = client
+        .list_files(game_id, mod_id, primary_file_id)
+        .await
+        .ok()?;
+    let archive = files
+        .iter()
+        .find(|f| f.file_id == file_id)
+        .map(|f| f.filename.as_str());
+    mods::pick_staged_file_name(mod_name, None, archive)
+}
+
+fn assign_download_file_name(state: &AppState, id: &str, file_name: Option<&str>) -> bool {
+    let Some(name) = file_name.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if let Ok(mut q) = state.downloads.lock() {
+        if let Some(item) = q.iter_mut().find(|d| d.id == id) {
+            if item
+                .file_name
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                item.file_name = Some(name.to_string());
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl AppState {
@@ -177,13 +260,21 @@ impl AppState {
         }
         let api_key = load_key_with_fallback(&paths)?;
         let modio_api_key = load_modio_key_with_fallback(&paths)?;
+        let mut recent = load_recent_downloads(&paths);
+        let recent_limit =
+            config::clamp_recent_downloads_limit(config.recent_downloads_limit) as usize;
+        let recent_before = recent.len();
+        trim_finished_downloads(&mut recent, recent_limit);
+        if recent.len() != recent_before {
+            save_recent_downloads(&paths, &recent);
+        }
         Ok(Self {
             paths,
             config: Mutex::new(config),
             api_key: Mutex::new(api_key),
             modio_api_key: Mutex::new(modio_api_key),
             user: Mutex::new(None),
-            downloads: Mutex::new(Vec::new()),
+            downloads: Mutex::new(recent),
             download_jobs: Mutex::new(HashMap::new()),
             download_restart_meta: Mutex::new(HashMap::new()),
             assist: Mutex::new(None),
@@ -199,6 +290,7 @@ impl AppState {
             nexus_games_cache: Mutex::new(None),
             ts_communities_cache: Mutex::new(None),
             download_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS),
+            order_locks: mods::shared_order_locks(),
         })
     }
 
@@ -285,13 +377,131 @@ fn is_finished_download_status(status: &str) -> bool {
     matches!(status, "done" | "staged" | "failed" | "cancelled")
 }
 
+fn nexus_page(game_id: &str, domain: &str, mod_id: u64) -> Option<DownloadPageTarget> {
+    if game_id.is_empty() || domain.is_empty() || mod_id == 0 {
+        return None;
+    }
+    Some(DownloadPageTarget::Nexus {
+        game_id: game_id.to_string(),
+        domain: domain.to_string(),
+        mod_id,
+    })
+}
+
+fn thunderstore_page(
+    game_id: &str,
+    community: &str,
+    namespace: &str,
+    package_name: &str,
+) -> Option<DownloadPageTarget> {
+    if game_id.is_empty() || community.is_empty() || namespace.is_empty() || package_name.is_empty()
+    {
+        return None;
+    }
+    Some(DownloadPageTarget::Thunderstore {
+        game_id: game_id.to_string(),
+        community: community.to_string(),
+        namespace: namespace.to_string(),
+        package_name: package_name.to_string(),
+    })
+}
+
+fn modio_page(game_id: &str, modio_game_id: u32, modio_mod_id: u64) -> Option<DownloadPageTarget> {
+    if game_id.is_empty() || modio_game_id == 0 || modio_mod_id == 0 {
+        return None;
+    }
+    Some(DownloadPageTarget::Modio {
+        game_id: game_id.to_string(),
+        modio_game_id,
+        modio_mod_id,
+    })
+}
+
+/// Keep every in-progress row, plus the newest `limit` finished rows.
+/// The vec is newest-first.
+fn trim_finished_downloads(downloads: &mut Vec<DownloadItem>, limit: usize) {
+    let mut kept_finished = 0usize;
+    downloads.retain(|d| {
+        if !is_finished_download_status(&d.status) {
+            return true;
+        }
+        if kept_finished < limit {
+            kept_finished += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn load_recent_downloads(paths: &Paths) -> Vec<DownloadItem> {
+    let path = paths.recent_downloads_file();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(mut items) = serde_json::from_str::<Vec<DownloadItem>>(&raw) else {
+        log::warn!(
+            "ignoring unreadable recent downloads file {}",
+            path.display()
+        );
+        return Vec::new();
+    };
+    items.retain(|d| is_finished_download_status(&d.status));
+    for item in &mut items {
+        item.can_restart = false;
+        item.speed_bps = 0;
+    }
+    items
+}
+
+fn save_recent_downloads(paths: &Paths, downloads: &[DownloadItem]) {
+    let finished: Vec<DownloadItem> = downloads
+        .iter()
+        .filter(|d| is_finished_download_status(&d.status))
+        .cloned()
+        .map(|mut d| {
+            d.can_restart = false;
+            d.speed_bps = 0;
+            d
+        })
+        .collect();
+    let path = paths.recent_downloads_file();
+    match serde_json::to_string_pretty(&finished) {
+        Ok(raw) => {
+            if let Err(e) = std::fs::write(&path, raw) {
+                log::warn!("failed to save recent downloads: {e}");
+            }
+        }
+        Err(e) => log::warn!("failed to serialize recent downloads: {e}"),
+    }
+}
+
+fn recent_downloads_limit(state: &AppState) -> usize {
+    state
+        .config
+        .lock()
+        .ok()
+        .map(|cfg| config::clamp_recent_downloads_limit(cfg.recent_downloads_limit) as usize)
+        .unwrap_or(50)
+}
+
+fn commit_recent_downloads(state: &AppState) {
+    let limit = recent_downloads_limit(state);
+    let snapshot = {
+        let Ok(mut q) = state.downloads.lock() else {
+            return;
+        };
+        trim_finished_downloads(&mut q, limit);
+        q.clone()
+    };
+    save_recent_downloads(&state.paths, &snapshot);
+}
+
 fn push_download(state: &AppState, item: DownloadItem) {
     if let Ok(mut q) = state.downloads.lock() {
         q.insert(0, item);
-        if q.len() > 100 {
-            q.truncate(100);
-        }
     }
+    commit_recent_downloads(state);
 }
 
 fn update_download(state: &AppState, id: &str, status: &str, error: Option<String>) {
@@ -308,6 +518,7 @@ fn update_download(state: &AppState, id: &str, status: &str, error: Option<Strin
             }
         }
     }
+    commit_recent_downloads(state);
 }
 
 fn ensure_download_job(
@@ -381,6 +592,7 @@ fn reset_download_row(state: &AppState, id: &str) {
             item.speed_bps = 0;
         }
     }
+    commit_recent_downloads(state);
 }
 
 fn finish_download_success(state: &AppState, id: &str) {
@@ -401,6 +613,109 @@ fn clear_download_job(state: &AppState, id: &str) {
     if let Ok(mut jobs) = state.download_jobs.lock() {
         jobs.remove(id);
     }
+}
+
+/// True when `path` resolves under `downloads_dir` (symlinks / `..` normalized).
+fn path_is_under_downloads(path: &Path, downloads_dir: &Path) -> bool {
+    let downloads =
+        std::fs::canonicalize(downloads_dir).unwrap_or_else(|_| downloads_dir.to_path_buf());
+    let candidate = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => {
+            if !path.is_absolute() {
+                return false;
+            }
+            path.to_path_buf()
+        }
+    };
+    candidate.starts_with(&downloads)
+}
+
+/// Delete a finished/failed download archive when it lives under the cache downloads dir.
+/// No-ops for paths outside that dir (e.g. user-chosen import files).
+fn remove_download_archive(path: &Path, downloads_dir: &Path) {
+    if !path_is_under_downloads(path, downloads_dir) {
+        return;
+    }
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearDownloadCacheResult {
+    pub files_removed: u64,
+    pub bytes_freed: u64,
+}
+
+/// Wipe entries under `downloads_dir` except paths in `protected` (active job dests).
+fn clear_download_cache_dir(
+    downloads_dir: &Path,
+    protected: &HashSet<PathBuf>,
+) -> Result<ClearDownloadCacheResult, String> {
+    let mut files_removed = 0u64;
+    let mut bytes_freed = 0u64;
+    if !downloads_dir.is_dir() {
+        return Ok(ClearDownloadCacheResult {
+            files_removed,
+            bytes_freed,
+        });
+    }
+    let entries = std::fs::read_dir(downloads_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if protected.iter().any(|p| {
+            let pc = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            pc == canon || canon.starts_with(&pc) || pc.starts_with(&canon)
+        }) {
+            continue;
+        }
+        let size = entry
+            .metadata()
+            .map(|m| {
+                if m.is_dir() {
+                    dir_size_approx(&path)
+                } else {
+                    m.len()
+                }
+            })
+            .unwrap_or(0);
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else {
+            std::fs::remove_file(&path).is_ok()
+        };
+        if removed {
+            files_removed += 1;
+            bytes_freed += size;
+        }
+    }
+    Ok(ClearDownloadCacheResult {
+        files_removed,
+        bytes_freed,
+    })
+}
+
+fn dir_size_approx(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in rd.flatten() {
+        let meta = entry.metadata();
+        if let Ok(m) = meta {
+            if m.is_dir() {
+                total += dir_size_approx(&entry.path());
+            } else {
+                total += m.len();
+            }
+        }
+    }
+    total
 }
 
 fn mark_cancelled(state: &AppState, id: &str) {
@@ -1106,6 +1421,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "last_active_game_id": cfg.last_active_game_id,
         "theme": cfg.theme,
         "install_click_behavior": cfg.install_click_behavior,
+        "recent_downloads_limit": config::clamp_recent_downloads_limit(cfg.recent_downloads_limit),
         "has_api_key": has_key,
         "has_modio_api_key": has_modio_api_key,
         "user": user,
@@ -1120,6 +1436,21 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 pub fn scan_mod_orphans(state: State<'_, AppState>) -> Result<migration::OrphanScan, String> {
     let cfg = state.config.lock().map_err(|e| e.to_string())?;
     Ok(migration::scan_orphans(&state.paths, &cfg))
+}
+
+#[tauri::command]
+pub fn clear_download_cache(
+    state: State<'_, AppState>,
+) -> Result<ClearDownloadCacheResult, String> {
+    let downloads_dir = state.paths.downloads_dir();
+    let protected: HashSet<PathBuf> = state
+        .download_jobs
+        .lock()
+        .map_err(|e| e.to_string())?
+        .values()
+        .filter_map(|j| j.dest.clone())
+        .collect();
+    clear_download_cache_dir(&downloads_dir, &protected)
 }
 
 #[tauri::command]
@@ -1162,6 +1493,18 @@ pub fn set_install_click_behavior(
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.install_click_behavior = behavior;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_recent_downloads_limit(state: State<'_, AppState>, limit: u32) -> Result<(), String> {
+    let limit = config::clamp_recent_downloads_limit(limit);
+    {
+        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.recent_downloads_limit = limit;
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
+    commit_recent_downloads(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1905,10 +2248,15 @@ async fn stage_thunderstore_package(
     ));
 
     if is_new {
-        let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
-        downloads.insert(
-            0,
-            DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+        push_download(
+            state,
+            DownloadItem::new(
+                dl_id.clone(),
+                label.clone(),
+                "downloading",
+                None,
+                thunderstore_page(game_id, community, &ns, &pkg_name),
+            ),
         );
     } else {
         reset_download_row(state, &dl_id);
@@ -1953,7 +2301,13 @@ async fn stage_thunderstore_package(
         Ok(()) => {
             update_download(state, &dl_id, "extracting", None);
             let _ = app.emit("downloads-changed", ());
-            let staged = mods::stage_thunderstore_mod(
+            let ts_file_name = mods::pick_staged_file_name(
+                display_name,
+                None,
+                crate::nexus::filename_from_url(&ver.download_url).as_deref(),
+            );
+            assign_download_file_name(state, &dl_id, ts_file_name.as_deref());
+            match mods::stage_thunderstore_mod(
                 &state.paths,
                 game_id,
                 community,
@@ -1962,37 +2316,42 @@ async fn stage_thunderstore_package(
                 incoming_ver,
                 Some(pkg.uuid4.clone()),
                 display_name,
+                ts_file_name,
+                Some(ver.icon.clone()).filter(|icon| !icon.trim().is_empty()),
                 &dest,
-            )
-            .map_err(|e| e.to_string())?;
-            if let Some(false) = enabled {
-                let _ = mods::merge_mod_meta(
-                    &state.paths,
-                    game_id,
-                    &staged.id,
-                    &[],
-                    &[],
-                    None,
-                    Some(false),
-                );
-            }
-            if let Ok(mut downloads) = state.downloads.lock() {
-                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                    d.status = "done".into();
+            ) {
+                Ok(staged) => {
+                    if let Some(false) = enabled {
+                        let _ = mods::merge_mod_meta(
+                            &state.paths,
+                            game_id,
+                            &staged.id,
+                            &[],
+                            &[],
+                            None,
+                            Some(false),
+                        );
+                    }
+                    update_download(state, &dl_id, "done", None);
+                    remove_download_archive(&dest, &state.paths.downloads_dir());
+                    finish_download_success(state, &dl_id);
+                    let _ = app.emit("downloads-changed", ());
+                    Ok(staged)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    remove_download_archive(&dest, &state.paths.downloads_dir());
+                    update_download(state, &dl_id, "failed", Some(msg.clone()));
+                    clear_download_job(state, &dl_id);
+                    let _ = app.emit("downloads-changed", ());
+                    Err(msg)
                 }
             }
-            finish_download_success(state, &dl_id);
-            let _ = app.emit("downloads-changed", ());
-            Ok(staged)
         }
         Err(e) => {
             let msg = e.to_string();
-            if let Ok(mut downloads) = state.downloads.lock() {
-                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                    d.status = "failed".into();
-                    d.error = Some(msg.clone());
-                }
-            }
+            remove_download_archive(&dest, &state.paths.downloads_dir());
+            update_download(state, &dl_id, "failed", Some(msg.clone()));
             clear_download_job(state, &dl_id);
             let _ = app.emit("downloads-changed", ());
             Err(msg)
@@ -2370,13 +2729,11 @@ pub async fn download_modio_mod(
         let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
         if let Some(existing) = mods::find_modio_mod(&order, modio_game_id, mid) {
             let same_file = existing.modio_file_id == Some(resolved_file);
-            let keep = if same_file {
-                true
-            } else if let Some(inc) = incoming_ver.as_deref().filter(|s| !s.is_empty()) {
-                !mods::incoming_is_newer(existing.version.as_deref(), inc)
-            } else {
-                existing.version.is_some()
-            };
+            let keep = mods::keep_existing_modio_file(
+                same_file,
+                existing.version.as_deref(),
+                incoming_ver.as_deref(),
+            );
             if keep {
                 staged_all.push(existing.clone());
                 continue;
@@ -2390,10 +2747,15 @@ pub async fn download_modio_mod(
             resolved_file
         ));
         {
-            let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
-            downloads.insert(
-                0,
-                DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+            push_download(
+                &state,
+                DownloadItem::new(
+                    dl_id.clone(),
+                    label.clone(),
+                    "downloading",
+                    None,
+                    modio_page(&game_id, modio_game_id, mid),
+                ),
             );
         }
         let modio_source = DownloadResumeSource::Modio {
@@ -2436,7 +2798,17 @@ pub async fn download_modio_mod(
             Ok(()) => {
                 update_download(&state, &dl_id, "extracting", None);
                 let _ = app.emit("downloads-changed", ());
-                let staged = mods::stage_modio_mod(
+                let modio_label = modio_file_label(
+                    &client,
+                    modio_game_id,
+                    mid,
+                    resolved_file,
+                    detail.primary_file_id,
+                    &detail.name,
+                )
+                .await;
+                assign_download_file_name(&state, &dl_id, modio_label.as_deref());
+                match mods::stage_modio_mod(
                     &state.paths,
                     &game_id,
                     modio_game_id,
@@ -2444,26 +2816,31 @@ pub async fn download_modio_mod(
                     resolved_file,
                     &detail.name,
                     ver,
+                    modio_label,
+                    detail.picture_url.clone(),
                     &dest,
-                )
-                .map_err(|e| e.to_string())?;
-                staged_all.push(staged);
-                if let Ok(mut downloads) = state.downloads.lock() {
-                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                        d.status = "done".into();
+                ) {
+                    Ok(staged) => {
+                        staged_all.push(staged);
+                        update_download(&state, &dl_id, "done", None);
+                        remove_download_archive(&dest, &state.paths.downloads_dir());
+                        finish_download_success(&state, &dl_id);
+                        let _ = app.emit("downloads-changed", ());
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        remove_download_archive(&dest, &state.paths.downloads_dir());
+                        update_download(&state, &dl_id, "failed", Some(msg.clone()));
+                        clear_download_job(&state, &dl_id);
+                        let _ = app.emit("downloads-changed", ());
+                        return Err(msg);
                     }
                 }
-                finish_download_success(&state, &dl_id);
-                let _ = app.emit("downloads-changed", ());
             }
             Err(e) => {
                 let msg = e.to_string();
-                if let Ok(mut downloads) = state.downloads.lock() {
-                    if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                        d.status = "failed".into();
-                        d.error = Some(msg.clone());
-                    }
-                }
+                remove_download_archive(&dest, &state.paths.downloads_dir());
+                update_download(&state, &dl_id, "failed", Some(msg.clone()));
                 clear_download_job(&state, &dl_id);
                 let _ = app.emit("downloads-changed", ());
                 return Err(msg);
@@ -2486,6 +2863,196 @@ pub async fn download_modio_mod(
         None,
     );
     Ok(staged_all)
+}
+
+fn staging_contains_filename(root: &Path, file_name: &str) -> bool {
+    if !root.is_dir() {
+        return false;
+    }
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(file_name)
+        })
+}
+
+fn staged_nexus_keys(mods: &[StagedMod]) -> HashSet<(String, u64)> {
+    mods.iter()
+        .filter(|m| m.source == ModSource::Nexus && m.nexus_mod_id != 0 && !m.domain.is_empty())
+        .map(|m| (m.domain.to_lowercase(), m.nexus_mod_id))
+        .collect()
+}
+
+struct RequirementSeed {
+    staged_id: String,
+    name: String,
+    domain: String,
+    mod_id: u64,
+}
+
+fn seed_from_staged(m: &StagedMod) -> Option<RequirementSeed> {
+    if m.source != ModSource::Nexus || m.nexus_mod_id == 0 || m.domain.is_empty() {
+        return None;
+    }
+    Some(RequirementSeed {
+        staged_id: m.id.clone(),
+        name: m.name.clone(),
+        domain: m.domain.clone(),
+        mod_id: m.nexus_mod_id,
+    })
+}
+
+async fn collect_requirement_seeds(
+    state: &AppState,
+    seeds: Vec<RequirementSeed>,
+    staged: HashSet<(String, u64)>,
+) -> nexus::MissingRequirements {
+    if seeds.is_empty() {
+        return nexus::MissingRequirements::default();
+    }
+    let client = match state.client() {
+        Ok(client) => client,
+        Err(e) => {
+            return nexus::MissingRequirements {
+                error: Some(e),
+                ..Default::default()
+            };
+        }
+    };
+    let games = match load_nexus_games_cached(state).await {
+        Ok(games) => games,
+        Err(e) => {
+            return nexus::MissingRequirements {
+                error: Some(e),
+                ..Default::default()
+            };
+        }
+    };
+    let mut by_id: HashMap<u64, String> = HashMap::new();
+    let mut by_domain: HashMap<String, u64> = HashMap::new();
+    for game in games {
+        by_domain.insert(game.domain_name.to_lowercase(), game.id);
+        by_id.insert(game.id, game.domain_name);
+    }
+    let mut roots = Vec::new();
+    let mut errors = Vec::new();
+    for seed in seeds {
+        let key = seed.domain.to_lowercase();
+        let game_id = if let Some(id) = by_domain.get(&key).copied() {
+            id
+        } else {
+            match state.get_game_cached(&seed.domain).await {
+                Ok(info) => {
+                    by_domain.insert(key, info.id);
+                    by_id.insert(info.id, info.domain_name);
+                    info.id
+                }
+                Err(e) => {
+                    errors.push(format!("{}: {e}", seed.name));
+                    continue;
+                }
+            }
+        };
+        roots.push(nexus::RequirementRoot {
+            staged_id: seed.staged_id,
+            name: seed.name,
+            game_id,
+            mod_id: seed.mod_id,
+        });
+    }
+    if roots.is_empty() {
+        return nexus::MissingRequirements {
+            error: (!errors.is_empty()).then(|| errors.join(" ")),
+            ..Default::default()
+        };
+    }
+    let mut missing = nexus::collect_missing(&client, &roots, &by_id, &staged).await;
+    if !errors.is_empty() {
+        let extra = errors.join(" ");
+        missing.error = Some(match missing.error.take() {
+            Some(existing) => format!("{existing} {extra}"),
+            None => extra,
+        });
+    }
+    missing
+}
+
+#[tauri::command]
+pub async fn missing_nexus_requirements(
+    state: State<'_, AppState>,
+    game_id: String,
+    staged_id: Option<String>,
+) -> Result<nexus::MissingRequirements, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = staged_nexus_keys(&order.mods);
+    let seeds = match staged_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let staged_mod = order
+                .mods
+                .iter()
+                .find(|m| m.id == id)
+                .ok_or_else(|| format!("Staged mod not found: {id}"))?;
+            seed_from_staged(staged_mod)
+                .ok_or_else(|| "Requirements are available for Nexus mods.".to_string())
+                .map(|seed| vec![seed])?
+        }
+        None => order.mods.iter().filter_map(seed_from_staged).collect(),
+    };
+    Ok(collect_requirement_seeds(&state, seeds, staged).await)
+}
+
+#[tauri::command]
+pub async fn nexus_mod_requirements(
+    state: State<'_, AppState>,
+    game_id: String,
+    domain: String,
+    mod_id: u64,
+    name: String,
+) -> Result<nexus::MissingRequirements, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let staged = staged_nexus_keys(&order.mods);
+    let existing = mods::find_nexus_mod(&order, &domain, mod_id);
+    let seed = RequirementSeed {
+        staged_id: existing.map(|m| m.id.clone()).unwrap_or_default(),
+        name: existing
+            .map(|m| m.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(name),
+        domain,
+        mod_id,
+    };
+    Ok(collect_requirement_seeds(&state, vec![seed], staged).await)
+}
+
+#[tauri::command]
+pub fn link_staged_requirements(
+    state: State<'_, AppState>,
+    game_id: String,
+    requirement_id: String,
+    required_by: Vec<String>,
+) -> Result<(), String> {
+    for parent in required_by {
+        if parent.is_empty() || parent == requirement_id {
+            continue;
+        }
+        mods::merge_mod_meta(
+            &state.paths,
+            &game_id,
+            &parent,
+            &[],
+            &[requirement_id.clone()],
+            None,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2513,6 +3080,21 @@ pub async fn get_mod(
                     .find(|c| c.category_id == category_id)
                     .map(|c| c.name.clone());
             }
+        }
+    }
+    match client.mod_page_gallery(&domain, mod_id).await {
+        Ok(images) => detail.image_urls = images,
+        Err(e) => log::warn!("nexus mod gallery unavailable for {domain}/{mod_id}: {e}"),
+    }
+    if detail.image_urls.is_empty() {
+        if let Some(url) = detail
+            .picture_url
+            .clone()
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        {
+            detail
+                .image_urls
+                .push(ModGalleryImage { url, caption: None });
         }
     }
     Ok(detail)
@@ -2780,6 +3362,7 @@ async fn download_and_stage_inner(
     existing_dl_id: Option<String>,
     batch_id: Option<String>,
     replace_staged_id: Option<String>,
+    chosen_file_name: Option<String>,
 ) -> Result<StagedMod, String> {
     let client = state.client()?;
     let is_premium = state.ensure_premium_status().await;
@@ -2796,6 +3379,7 @@ async fn download_and_stage_inner(
                 label.to_string(),
                 "downloading",
                 batch_id.clone(),
+                nexus_page(game_id, domain, mod_id),
             ),
         );
     } else {
@@ -2836,8 +3420,17 @@ async fn download_and_stage_inner(
             nxm_key: nxm_key.clone(),
             nxm_expires,
             replace_staged_id: replace_staged_id.clone(),
+            file_name: chosen_file_name.clone(),
         },
     );
+
+    if let Some(early) = mods::pick_staged_file_name(label, chosen_file_name.as_deref(), None) {
+        if assign_download_file_name(state, &dl_id, Some(&early)) {
+            if let Some(handle) = app {
+                let _ = handle.emit("downloads-changed", ());
+            }
+        }
+    }
 
     let start_offset = file_offset(&dest);
     let control = TransferControl {
@@ -2943,6 +3536,14 @@ async fn download_and_stage_inner(
         );
     }
 
+    let stored_file_name =
+        mods::pick_staged_file_name(label, chosen_file_name.as_deref(), cdn_name.as_deref());
+    if assign_download_file_name(state, &dl_id, stored_file_name.as_deref()) {
+        if let Some(handle) = app {
+            let _ = handle.emit("downloads-changed", ());
+        }
+    }
+
     match if let Some(replace_id) = replace_staged_id.as_deref() {
         mods::stage_mod_replacing(
             &state.paths,
@@ -2953,6 +3554,7 @@ async fn download_and_stage_inner(
             mod_id,
             file_id,
             version,
+            stored_file_name.clone(),
             &dest,
         )
     } else {
@@ -2964,11 +3566,13 @@ async fn download_and_stage_inner(
             mod_id,
             file_id,
             version,
+            stored_file_name,
             &dest,
         )
     } {
         Ok(staged) => {
             if cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
                 mark_cancelled(state, &dl_id);
                 clear_download_job(state, &dl_id);
                 return Err("Cancelled".into());
@@ -2997,6 +3601,209 @@ async fn download_and_stage_inner(
     }
 }
 
+/// Download via Nexus API / NXM key, then install as a FromSoft legacy loader.
+async fn download_and_install_loader_inner(
+    app: Option<&tauri::AppHandle>,
+    state: &AppState,
+    game_id: &str,
+    domain: &str,
+    mod_id: u64,
+    file_id: u64,
+    label: &str,
+    nxm_key: Option<String>,
+    nxm_expires: Option<u64>,
+    existing_dl_id: Option<String>,
+    batch_id: Option<String>,
+    plugin_id: &str,
+    install_path: &Path,
+) -> Result<(), String> {
+    let client = state.client()?;
+    let is_premium = state.ensure_premium_status().await;
+
+    let (dl_id, is_new) = match existing_dl_id {
+        Some(id) => (id, false),
+        None => (uuid::Uuid::new_v4().to_string(), true),
+    };
+    if is_new {
+        push_download(
+            state,
+            DownloadItem::new(
+                dl_id.clone(),
+                label.to_string(),
+                "downloading",
+                batch_id.clone(),
+                None,
+            ),
+        );
+    } else {
+        update_download(state, &dl_id, "downloading", None);
+        if let Ok(mut q) = state.downloads.lock() {
+            if let Some(item) = q.iter_mut().find(|d| d.id == dl_id) {
+                if item.batch_id.is_none() {
+                    item.batch_id = batch_id.clone();
+                }
+            }
+        }
+    }
+
+    let (cancel, pause) = ensure_download_job(state, &dl_id, batch_id.clone());
+    if cancel.load(Ordering::SeqCst) {
+        mark_cancelled(state, &dl_id);
+        clear_download_job(state, &dl_id);
+        return Err("Cancelled".into());
+    }
+    pause.store(false, Ordering::SeqCst);
+
+    let dest = state
+        .paths
+        .downloads_dir()
+        .join(format!("{domain}_{mod_id}_{file_id}.bin"));
+
+    set_download_resume(
+        state,
+        &dl_id,
+        dest.clone(),
+        DownloadResumeSource::Api {
+            game_id: game_id.to_string(),
+            domain: domain.to_string(),
+            mod_id,
+            file_id,
+            label: label.to_string(),
+            version: None,
+            nxm_key: nxm_key.clone(),
+            nxm_expires,
+            replace_staged_id: None,
+            file_name: None,
+        },
+    );
+
+    let start_offset = file_offset(&dest);
+    let control = TransferControl {
+        cancel: cancel.clone(),
+        pause: pause.clone(),
+    };
+    let on_progress = progress_callback(app, dl_id.clone());
+
+    let _slot = state
+        .download_slots
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let download_result = client
+        .download_file(
+            domain,
+            mod_id,
+            file_id,
+            &dest,
+            is_premium,
+            nxm_key.as_deref(),
+            nxm_expires,
+            start_offset,
+            Some(&control),
+            on_progress.as_ref(),
+        )
+        .await;
+
+    let cdn_name = match download_result {
+        Ok(name) => name,
+        Err(e) => {
+            let msg = e.to_string();
+            if is_pause_err(&msg) || pause.load(Ordering::SeqCst) {
+                mark_paused(app, state, &dl_id);
+                return Err("Paused".into());
+            }
+            if is_cancel_err(&msg) || cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
+                mark_cancelled(state, &dl_id);
+                clear_download_job(state, &dl_id);
+                return Err("Cancelled".into());
+            }
+            let _ = std::fs::remove_file(&dest);
+            update_download(state, &dl_id, "failed", Some(msg.clone()));
+            clear_download_job(state, &dl_id);
+            return Err(msg);
+        }
+    };
+
+    if cancel.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(&dest);
+        mark_cancelled(state, &dl_id);
+        clear_download_job(state, &dl_id);
+        return Err("Cancelled".into());
+    }
+    if pause.load(Ordering::SeqCst) {
+        mark_paused(app, state, &dl_id);
+        return Err("Paused".into());
+    }
+
+    drop(_slot);
+
+    let dest = match archive_extension(cdn_name.as_deref()) {
+        Some(ext) => {
+            let renamed = state
+                .paths
+                .downloads_dir()
+                .join(format!("{domain}_{mod_id}_{file_id}.{ext}"));
+            match std::fs::rename(&dest, &renamed) {
+                Ok(()) => renamed,
+                Err(e) => {
+                    log::warn!("could not rename {} to {ext}: {e}", dest.display());
+                    dest
+                }
+            }
+        }
+        None => dest,
+    };
+
+    update_download(state, &dl_id, "extracting", None);
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "download-progress",
+            serde_json::json!({
+                "id": dl_id,
+                "bytes_downloaded": state.downloads.lock().ok()
+                    .and_then(|q| q.iter().find(|d| d.id == dl_id).map(|d| d.bytes_downloaded))
+                    .unwrap_or(0),
+                "bytes_total": state.downloads.lock().ok()
+                    .and_then(|q| q.iter().find(|d| d.id == dl_id).and_then(|d| d.bytes_total)),
+                "speed_bps": 0,
+                "status": "extracting",
+            }),
+        );
+    }
+
+    match games::install_legacy_from_archive(&state.paths, plugin_id, install_path, &dest) {
+        Ok(()) => {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
+                mark_cancelled(state, &dl_id);
+                clear_download_job(state, &dl_id);
+                return Err("Cancelled".into());
+            }
+            update_download(state, &dl_id, "staged", None);
+            let _ = std::fs::remove_file(&dest);
+            finish_download_success(state, &dl_id);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = std::fs::remove_file(&dest);
+            if cancel.load(Ordering::SeqCst) {
+                mark_cancelled(state, &dl_id);
+            } else {
+                update_download(state, &dl_id, "failed", Some(msg.clone()));
+            }
+            clear_download_job(state, &dl_id);
+            Err(if cancel.load(Ordering::SeqCst) {
+                "Cancelled".into()
+            } else {
+                msg
+            })
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn download_mod(
     app: tauri::AppHandle,
@@ -3007,6 +3814,8 @@ pub async fn download_mod(
     file_id: u64,
     name: String,
     version: Option<String>,
+    replace_staged_id: Option<String>,
+    file_name: Option<String>,
 ) -> Result<StagedMod, String> {
     if !state.ensure_premium_status().await {
         return Err(
@@ -3028,7 +3837,8 @@ pub async fn download_mod(
         None,
         None,
         None,
-        None,
+        replace_staged_id,
+        file_name,
     )
     .await
 }
@@ -3096,6 +3906,7 @@ pub async fn install_collection(
             None,
             Some(batch_id.clone()),
             None,
+            Some(file.file_name),
         )
         .await
         {
@@ -3158,6 +3969,15 @@ pub async fn handle_nxm(
     let assist = crate::assist::peek_assist_context(&state);
     let batch_id = assist.as_ref().and_then(|a| a.batch_id.clone());
     let replace_staged_id = assist.as_ref().and_then(|a| a.replace_staged_id.clone());
+    let staged_version = assist.as_ref().and_then(|a| a.version.clone());
+    let staged_file_name = assist.as_ref().and_then(|a| a.file_name.clone());
+    let loader_purpose = match assist.as_ref().map(|a| &a.purpose) {
+        Some(crate::assist::AssistPurpose::FromsoftLegacyLoader {
+            plugin_id,
+            install_path,
+        }) => Some((plugin_id.clone(), install_path.clone())),
+        _ => None,
+    };
     let game = {
         let cfg = state.config.lock().map_err(|e| e.to_string())?;
         cfg.managed_games
@@ -3205,7 +4025,18 @@ pub async fn handle_nxm(
     let _ = crate::assist::close_assist_intentionally(&app, &state);
 
     let dl_id = uuid::Uuid::new_v4().to_string();
-    let item = DownloadItem::new(dl_id.clone(), name.clone(), "downloading", batch_id.clone());
+    let page = if loader_purpose.is_some() {
+        None
+    } else {
+        nexus_page(&game.id, &link.domain, link.mod_id)
+    };
+    let item = DownloadItem::new(
+        dl_id.clone(),
+        name.clone(),
+        "downloading",
+        batch_id.clone(),
+        page,
+    );
     push_download(&state, item.clone());
     let _ = ensure_download_job(&state, &dl_id, batch_id.clone());
     log::info!(
@@ -3238,9 +4069,78 @@ pub async fn handle_nxm(
     let queued_id = dl_id.clone();
     let batch_id_bg = batch_id.clone();
     let replace_staged_id_bg = replace_staged_id;
+    let staged_version_bg = staged_version;
+    let file_name_bg = staged_file_name;
 
     tauri::async_runtime::spawn(async move {
         let state = app_bg.state::<AppState>();
+        if let Some((plugin_id, install_path)) = loader_purpose {
+            let result = download_and_install_loader_inner(
+                Some(&app_bg),
+                &*state,
+                &game_id,
+                &domain,
+                mod_id,
+                file_id,
+                &label,
+                key,
+                expires,
+                Some(queued_id.clone()),
+                batch_id_bg,
+                &plugin_id,
+                Path::new(&install_path),
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    log::info!("nxm loader install finished: {label}");
+                    let _ = app_bg.emit(
+                        "fromsoft-loader-installed",
+                        serde_json::json!({
+                            "id": queued_id,
+                            "label": label,
+                            "game_id": game_id,
+                            "plugin_id": plugin_id,
+                        }),
+                    );
+                    let _ = app_bg.emit(
+                        "download-finished",
+                        serde_json::json!({
+                            "id": queued_id,
+                            "label": label,
+                            "game_id": game_id,
+                            "mod_id": "",
+                        }),
+                    );
+                }
+                Err(e) => {
+                    if is_pause_err(&e) {
+                        log::info!("nxm loader download paused: {label}");
+                    } else if is_cancel_err(&e) {
+                        log::info!("nxm loader download cancelled: {label}");
+                        let _ = app_bg.emit(
+                            "download-cancelled",
+                            serde_json::json!({
+                                "id": queued_id,
+                                "label": label,
+                            }),
+                        );
+                    } else {
+                        log::error!("nxm loader download failed ({label}): {e}");
+                        let _ = app_bg.emit(
+                            "download-failed",
+                            serde_json::json!({
+                                "id": queued_id,
+                                "label": label,
+                                "error": e,
+                            }),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
         let result = download_and_stage_inner(
             Some(&app_bg),
             &*state,
@@ -3249,12 +4149,13 @@ pub async fn handle_nxm(
             mod_id,
             file_id,
             &label,
-            None,
+            staged_version_bg,
             key,
             expires,
             Some(queued_id.clone()),
             batch_id_bg,
             replace_staged_id_bg,
+            file_name_bg,
         )
         .await;
         match result {
@@ -3342,6 +4243,7 @@ pub fn import_mod_archive(
             .unwrap_or(1)
     });
 
+    let imported_name = archive.file_name().map(|s| s.to_string_lossy().to_string());
     mods::stage_mod(
         &state.paths,
         &game_id,
@@ -3350,6 +4252,7 @@ pub fn import_mod_archive(
         mod_id,
         file_id,
         None,
+        mods::pick_staged_file_name(&label, None, imported_name.as_deref()),
         &archive,
     )
     .map_err(|e| e.to_string())
@@ -3373,6 +4276,13 @@ pub async fn start_assist_cdn_download(
 
     let ctx = crate::assist::peek_assist_context(state)
         .ok_or_else(|| "No active Download Assist context".to_string())?;
+    let loader_purpose = match &ctx.purpose {
+        crate::assist::AssistPurpose::FromsoftLegacyLoader {
+            plugin_id,
+            install_path,
+        } => Some((plugin_id.clone(), install_path.clone())),
+        crate::assist::AssistPurpose::StageMod => None,
+    };
 
     let parsed = url::Url::parse(cdn_url).map_err(|e| e.to_string())?;
     if !crate::assist::is_nexus_cdn_download(&parsed) {
@@ -3404,11 +4314,17 @@ pub async fn start_assist_cdn_download(
 
     let batch_id = ctx.batch_id.clone();
     let dl_id = uuid::Uuid::new_v4().to_string();
+    let page = if loader_purpose.is_some() {
+        None
+    } else {
+        nexus_page(&ctx.game_id, &ctx.domain, ctx.mod_id)
+    };
     let item = DownloadItem::new(
         dl_id.clone(),
         ctx.label.clone(),
         "downloading",
         batch_id.clone(),
+        page,
     );
     push_download(state, item.clone());
     let _ = ensure_download_job(state, &dl_id, batch_id.clone());
@@ -3442,6 +4358,8 @@ pub async fn start_assist_cdn_download(
     let mod_id = ctx.mod_id;
     let file_id = ctx.file_id;
     let replace_staged_id = ctx.replace_staged_id.clone();
+    let staged_version = ctx.version.clone();
+    let staged_file_name = ctx.file_name.clone();
     let queued_id = dl_id.clone();
     let cdn_url = cdn_url.to_string();
     let cookie_header = cookie_header;
@@ -3449,6 +4367,73 @@ pub async fn start_assist_cdn_download(
 
     tauri::async_runtime::spawn(async move {
         let state = app_bg.state::<AppState>();
+        if let Some((plugin_id, install_path)) = loader_purpose {
+            let result = fetch_cdn_and_install_loader(
+                &app_bg,
+                &*state,
+                &cdn_url,
+                &cookie_header,
+                &game_id,
+                &label,
+                &domain,
+                mod_id,
+                file_id,
+                &queued_id,
+                batch_id_bg,
+                &plugin_id,
+                Path::new(&install_path),
+            )
+            .await;
+            match result {
+                Ok(()) => {
+                    log::info!("cdn loader install finished: {label}");
+                    let _ = app_bg.emit(
+                        "fromsoft-loader-installed",
+                        serde_json::json!({
+                            "id": queued_id,
+                            "label": label,
+                            "game_id": game_id,
+                            "plugin_id": plugin_id,
+                        }),
+                    );
+                    let _ = app_bg.emit(
+                        "download-finished",
+                        serde_json::json!({
+                            "id": queued_id,
+                            "label": label,
+                            "game_id": game_id,
+                            "mod_id": "",
+                        }),
+                    );
+                }
+                Err(e) => {
+                    if is_pause_err(&e) {
+                        log::info!("cdn loader download paused: {label}");
+                    } else if is_cancel_err(&e) {
+                        log::info!("cdn loader download cancelled: {label}");
+                        let _ = app_bg.emit(
+                            "download-cancelled",
+                            serde_json::json!({
+                                "id": queued_id,
+                                "label": label,
+                            }),
+                        );
+                    } else {
+                        log::error!("cdn loader download failed ({label}): {e}");
+                        let _ = app_bg.emit(
+                            "download-failed",
+                            serde_json::json!({
+                                "id": queued_id,
+                                "label": label,
+                                "error": e,
+                            }),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
         let result = fetch_and_stage_cdn(
             &app_bg,
             &*state,
@@ -3461,7 +4446,9 @@ pub async fn start_assist_cdn_download(
             file_id,
             &queued_id,
             batch_id_bg,
+            staged_version,
             replace_staged_id,
+            staged_file_name,
         )
         .await;
         match result {
@@ -3507,7 +4494,8 @@ pub async fn start_assist_cdn_download(
     Ok(item)
 }
 
-async fn fetch_and_stage_cdn(
+/// Download a CDN URL into the downloads dir (shared by stage + loader install).
+async fn download_cdn_archive(
     app: &tauri::AppHandle,
     state: &AppState,
     cdn_url: &str,
@@ -3519,8 +4507,10 @@ async fn fetch_and_stage_cdn(
     file_id: u64,
     dl_id: &str,
     batch_id: Option<String>,
+    version: Option<String>,
     replace_staged_id: Option<String>,
-) -> Result<StagedMod, String> {
+    chosen_file_name: Option<String>,
+) -> Result<(PathBuf, Arc<AtomicBool>), String> {
     let (cancel, pause) = ensure_download_job(state, dl_id, batch_id.clone());
     if cancel.load(Ordering::SeqCst) {
         mark_cancelled(state, dl_id);
@@ -3562,9 +4552,19 @@ async fn fetch_and_stage_cdn(
             mod_id,
             file_id,
             label: label.to_string(),
+            version: version.clone(),
             replace_staged_id: replace_staged_id.clone(),
+            file_name: chosen_file_name.clone(),
         },
     );
+    let archive_name = crate::nexus::filename_from_url(cdn_url);
+    if let Some(early) =
+        mods::pick_staged_file_name(label, chosen_file_name.as_deref(), archive_name.as_deref())
+    {
+        if assign_download_file_name(state, dl_id, Some(&early)) {
+            let _ = app.emit("downloads-changed", ());
+        }
+    }
 
     let client = reqwest::Client::builder()
         .user_agent(format!("{APP_NAME}/{APP_VERSION}"))
@@ -3672,7 +4672,10 @@ async fn fetch_and_stage_cdn(
     };
 
     log::info!("cdn download saved to {}", dest.display());
+    Ok((dest, cancel))
+}
 
+fn report_cdn_extracting(app: &tauri::AppHandle, state: &AppState, dl_id: &str, dest: &PathBuf) {
     let (bytes_downloaded, bytes_total) = state
         .downloads
         .lock()
@@ -3685,10 +4688,50 @@ async fn fetch_and_stage_cdn(
                 )
             })
         })
-        .unwrap_or_else(|| (file_offset(&dest), Some(file_offset(&dest))));
+        .unwrap_or_else(|| (file_offset(dest), Some(file_offset(dest))));
 
     update_download(state, dl_id, "extracting", None);
     report_download_progress(app, state, dl_id, bytes_downloaded, bytes_total, 0);
+}
+
+async fn fetch_and_stage_cdn(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    cdn_url: &str,
+    cookie_header: &str,
+    game_id: &str,
+    label: &str,
+    domain: &str,
+    mod_id: u64,
+    file_id: u64,
+    dl_id: &str,
+    batch_id: Option<String>,
+    version: Option<String>,
+    replace_staged_id: Option<String>,
+    chosen_file_name: Option<String>,
+) -> Result<StagedMod, String> {
+    let archive_name = crate::nexus::filename_from_url(cdn_url);
+    let stored_file_name =
+        mods::pick_staged_file_name(label, chosen_file_name.as_deref(), archive_name.as_deref());
+    let (dest, cancel) = download_cdn_archive(
+        app,
+        state,
+        cdn_url,
+        cookie_header,
+        game_id,
+        label,
+        domain,
+        mod_id,
+        file_id,
+        dl_id,
+        batch_id,
+        version.clone(),
+        replace_staged_id.clone(),
+        chosen_file_name,
+    )
+    .await?;
+
+    report_cdn_extracting(app, state, dl_id, &dest);
     match if let Some(replace_id) = replace_staged_id.as_deref() {
         mods::stage_mod_replacing(
             &state.paths,
@@ -3698,7 +4741,8 @@ async fn fetch_and_stage_cdn(
             domain,
             mod_id,
             file_id,
-            None,
+            version.clone(),
+            stored_file_name.clone(),
             &dest,
         )
     } else {
@@ -3709,12 +4753,14 @@ async fn fetch_and_stage_cdn(
             domain,
             mod_id,
             file_id,
-            None,
+            version,
+            stored_file_name,
             &dest,
         )
     } {
         Ok(staged) => {
             if cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
                 mark_cancelled(state, dl_id);
                 clear_download_job(state, dl_id);
                 return Err("Cancelled".into());
@@ -3741,16 +4787,88 @@ async fn fetch_and_stage_cdn(
     }
 }
 
+/// Same CDN download as [`fetch_and_stage_cdn`], but installs a FromSoft loader.
+async fn fetch_cdn_and_install_loader(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    cdn_url: &str,
+    cookie_header: &str,
+    game_id: &str,
+    label: &str,
+    domain: &str,
+    mod_id: u64,
+    file_id: u64,
+    dl_id: &str,
+    batch_id: Option<String>,
+    plugin_id: &str,
+    install_path: &Path,
+) -> Result<(), String> {
+    let (dest, cancel) = download_cdn_archive(
+        app,
+        state,
+        cdn_url,
+        cookie_header,
+        game_id,
+        label,
+        domain,
+        mod_id,
+        file_id,
+        dl_id,
+        batch_id,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    report_cdn_extracting(app, state, dl_id, &dest);
+    match games::install_legacy_from_archive(&state.paths, plugin_id, install_path, &dest) {
+        Ok(()) => {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&dest);
+                mark_cancelled(state, dl_id);
+                clear_download_job(state, dl_id);
+                return Err("Cancelled".into());
+            }
+            update_download(state, dl_id, "staged", None);
+            let _ = std::fs::remove_file(&dest);
+            finish_download_success(state, dl_id);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = std::fs::remove_file(&dest);
+            if cancel.load(Ordering::SeqCst) {
+                mark_cancelled(state, dl_id);
+                clear_download_job(state, dl_id);
+                Err("Cancelled".into())
+            } else {
+                update_download(state, dl_id, "failed", Some(msg.clone()));
+                clear_download_job(state, dl_id);
+                Err(msg)
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub fn import_assist_download(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<StagedMod, String> {
+) -> Result<Option<StagedMod>, String> {
     let ctx = crate::assist::peek_assist_context(&state)
         .ok_or_else(|| "No active Download Assist context".to_string())?;
     let dl_id = uuid::Uuid::new_v4().to_string();
     let batch_id = ctx.batch_id.clone();
+    let page = if matches!(
+        ctx.purpose,
+        crate::assist::AssistPurpose::FromsoftLegacyLoader { .. }
+    ) {
+        None
+    } else {
+        nexus_page(&ctx.game_id, &ctx.domain, ctx.mod_id)
+    };
     push_download(
         &state,
         DownloadItem::new(
@@ -3758,6 +4876,7 @@ pub fn import_assist_download(
             ctx.label.clone(),
             "extracting",
             batch_id.clone(),
+            page,
         ),
     );
     let (cancel, _pause) = ensure_download_job(&state, &dl_id, batch_id);
@@ -3767,68 +4886,149 @@ pub fn import_assist_download(
         clear_download_job(&state, &dl_id);
         return Err("Cancelled".into());
     }
-    match if let Some(replace_id) = ctx.replace_staged_id.as_deref() {
-        mods::stage_mod_replacing(
+
+    if let crate::assist::AssistPurpose::FromsoftLegacyLoader {
+        plugin_id,
+        install_path,
+    } = &ctx.purpose
+    {
+        let archive = PathBuf::from(&path);
+        match games::install_legacy_from_archive(
             &state.paths,
-            &ctx.game_id,
-            replace_id,
-            &ctx.label,
-            &ctx.domain,
-            ctx.mod_id,
-            ctx.file_id,
-            None,
-            &PathBuf::from(&path),
-        )
-    } else {
-        mods::stage_mod(
-            &state.paths,
-            &ctx.game_id,
-            &ctx.label,
-            &ctx.domain,
-            ctx.mod_id,
-            ctx.file_id,
-            None,
-            &PathBuf::from(&path),
-        )
-    } {
-        Ok(staged) => {
-            if cancel.load(Ordering::SeqCst) {
-                mark_cancelled(&state, &dl_id);
+            plugin_id,
+            Path::new(install_path),
+            &archive,
+        ) {
+            Ok(()) => {
+                remove_download_archive(&archive, &state.paths.downloads_dir());
+                if cancel.load(Ordering::SeqCst) {
+                    mark_cancelled(&state, &dl_id);
+                    clear_download_job(&state, &dl_id);
+                    return Err("Cancelled".into());
+                }
+                update_download(&state, &dl_id, "staged", None);
                 clear_download_job(&state, &dl_id);
-                return Err("Cancelled".into());
-            }
-            update_download(&state, &dl_id, "staged", None);
-            clear_download_job(&state, &dl_id);
-            let _ = crate::assist::close_assist_intentionally(&app, &state);
-            let _ = app.emit(
-                "download-finished",
-                serde_json::json!({
-                    "id": dl_id,
-                    "label": ctx.label,
-                    "game_id": ctx.game_id,
-                    "mod_id": staged.id,
-                }),
-            );
-            Ok(staged)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if cancel.load(Ordering::SeqCst) {
-                mark_cancelled(&state, &dl_id);
-                clear_download_job(&state, &dl_id);
-                Err("Cancelled".into())
-            } else {
-                update_download(&state, &dl_id, "failed", Some(msg.clone()));
-                clear_download_job(&state, &dl_id);
+                let _ = crate::assist::close_assist_intentionally(&app, &state);
                 let _ = app.emit(
-                    "download-failed",
+                    "fromsoft-loader-installed",
                     serde_json::json!({
                         "id": dl_id,
                         "label": ctx.label,
-                        "error": msg,
+                        "game_id": ctx.game_id,
+                        "plugin_id": plugin_id,
                     }),
                 );
-                Err(msg)
+                let _ = app.emit(
+                    "download-finished",
+                    serde_json::json!({
+                        "id": dl_id,
+                        "label": ctx.label,
+                        "game_id": ctx.game_id,
+                        "mod_id": "",
+                    }),
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                remove_download_archive(Path::new(&path), &state.paths.downloads_dir());
+                if cancel.load(Ordering::SeqCst) {
+                    mark_cancelled(&state, &dl_id);
+                    clear_download_job(&state, &dl_id);
+                    Err("Cancelled".into())
+                } else {
+                    update_download(&state, &dl_id, "failed", Some(msg.clone()));
+                    clear_download_job(&state, &dl_id);
+                    let _ = app.emit(
+                        "download-failed",
+                        serde_json::json!({
+                            "id": dl_id,
+                            "label": ctx.label,
+                            "error": msg,
+                        }),
+                    );
+                    Err(msg)
+                }
+            }
+        }
+    } else {
+        let imported_name = Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string());
+        let stored_file_name = mods::pick_staged_file_name(
+            &ctx.label,
+            ctx.file_name.as_deref(),
+            imported_name.as_deref(),
+        );
+        assign_download_file_name(&state, &dl_id, stored_file_name.as_deref());
+        match if let Some(replace_id) = ctx.replace_staged_id.as_deref() {
+            mods::stage_mod_replacing(
+                &state.paths,
+                &ctx.game_id,
+                replace_id,
+                &ctx.label,
+                &ctx.domain,
+                ctx.mod_id,
+                ctx.file_id,
+                ctx.version.clone(),
+                stored_file_name.clone(),
+                &PathBuf::from(&path),
+            )
+        } else {
+            mods::stage_mod(
+                &state.paths,
+                &ctx.game_id,
+                &ctx.label,
+                &ctx.domain,
+                ctx.mod_id,
+                ctx.file_id,
+                ctx.version.clone(),
+                stored_file_name,
+                &PathBuf::from(&path),
+            )
+        } {
+            Ok(staged) => {
+                let archive = PathBuf::from(&path);
+                remove_download_archive(&archive, &state.paths.downloads_dir());
+                if cancel.load(Ordering::SeqCst) {
+                    mark_cancelled(&state, &dl_id);
+                    clear_download_job(&state, &dl_id);
+                    return Err("Cancelled".into());
+                }
+                update_download(&state, &dl_id, "staged", None);
+                clear_download_job(&state, &dl_id);
+                let _ = crate::assist::close_assist_intentionally(&app, &state);
+                let _ = app.emit(
+                    "download-finished",
+                    serde_json::json!({
+                        "id": dl_id,
+                        "label": ctx.label,
+                        "game_id": ctx.game_id,
+                        "mod_id": staged.id,
+                    }),
+                );
+                Ok(Some(staged))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                remove_download_archive(Path::new(&path), &state.paths.downloads_dir());
+                if cancel.load(Ordering::SeqCst) {
+                    mark_cancelled(&state, &dl_id);
+                    clear_download_job(&state, &dl_id);
+                    Err("Cancelled".into())
+                } else {
+                    update_download(&state, &dl_id, "failed", Some(msg.clone()));
+                    clear_download_job(&state, &dl_id);
+                    let _ = app.emit(
+                        "download-failed",
+                        serde_json::json!({
+                            "id": dl_id,
+                            "label": ctx.label,
+                            "error": msg,
+                        }),
+                    );
+                    Err(msg)
+                }
             }
         }
     }
@@ -3841,7 +5041,245 @@ pub fn list_mods(state: State<'_, AppState>, game_id: String) -> Result<Vec<Stag
     Ok(order.mods)
 }
 
-async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Option<StagedModUpdate> {
+enum PosterLookup {
+    Empty(String),
+    Nexus {
+        id: String,
+        domain: String,
+        mod_id: u64,
+    },
+    Thunderstore {
+        id: String,
+        community: String,
+        namespace: String,
+        name: String,
+    },
+    Modio {
+        id: String,
+        game_id: u32,
+        mod_id: u64,
+    },
+}
+
+fn poster_lookup(staged: &StagedMod) -> Option<PosterLookup> {
+    if staged.picture_url.is_some() {
+        return None;
+    }
+    Some(match staged.source {
+        ModSource::Nexus => {
+            let domain = staged.domain.trim();
+            if staged.nexus_mod_id == 0
+                || domain.is_empty()
+                || domain.eq_ignore_ascii_case("unknown")
+            {
+                PosterLookup::Empty(staged.id.clone())
+            } else {
+                PosterLookup::Nexus {
+                    id: staged.id.clone(),
+                    domain: domain.to_string(),
+                    mod_id: staged.nexus_mod_id,
+                }
+            }
+        }
+        ModSource::Thunderstore => {
+            let community = staged.domain.trim();
+            let namespace = staged.ts_namespace.as_deref().unwrap_or("").trim();
+            let name = staged.ts_name.as_deref().unwrap_or("").trim();
+            if community.is_empty()
+                || community.eq_ignore_ascii_case("profile")
+                || namespace.is_empty()
+                || name.is_empty()
+                || namespace.eq_ignore_ascii_case("profile")
+            {
+                PosterLookup::Empty(staged.id.clone())
+            } else {
+                PosterLookup::Thunderstore {
+                    id: staged.id.clone(),
+                    community: community.to_string(),
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                }
+            }
+        }
+        ModSource::Modio => match (staged.modio_game_id, staged.modio_mod_id) {
+            (Some(game_id), Some(mod_id)) if game_id > 0 && mod_id > 0 => PosterLookup::Modio {
+                id: staged.id.clone(),
+                game_id,
+                mod_id,
+            },
+            _ => PosterLookup::Empty(staged.id.clone()),
+        },
+    })
+}
+
+fn catalog_picture(url: Option<String>) -> String {
+    url.map(|value| value.trim().to_string())
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn fill_staged_pictures(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Vec<StagedMod>, String> {
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mut updates: HashMap<String, String> = HashMap::new();
+    let mut nexus = Vec::new();
+    let mut thunderstore: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut modio = Vec::new();
+    for staged in &order.mods {
+        match poster_lookup(staged) {
+            Some(PosterLookup::Empty(id)) => {
+                updates.insert(id, String::new());
+            }
+            Some(PosterLookup::Nexus { id, domain, mod_id }) => {
+                nexus.push((id, domain, mod_id));
+            }
+            Some(PosterLookup::Thunderstore {
+                id,
+                community,
+                namespace,
+                name,
+            }) => {
+                thunderstore
+                    .entry(community)
+                    .or_default()
+                    .push((id, namespace, name));
+            }
+            Some(PosterLookup::Modio {
+                id,
+                game_id,
+                mod_id,
+            }) => {
+                modio.push((id, game_id, mod_id));
+            }
+            None => {}
+        }
+    }
+
+    if let Ok(client) = state.client() {
+        const CONCURRENCY: usize = 4;
+        for chunk in nexus.chunks(CONCURRENCY) {
+            let futs = chunk.iter().map(|(id, domain, mod_id)| {
+                let client = state.client();
+                let id = id.clone();
+                let domain = domain.clone();
+                let mod_id = *mod_id;
+                async move {
+                    let Ok(client) = client else {
+                        return None;
+                    };
+                    match client.get_mod(&domain, mod_id).await {
+                        Ok(detail) => Some((id, catalog_picture(detail.picture_url))),
+                        Err(e) => {
+                            log::warn!(
+                                "staged poster lookup failed for nexus {domain}/{mod_id}: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+            });
+            for found in futures_util::future::join_all(futs)
+                .await
+                .into_iter()
+                .flatten()
+            {
+                updates.insert(found.0, found.1);
+            }
+        }
+        let _ = client;
+    }
+
+    if !thunderstore.is_empty() {
+        match ThunderstoreClient::new() {
+            Ok(client) => {
+                for (community, rows) in thunderstore {
+                    match client.list_packages(&community).await {
+                        Ok(packages) => {
+                            for (id, namespace, name) in rows {
+                                let icon = packages.iter().find(|pkg| {
+                                    pkg.owner.eq_ignore_ascii_case(&namespace)
+                                        && pkg.name.eq_ignore_ascii_case(&name)
+                                });
+                                let url = icon.and_then(|pkg| {
+                                    pkg.versions.first().map(|ver| ver.icon.clone())
+                                });
+                                updates.insert(id, catalog_picture(url));
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "staged poster lookup failed for thunderstore {community}: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => log::warn!("thunderstore client unavailable for staged posters: {e}"),
+        }
+    }
+
+    if !modio.is_empty() {
+        let key = state
+            .modio_api_key
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(key) = key {
+            match ModioClient::new(&key) {
+                Ok(client) => {
+                    const CONCURRENCY: usize = 4;
+                    for chunk in modio.chunks(CONCURRENCY) {
+                        let futs = chunk.iter().map(|(id, game_id, mod_id)| {
+                            let id = id.clone();
+                            let game_id = *game_id;
+                            let mod_id = *mod_id;
+                            let client = ModioClient::new(&key);
+                            async move {
+                                let Ok(client) = client else {
+                                    return None;
+                                };
+                                match client.get_mod(game_id, mod_id).await {
+                                    Ok(detail) => Some((id, catalog_picture(detail.picture_url))),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "staged poster lookup failed for mod.io {game_id}/{mod_id}: {e}"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        });
+                        for found in futures_util::future::join_all(futs)
+                            .await
+                            .into_iter()
+                            .flatten()
+                        {
+                            updates.insert(found.0, found.1);
+                        }
+                    }
+                    let _ = client;
+                }
+                Err(e) => log::warn!("mod.io client unavailable for staged posters: {e}"),
+            }
+        }
+    }
+
+    if updates.is_empty() {
+        let mut mods = order.mods;
+        mods.sort_by_key(|m| m.order);
+        return Ok(mods);
+    }
+    mods::apply_staged_pictures(&state.paths, &game_id, &updates).map_err(|e| e.to_string())
+}
+
+async fn detect_update_for_staged(
+    state: &AppState,
+    game_id: &str,
+    staged: &StagedMod,
+) -> Option<StagedModUpdate> {
     match staged.source {
         ModSource::Nexus => {
             if staged.nexus_mod_id == 0 || staged.domain.is_empty() {
@@ -3853,15 +5291,40 @@ async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Optio
                 .await
                 .ok()?;
             let metas: Vec<_> = files
-                .into_iter()
+                .iter()
                 .map(|f| mods::NexusFileMeta {
                     file_id: f.file_id,
-                    version: f.version,
-                    category_name: f.category_name,
+                    version: f.version.clone(),
+                    category_name: f.category_name.clone(),
                     uploaded_timestamp: f.uploaded_timestamp,
                     is_primary: f.is_primary,
+                    name: f.name.clone(),
+                    file_name: mods::pick_staged_file_name(
+                        &staged.name,
+                        Some(&f.name),
+                        f.file_name.as_deref(),
+                    ),
                 })
                 .collect();
+            if staged
+                .file_name
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                if let Some(label) = metas
+                    .iter()
+                    .find(|f| f.file_id == staged.nexus_file_id)
+                    .and_then(|f| f.file_name.clone())
+                {
+                    let _ = mods::remember_file_name_if_missing(
+                        &state.paths,
+                        game_id,
+                        &staged.id,
+                        &label,
+                    );
+                }
+            }
             let candidate = mods::nexus_update_candidate(
                 staged.nexus_file_id,
                 staged.version.as_deref(),
@@ -3874,6 +5337,7 @@ async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Optio
                 nexus_file_id: Some(candidate.file_id),
                 ts_version: None,
                 modio_file_id: None,
+                file_name: candidate.file_name.clone(),
             })
         }
         ModSource::Thunderstore => {
@@ -3890,6 +5354,11 @@ async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Optio
             if !mods::incoming_is_newer(staged.version.as_deref(), &latest) {
                 return None;
             }
+            let archive_name = detail
+                .versions
+                .iter()
+                .find(|v| v.version_number == latest)
+                .and_then(|v| crate::nexus::filename_from_url(&v.download_url));
             Some(StagedModUpdate {
                 staged_id: staged.id.clone(),
                 available_version: Some(latest.clone()),
@@ -3897,6 +5366,7 @@ async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Optio
                 nexus_file_id: None,
                 ts_version: Some(latest),
                 modio_file_id: None,
+                file_name: mods::pick_staged_file_name(&staged.name, None, archive_name.as_deref()),
             })
         }
         ModSource::Modio => {
@@ -3910,10 +5380,15 @@ async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Optio
                 return None;
             }
             let files = client.list_files(game_id, mod_id, Some(primary)).await.ok();
-            let available_version = files
+            let matched = files
                 .as_ref()
-                .and_then(|fs| fs.iter().find(|f| f.file_id == primary))
-                .and_then(|f| f.version.clone());
+                .and_then(|fs| fs.iter().find(|f| f.file_id == primary));
+            let available_version = matched.and_then(|f| f.version.clone());
+            let file_name = mods::pick_staged_file_name(
+                &staged.name,
+                None,
+                matched.map(|f| f.filename.as_str()),
+            );
             Some(StagedModUpdate {
                 staged_id: staged.id.clone(),
                 available_version,
@@ -3921,6 +5396,7 @@ async fn detect_update_for_staged(state: &AppState, staged: &StagedMod) -> Optio
                 nexus_file_id: None,
                 ts_version: None,
                 modio_file_id: Some(primary),
+                file_name,
             })
         }
     }
@@ -3938,7 +5414,7 @@ pub async fn check_staged_mod_updates(
     for chunk in mods_list.chunks(CONCURRENCY) {
         let futs: Vec<_> = chunk
             .iter()
-            .map(|m| detect_update_for_staged(&state, m))
+            .map(|m| detect_update_for_staged(&state, &game_id, m))
             .collect();
         let results = futures_util::future::join_all(futs).await;
         for upd in results.into_iter().flatten() {
@@ -3962,7 +5438,7 @@ pub async fn update_staged_mod(
         .find(|m| m.id == staged_id)
         .cloned()
         .ok_or_else(|| format!("Staged mod not found: {staged_id}"))?;
-    let update = detect_update_for_staged(&state, &staged)
+    let update = detect_update_for_staged(&state, &game_id, &staged)
         .await
         .ok_or_else(|| "No update available for this mod".to_string())?;
 
@@ -3992,6 +5468,7 @@ pub async fn update_staged_mod(
                 None,
                 None,
                 Some(staged.id.clone()),
+                update.file_name.clone(),
             )
             .await
         }
@@ -4316,6 +5793,7 @@ pub async fn import_share_code(
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     {
@@ -4417,10 +5895,15 @@ pub async fn import_share_code(
                     resolved_file
                 ));
                 {
-                    let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
-                    downloads.insert(
-                        0,
-                        DownloadItem::new(dl_id.clone(), label.clone(), "downloading", None),
+                    push_download(
+                        &state,
+                        DownloadItem::new(
+                            dl_id.clone(),
+                            label.clone(),
+                            "downloading",
+                            None,
+                            modio_page(&game_id, gid, mid),
+                        ),
                     );
                 }
                 let _ = app.emit("downloads-changed", ());
@@ -4432,7 +5915,17 @@ pub async fn import_share_code(
                     Ok(()) => {
                         update_download(&state, &dl_id, "extracting", None);
                         let _ = app.emit("downloads-changed", ());
-                        let staged = mods::stage_modio_mod(
+                        let modio_label = modio_file_label(
+                            &client,
+                            gid,
+                            mid,
+                            resolved_file,
+                            detail.primary_file_id,
+                            &detail.name,
+                        )
+                        .await;
+                        assign_download_file_name(&state, &dl_id, modio_label.as_deref());
+                        match mods::stage_modio_mod(
                             &state.paths,
                             &game_id,
                             gid,
@@ -4440,27 +5933,33 @@ pub async fn import_share_code(
                             resolved_file,
                             &detail.name,
                             entry.version.clone(),
+                            modio_label,
+                            detail.picture_url.clone(),
                             &dest,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        member_ids.push(staged.id);
-                        if let Ok(mut downloads) = state.downloads.lock() {
-                            if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                                d.status = "done".into();
+                        ) {
+                            Ok(staged) => {
+                                member_ids.push(staged.id);
+                                update_download(&state, &dl_id, "done", None);
+                                remove_download_archive(&dest, &state.paths.downloads_dir());
+                                clear_download_job(&state, &dl_id);
+                                let _ = app.emit("downloads-changed", ());
+                            }
+                            Err(e) => {
+                                modio_failures += 1;
+                                let msg = e.to_string();
+                                remove_download_archive(&dest, &state.paths.downloads_dir());
+                                update_download(&state, &dl_id, "failed", Some(msg.clone()));
+                                clear_download_job(&state, &dl_id);
+                                let _ = app.emit("downloads-changed", ());
+                                warnings.push(format!("{label}: {msg}"));
                             }
                         }
-                        clear_download_job(&state, &dl_id);
-                        let _ = app.emit("downloads-changed", ());
                     }
                     Err(e) => {
                         modio_failures += 1;
                         let msg = e.to_string();
-                        if let Ok(mut downloads) = state.downloads.lock() {
-                            if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                                d.status = "failed".into();
-                                d.error = Some(msg.clone());
-                            }
-                        }
+                        remove_download_archive(&dest, &state.paths.downloads_dir());
+                        update_download(&state, &dl_id, "failed", Some(msg.clone()));
                         clear_download_job(&state, &dl_id);
                         let _ = app.emit("downloads-changed", ());
                         warnings.push(format!("{label}: {msg}"));
@@ -4868,6 +6367,38 @@ pub async fn deploy_mods(
             .ok_or_else(|| "Managed game not found".to_string())?
     };
     let repair_warnings = repair_damaged_staging(&app, &state, &game_id).await;
+    let mut loader_warnings = if games::is_fromsoft_plugin(&game.plugin_id) {
+        let nexus = state.client().ok();
+        let premium = state.is_premium();
+        match games::ensure_fromsoft_loaders(
+            &state.paths,
+            &game.plugin_id,
+            Path::new(&game.install_path),
+            nexus.as_ref(),
+            premium,
+        )
+        .await
+        {
+            games::EnsureLoadersOutcome::Done(w) => w,
+            games::EnsureLoadersOutcome::NeedsAssist { warnings, request } => {
+                let mut w = warnings;
+                if let Err(e) =
+                    wait_for_legacy_loader_assist(&app, &state, &game_id, &request).await
+                {
+                    w.push(e);
+                } else if let Ok(extra) = games::finish_legacy_after_assist(
+                    &state.paths,
+                    &request.plugin_id,
+                    &request.install_path,
+                ) {
+                    w.extend(extra);
+                }
+                w
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let mut result = mods::deploy(
         &state.paths,
         &game_id,
@@ -4876,8 +6407,71 @@ pub async fn deploy_mods(
         game.project_name.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+    result.warnings.splice(0..0, loader_warnings.drain(..));
     result.warnings.splice(0..0, repair_warnings);
+    if !result.plugin_skips.is_empty() {
+        if let Ok(order) = mods::load_loadorder(&state.paths, &game_id) {
+            let mut owners: Vec<StagedMod> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for skip in &result.plugin_skips {
+                for staged in &order.mods {
+                    if !staged.enabled
+                        || staged.source != ModSource::Nexus
+                        || staged.nexus_mod_id == 0
+                        || seen.contains(&staged.id)
+                    {
+                        continue;
+                    }
+                    if staging_contains_filename(Path::new(&staged.staging_path), &skip.plugin) {
+                        seen.insert(staged.id.clone());
+                        owners.push(staged.clone());
+                    }
+                }
+            }
+            let seeds = owners.iter().filter_map(seed_from_staged).collect();
+            result.missing_requirements =
+                collect_requirement_seeds(&state, seeds, staged_nexus_keys(&order.mods)).await;
+        }
+    }
     Ok(result)
+}
+
+async fn wait_for_legacy_loader_assist(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    game_id: &str,
+    request: &games::LegacyAssistRequest,
+) -> Result<(), String> {
+    crate::assist::open_download_assist_inner(
+        app,
+        state,
+        game_id.to_string(),
+        request.domain.clone(),
+        request.mod_id,
+        request.file_id,
+        request.label.clone(),
+        None,
+        None,
+        None,
+        None,
+        crate::assist::AssistPurpose::FromsoftLegacyLoader {
+            plugin_id: request.plugin_id.clone(),
+            install_path: request.install_path.display().to_string(),
+        },
+    )
+    .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < deadline {
+        if games::legacy_loader_ready(&state.paths, &request.plugin_id, &request.install_path) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(
+        "Timed out waiting for Mod Engine Download Assist (180s). Complete the download in Assist and deploy again."
+            .into(),
+    )
 }
 
 #[tauri::command]
@@ -4926,6 +6520,8 @@ pub fn clear_recent_downloads(state: State<'_, AppState>, ids: Vec<String>) -> R
     }
     let mut downloads = state.downloads.lock().map_err(|e| e.to_string())?;
     downloads.retain(|d| !removed_ids.iter().any(|id| id == &d.id));
+    drop(downloads);
+    commit_recent_downloads(&state);
     Ok(())
 }
 
@@ -4938,8 +6534,10 @@ pub fn remove_download(state: State<'_, AppState>, id: String) -> Result<(), Str
         }
     }
     downloads.retain(|d| d.id != id);
+    drop(downloads);
     clear_restart_meta(&state, &id);
     clear_download_job(&state, &id);
+    commit_recent_downloads(&state);
     Ok(())
 }
 
@@ -5046,55 +6644,14 @@ pub fn resume_download(
         let job = jobs
             .get_mut(&id)
             .ok_or_else(|| "Download job not found".to_string())?;
-        let source = job
-            .source
-            .as_ref()
-            .ok_or_else(|| "Missing resume metadata for this download".to_string())?;
-        // Clone source fields without moving enum yet — we'll take ownership below.
-        let source = match source {
-            DownloadResumeSource::Api {
-                game_id,
-                domain,
-                mod_id,
-                file_id,
-                label,
-                version,
-                nxm_key,
-                nxm_expires,
-                replace_staged_id,
-            } => DownloadResumeSource::Api {
-                game_id: game_id.clone(),
-                domain: domain.clone(),
-                mod_id: *mod_id,
-                file_id: *file_id,
-                label: label.clone(),
-                version: version.clone(),
-                nxm_key: nxm_key.clone(),
-                nxm_expires: *nxm_expires,
-                replace_staged_id: replace_staged_id.clone(),
-            },
-            DownloadResumeSource::Cdn {
-                url,
-                cookie_header,
-                game_id,
-                domain,
-                mod_id,
-                file_id,
-                label,
-                replace_staged_id,
-            } => DownloadResumeSource::Cdn {
-                url: url.clone(),
-                cookie_header: cookie_header.clone(),
-                game_id: game_id.clone(),
-                domain: domain.clone(),
-                mod_id: *mod_id,
-                file_id: *file_id,
-                label: label.clone(),
-                replace_staged_id: replace_staged_id.clone(),
-            },
-            DownloadResumeSource::Thunderstore { .. } | DownloadResumeSource::Modio { .. } => {
+        let source = match job.source.as_ref() {
+            Some(
+                DownloadResumeSource::Thunderstore { .. } | DownloadResumeSource::Modio { .. },
+            ) => {
                 return Err("Cannot resume this download — use Restart instead.".into());
             }
+            Some(source) => source.clone(),
+            None => return Err("Missing resume metadata for this download".to_string()),
         };
         let dest = job
             .dest
@@ -5135,6 +6692,7 @@ pub fn resume_download(
                 nxm_key,
                 nxm_expires,
                 replace_staged_id,
+                file_name,
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
@@ -5152,6 +6710,7 @@ pub fn resume_download(
                     Some(queued_id.clone()),
                     batch_id,
                     replace_staged_id,
+                    file_name,
                 )
                 .await;
                 (res, label_clone, game_id_clone)
@@ -5164,7 +6723,9 @@ pub fn resume_download(
                 mod_id,
                 file_id,
                 label,
+                version,
                 replace_staged_id,
+                file_name,
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
@@ -5180,7 +6741,9 @@ pub fn resume_download(
                     file_id,
                     &queued_id,
                     batch_id,
+                    version,
                     replace_staged_id,
+                    file_name,
                 )
                 .await;
                 (res, label_clone, game_id_clone)
@@ -5366,7 +6929,17 @@ async fn run_modio_download_restart(
         Ok(()) => {
             update_download(state, dl_id, "extracting", None);
             let _ = app.emit("downloads-changed", ());
-            let staged = mods::stage_modio_mod(
+            let modio_label = modio_file_label(
+                &client,
+                modio_game_id,
+                mod_id,
+                file_id,
+                Some(file_id),
+                label,
+            )
+            .await;
+            assign_download_file_name(state, dl_id, modio_label.as_deref());
+            match mods::stage_modio_mod(
                 &state.paths,
                 game_id,
                 modio_game_id,
@@ -5374,26 +6947,31 @@ async fn run_modio_download_restart(
                 file_id,
                 label,
                 version,
+                modio_label,
+                None,
                 &dest,
-            )
-            .map_err(|e| e.to_string())?;
-            if let Ok(mut downloads) = state.downloads.lock() {
-                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                    d.status = "done".into();
+            ) {
+                Ok(staged) => {
+                    update_download(state, dl_id, "done", None);
+                    remove_download_archive(&dest, &state.paths.downloads_dir());
+                    finish_download_success(state, dl_id);
+                    let _ = app.emit("downloads-changed", ());
+                    Ok(staged)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    remove_download_archive(&dest, &state.paths.downloads_dir());
+                    update_download(state, dl_id, "failed", Some(msg.clone()));
+                    clear_download_job(state, dl_id);
+                    let _ = app.emit("downloads-changed", ());
+                    Err(msg)
                 }
             }
-            finish_download_success(state, dl_id);
-            let _ = app.emit("downloads-changed", ());
-            Ok(staged)
         }
         Err(e) => {
             let msg = e.to_string();
-            if let Ok(mut downloads) = state.downloads.lock() {
-                if let Some(d) = downloads.iter_mut().find(|d| d.id == dl_id) {
-                    d.status = "failed".into();
-                    d.error = Some(msg.clone());
-                }
-            }
+            remove_download_archive(&dest, &state.paths.downloads_dir());
+            update_download(state, dl_id, "failed", Some(msg.clone()));
             clear_download_job(state, dl_id);
             let _ = app.emit("downloads-changed", ());
             Err(msg)
@@ -5443,6 +7021,7 @@ pub fn restart_download(
                 label,
                 version,
                 replace_staged_id,
+                file_name,
                 ..
             } => {
                 let label_clone = label.clone();
@@ -5466,6 +7045,7 @@ pub fn restart_download(
                     Some(queued_id.clone()),
                     batch_id,
                     replace_staged_id,
+                    file_name,
                 )
                 .await;
                 (res, label_clone, game_id_clone)
@@ -5478,7 +7058,9 @@ pub fn restart_download(
                 mod_id,
                 file_id,
                 label,
+                version,
                 replace_staged_id,
+                file_name,
             } => {
                 let label_clone = label.clone();
                 let game_id_clone = game_id.clone();
@@ -5499,7 +7081,9 @@ pub fn restart_download(
                     file_id,
                     &queued_id,
                     batch_id,
+                    version,
                     replace_staged_id,
+                    file_name,
                 )
                 .await;
                 (res, label_clone, game_id_clone)
@@ -5629,6 +7213,78 @@ mod download_naming_tests {
 }
 
 #[cfg(test)]
+mod download_cache_cleanup_tests {
+    use super::{clear_download_cache_dir, path_is_under_downloads, remove_download_archive};
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_downloads() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        (tmp, downloads)
+    }
+
+    #[test]
+    fn path_under_downloads_accepts_nested_files() {
+        let (_tmp, downloads) = temp_downloads();
+        let archive = downloads.join("ts_abc_mod.zip");
+        fs::write(&archive, b"zip").unwrap();
+        assert!(path_is_under_downloads(&archive, &downloads));
+    }
+
+    #[test]
+    fn path_under_downloads_rejects_outside_paths() {
+        let (_tmp, downloads) = temp_downloads();
+        let outside = _tmp.path().join("elsewhere.zip");
+        fs::write(&outside, b"zip").unwrap();
+        assert!(!path_is_under_downloads(&outside, &downloads));
+    }
+
+    #[test]
+    fn remove_download_archive_only_deletes_under_cache() {
+        let (_tmp, downloads) = temp_downloads();
+        let inside = downloads.join("keep-me-not.zip");
+        let outside = _tmp.path().join("user-import.zip");
+        fs::write(&inside, b"a").unwrap();
+        fs::write(&outside, b"b").unwrap();
+
+        remove_download_archive(&inside, &downloads);
+        remove_download_archive(&outside, &downloads);
+
+        assert!(!inside.exists());
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn clear_download_cache_skips_protected_active_dest() {
+        let (_tmp, downloads) = temp_downloads();
+        let stale = downloads.join("stale.zip");
+        let active = downloads.join("active.zip");
+        fs::write(&stale, b"aaaa").unwrap();
+        fs::write(&active, b"bbbbbbbb").unwrap();
+
+        let mut protected = HashSet::new();
+        protected.insert(active.clone());
+
+        let result = clear_download_cache_dir(&downloads, &protected).unwrap();
+        assert_eq!(result.files_removed, 1);
+        assert_eq!(result.bytes_freed, 4);
+        assert!(!stale.exists());
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn clear_download_cache_empty_dir_is_noop() {
+        let (_tmp, downloads) = temp_downloads();
+        let result = clear_download_cache_dir(&downloads, &HashSet::new()).unwrap();
+        assert_eq!(result.files_removed, 0);
+        assert_eq!(result.bytes_freed, 0);
+    }
+}
+
+#[cfg(test)]
 mod catalog_filter_tests {
     use super::catalog_source_unavailable_error;
 
@@ -5657,5 +7313,37 @@ mod catalog_filter_tests {
         let msg = catalog_source_unavailable_error("thunderstore", true, false, false, true);
         assert!(msg.contains("Thunderstore filter"), "{msg}");
         assert!(msg.contains("Nexus"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod recent_download_limit_tests {
+    use super::{trim_finished_downloads, DownloadItem};
+
+    fn row(id: &str, status: &str) -> DownloadItem {
+        DownloadItem::new(id.into(), id.into(), status, None, None)
+    }
+
+    #[test]
+    fn limit_drops_oldest_finished_and_keeps_active() {
+        let mut q = vec![
+            row("new-done", "done"),
+            row("active", "downloading"),
+            row("mid", "failed"),
+            row("paused", "paused"),
+            row("old", "cancelled"),
+        ];
+        trim_finished_downloads(&mut q, 2);
+        let ids: Vec<_> = q.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["new-done", "active", "mid", "paused"]);
+    }
+
+    #[test]
+    fn shorter_list_is_left_untouched() {
+        let mut q = vec![row("a", "done"), row("b", "downloading")];
+        trim_finished_downloads(&mut q, 5);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].id, "a");
+        assert_eq!(q[1].status, "downloading");
     }
 }

@@ -112,8 +112,13 @@ mod tests {
     #[test]
     fn warns_when_eac_present() {
         let empty = tempfile::tempdir().unwrap();
-        assert!(SevenDaysToDiePlugin.preflight_warnings(empty.path()).is_empty());
+        assert!(SevenDaysToDiePlugin
+            .preflight_warnings(empty.path())
+            .is_empty());
         std::fs::create_dir_all(empty.path().join("EasyAntiCheat")).unwrap();
-        assert_eq!(SevenDaysToDiePlugin.preflight_warnings(empty.path()).len(), 1);
+        assert_eq!(
+            SevenDaysToDiePlugin.preflight_warnings(empty.path()).len(),
+            1
+        );
     }
 }

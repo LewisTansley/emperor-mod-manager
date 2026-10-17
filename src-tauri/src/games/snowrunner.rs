@@ -45,10 +45,7 @@ fn client_paks_dir(install_path: &Path) -> PathBuf {
     if en_us.is_dir() || install_path.join("en_us").join("preload").is_dir() {
         return en_us;
     }
-    install_path
-        .join("preload")
-        .join("paks")
-        .join("client")
+    install_path.join("preload").join("paks").join("client")
 }
 
 fn resolve_snowrunner_deploy(install_path: &Path, relative: &Path) -> PathBuf {
@@ -90,10 +87,7 @@ mod tests {
         let dest = SnowRunnerPlugin
             .resolve_deploy_root(Path::new("/game"), Path::new("Cool.pak"))
             .unwrap();
-        assert_eq!(
-            dest,
-            PathBuf::from("/game/preload/paks/client/Cool.pak")
-        );
+        assert_eq!(dest, PathBuf::from("/game/preload/paks/client/Cool.pak"));
     }
 
     #[test]
@@ -104,10 +98,7 @@ mod tests {
                 Path::new("preload/paks/client/Cool.pak"),
             )
             .unwrap();
-        assert_eq!(
-            dest,
-            PathBuf::from("/game/preload/paks/client/Cool.pak")
-        );
+        assert_eq!(dest, PathBuf::from("/game/preload/paks/client/Cool.pak"));
     }
 
     #[test]

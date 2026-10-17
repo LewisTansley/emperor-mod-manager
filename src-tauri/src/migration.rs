@@ -145,13 +145,13 @@ pub fn remove_game_from_legacy_config(game_id: &str) -> Result<()> {
         return Ok(());
     }
     let raw = fs::read_to_string(&file).context("reading legacy config.toml")?;
-    let mut legacy: AppConfig =
-        toml::from_str(&raw).context("parsing legacy config.toml")?;
+    let mut legacy: AppConfig = toml::from_str(&raw).context("parsing legacy config.toml")?;
     let before = legacy.managed_games.len();
     legacy.managed_games.retain(|g| g.id != game_id);
     if legacy.managed_games.len() != before {
         let out = toml::to_string_pretty(&legacy).context("serializing legacy config")?;
-        fs::write(&file, out).with_context(|| format!("writing legacy config {}", file.display()))?;
+        fs::write(&file, out)
+            .with_context(|| format!("writing legacy config {}", file.display()))?;
     }
     Ok(())
 }
@@ -285,7 +285,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rewrite_staging_paths(&paths, game_id, &legacy_game).unwrap(), 1);
+        assert_eq!(
+            rewrite_staging_paths(&paths, game_id, &legacy_game).unwrap(),
+            1
+        );
         let recovered = mods::load_loadorder(&paths, game_id).unwrap();
         assert_eq!(
             recovered.mods[0].staging_path,

@@ -11,6 +11,8 @@ export type AssistQueueEntry = {
   version?: string | null;
   /** When set, staging replaces this existing staged mod (e.g. free-account update). */
   replaceStagedId?: string | null;
+  /** File chooser title or archive name, when it differs from the mod title. */
+  fileName?: string | null;
 };
 
 export type AssistQueueState = {
@@ -54,6 +56,7 @@ export function createQueueEntry(
   name: string,
   version?: string | null,
   replaceStagedId?: string | null,
+  fileName?: string | null,
 ): AssistQueueEntry {
   return {
     id: crypto.randomUUID(),
@@ -64,6 +67,7 @@ export function createQueueEntry(
     name,
     version,
     replaceStagedId: replaceStagedId ?? null,
+    fileName: fileName ?? null,
   };
 }
 
@@ -154,6 +158,7 @@ type DownloadsWorkspaceProps = {
   onRetryAssistOpening: () => void;
   isDownloadStuck: (id: string, status: string) => boolean;
   onClearRecent: (ids: string[]) => void;
+  onOpenRecent: (item: DownloadItem) => void;
   onRemoveDownload: (id: string) => void;
   onPauseDownload: (id: string) => void;
   onResumeDownload: (id: string) => void;
@@ -177,6 +182,7 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
     onRetryAssistOpening,
     isDownloadStuck,
     onClearRecent,
+    onOpenRecent,
     onRemoveDownload,
     onPauseDownload,
     onResumeDownload,
@@ -271,6 +277,7 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                   <div className="downloads-active-row">
                     <div className="downloads-active-meta">
                       <strong>{d.label}</strong>
+                      {d.file_name ? <small>{d.file_name}</small> : null}
                       <small>
                         {statusLabel(d.status)}
                         {pct != null ? ` · ${pct}%` : ""}
@@ -352,45 +359,69 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                 </button>
               </div>
               <ul className="list downloads-recent">
-                {recentDownloads.slice(0, 8).map((d) => (
-                  <li key={d.id}>
-                    <div>
+                {recentDownloads.map((d) => {
+                  const openable = d.page != null;
+                  const identity = (
+                    <>
                       <strong>{d.label}</strong>
+                      {d.file_name ? <small>{d.file_name}</small> : null}
                       <small>
                         {statusLabel(d.status)}
                         {d.error ? ` · ${d.error}` : ""}
                       </small>
-                    </div>
-                    <div className="downloads-recent-actions">
-                      {d.status === "failed" && d.can_restart ? (
+                    </>
+                  );
+                  return (
+                    <li key={d.id}>
+                      {openable ? (
+                        <div
+                          className="downloads-recent-page"
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => onOpenRecent(d)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              onOpenRecent(d);
+                            }
+                          }}
+                        >
+                          {identity}
+                        </div>
+                      ) : (
+                        <div>{identity}</div>
+                      )}
+                      <div className="downloads-recent-actions">
+                        {d.status === "failed" && d.can_restart ? (
+                          <button
+                            type="button"
+                            className="downloads-control-one"
+                            onClick={() => onRestartDownload(d.id)}
+                          >
+                            Retry
+                          </button>
+                        ) : null}
+                        {d.status === "failed" && !d.can_restart ? (
+                          <button
+                            type="button"
+                            className="downloads-control-one"
+                            onClick={() => onForceResetDownload(d.id)}
+                          >
+                            Dismiss
+                          </button>
+                        ) : null}
                         <button
                           type="button"
-                          className="downloads-control-one"
-                          onClick={() => onRestartDownload(d.id)}
+                          className="downloads-recent-remove"
+                          onClick={() => onRemoveDownload(d.id)}
+                          aria-label={`Remove ${d.label}`}
                         >
-                          Retry
+                          Remove
                         </button>
-                      ) : null}
-                      {d.status === "failed" && !d.can_restart ? (
-                        <button
-                          type="button"
-                          className="downloads-control-one"
-                          onClick={() => onForceResetDownload(d.id)}
-                        >
-                          Dismiss
-                        </button>
-                      ) : null}
-                      <button
-                        type="button"
-                        className="downloads-recent-remove"
-                        onClick={() => onRemoveDownload(d.id)}
-                        aria-label={`Remove ${d.label}`}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  </li>
-                ))}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </>
           )}
@@ -402,17 +433,19 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
               <h2>Download Assist</h2>
               {current ? <span className="pill">{current.name}</span> : null}
             </div>
-            <div
-              ref={hostRef}
-              className={assistActive ? "downloads-assist-host active" : "downloads-assist-host"}
-            >
-              {!assistActive && (
-                <p className="note downloads-assist-placeholder">
-                  {current
-                    ? "Assist panel will appear here when a free download is queued."
-                    : "Install a mod to start a download, or queue collection mods below."}
-                </p>
-              )}
+            <div className="downloads-assist-frame">
+              <div
+                ref={hostRef}
+                className={assistActive ? "downloads-assist-host active" : "downloads-assist-host"}
+              >
+                {!assistActive && (
+                  <p className="note downloads-assist-placeholder">
+                    {current
+                      ? "Assist panel will appear here when a free download is queued."
+                      : "Install a mod to start a download, or queue collection mods below."}
+                  </p>
+                )}
+              </div>
             </div>
             {assistHint ? <p className="note downloads-assist-hint">{assistHint}</p> : null}
           </div>
