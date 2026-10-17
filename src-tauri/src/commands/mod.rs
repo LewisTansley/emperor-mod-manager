@@ -119,6 +119,8 @@ pub struct AppState {
     pub assist_bounds: Mutex<AssistBounds>,
     /// Whether the assist webview should be shown (Downloads tab). Bounds/open must not force-show.
     pub assist_desired_visible: AtomicBool,
+    /// Nexus URL waiting until the Linux embed has a real, visible allocation.
+    pub assist_pending_url: Mutex<Option<String>>,
     /// Cached Nexus game metadata (categories, counts) keyed by domain.
     pub game_info_cache: Mutex<HashMap<String, GameInfo>>,
     /// Cached Thunderstore community package lists.
@@ -285,6 +287,7 @@ impl AppState {
             last_cdn_handled: Mutex::new(None),
             assist_bounds: Mutex::new(AssistBounds::default()),
             assist_desired_visible: AtomicBool::new(false),
+            assist_pending_url: Mutex::new(None),
             game_info_cache: Mutex::new(HashMap::new()),
             ts_package_cache: Mutex::new(HashMap::new()),
             nexus_games_cache: Mutex::new(None),
@@ -4282,6 +4285,9 @@ pub async fn start_assist_cdn_download(
             install_path,
         } => Some((plugin_id.clone(), install_path.clone())),
         crate::assist::AssistPurpose::StageMod => None,
+        crate::assist::AssistPurpose::WebsiteLogin => {
+            return Err("Nexus website login is not a download".into());
+        }
     };
 
     let parsed = url::Url::parse(cdn_url).map_err(|e| e.to_string())?;

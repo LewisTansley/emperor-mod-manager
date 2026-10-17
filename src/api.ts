@@ -295,6 +295,7 @@ export const api = {
   setAssistVisible: (visible: boolean) =>
     invoke<void>("set_assist_visible", { visible }),
   closeDownloadAssist: () => invoke<void>("close_download_assist"),
+  openNexusWebsiteLogin: () => invoke<void>("open_nexus_website_login"),
   clearAssistSession: () => invoke<void>("clear_assist_session"),
   collectionFiles: (args: { slug: string; revision?: number | null }) =>
     invoke<CollectionModFile[]>("collection_files", {

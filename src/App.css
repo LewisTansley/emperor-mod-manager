@@ -739,6 +739,28 @@ button.tag-picker-trigger[aria-expanded="true"] {
   align-items: center;
 }
 
+.modal.modal-nexus-login {
+  width: min(64rem, calc(100vw - 3rem));
+  height: min(44rem, calc(100vh - 3rem));
+}
+
+.modal.modal-nexus-login .modal-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.nexus-login-host {
+  flex: 1;
+  min-height: min(40rem, calc(100vh - 6rem));
+  border: 1px dashed var(--line);
+  border-radius: 0.55rem;
+  background: var(--panel);
+  overflow: hidden;
+}
+
 .mod-option-list,
 .mod-suboption-list {
   list-style: none;

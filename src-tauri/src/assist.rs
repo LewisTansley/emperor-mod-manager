@@ -1,7 +1,8 @@
 //! Visible Nexus download-assist WebView (free-account path).
 
 use std::fs;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -592,6 +593,8 @@ pub enum AssistPurpose {
         plugin_id: String,
         install_path: String,
     },
+    /// Sign in on the Nexus website so later downloads reuse the session cookie.
+    WebsiteLogin,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -648,6 +651,7 @@ pub fn emit_nxm_url(app: &tauri::AppHandle, url: &str) {
 }
 
 pub fn close_assist_webview(app: &tauri::AppHandle) -> Result<(), String> {
+    clear_pending_assist_url(app);
     if let Some(w) = app.get_webview(ASSIST_LABEL) {
         w.close().map_err(|e| e.to_string())?;
     }
@@ -676,6 +680,36 @@ fn stored_bounds(state: &AppState) -> AssistBounds {
         .ok()
         .map(|g| *g)
         .unwrap_or_default()
+}
+
+fn clear_pending_assist_url(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut pending) = state.assist_pending_url.lock() {
+            *pending = None;
+        }
+    }
+}
+
+fn store_pending_assist_url(state: &AppState, url: &url::Url) {
+    if let Ok(mut pending) = state.assist_pending_url.lock() {
+        *pending = Some(url.to_string());
+    }
+}
+
+fn flush_pending_assist_navigation(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let raw = state
+        .assist_pending_url
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let url = url::Url::parse(&raw).map_err(|e| e.to_string())?;
+    if let Some(webview) = app.get_webview(ASSIST_LABEL) {
+        webview.navigate(url).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn apply_assist_bounds(
@@ -749,6 +783,102 @@ fn is_nexus_login_url(url: &str) -> bool {
         return false;
     }
     u.contains("/auth/") || u.contains("sign-in") || u.contains("signin") || u.contains("/login")
+}
+
+fn has_nexus_session_cookie(cookie_names: &[String]) -> bool {
+    cookie_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("nexusmods_session"))
+}
+
+/// Logged-in Nexus page with the website session cookie Download Assist reuses.
+fn nexus_website_login_succeeded(url: &str, cookie_names: &[String]) -> bool {
+    url.to_ascii_lowercase().contains("nexusmods.com")
+        && !is_nexus_login_url(url)
+        && has_nexus_session_cookie(cookie_names)
+}
+
+fn nexus_sign_in_url() -> Result<url::Url, String> {
+    "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F"
+        .parse()
+        .map_err(|e: url::ParseError| e.to_string())
+}
+
+fn download_assist_in_use(state: &AppState) -> bool {
+    matches!(
+        peek_assist_context(state).as_ref().map(|c| &c.purpose),
+        Some(AssistPurpose::StageMod) | Some(AssistPurpose::FromsoftLegacyLoader { .. })
+    )
+}
+
+fn intercept_login_navigation(nav_url: &url::Url) -> bool {
+    let s = nav_url.as_str();
+    if s.starts_with("nxm://") || is_nexus_cdn_download(nav_url) {
+        return false;
+    }
+    nav_url.host_str() != Some(NXM_SENTINEL_HOST)
+}
+
+fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        let still = peek_assist_context(&state).is_some_and(|c| {
+            c.generation == generation && matches!(c.purpose, AssistPurpose::WebsiteLogin)
+        });
+        if !still {
+            return;
+        }
+        let _ = app.emit("nexus-login-complete", ());
+        let _ = close_assist_intentionally(&app, &state);
+    });
+}
+
+fn poll_nexus_login_cookie(app: tauri::AppHandle, generation: u64, done: Arc<AtomicBool>) {
+    tauri::async_runtime::spawn(async move {
+        let Ok(cookie_url) = url::Url::parse("https://www.nexusmods.com/") else {
+            return;
+        };
+        for _ in 0..12 {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            let still = peek_assist_context(&state).is_some_and(|c| {
+                c.generation == generation && matches!(c.purpose, AssistPurpose::WebsiteLogin)
+            });
+            if !still {
+                return;
+            }
+            let Some(webview) = app.get_webview(ASSIST_LABEL) else {
+                return;
+            };
+            let Ok(current) = webview.url() else {
+                continue;
+            };
+            let Ok(cookies) = webview.cookies_for_url(cookie_url.clone()) else {
+                continue;
+            };
+            let names = cookies
+                .iter()
+                .map(|cookie| cookie.name().to_string())
+                .collect::<Vec<_>>();
+            if nexus_website_login_succeeded(current.as_str(), &names)
+                && !done.swap(true, Ordering::SeqCst)
+            {
+                schedule_nexus_login_close(app, generation);
+                return;
+            }
+        }
+    });
 }
 
 fn emit_assist_opened(
@@ -949,10 +1079,13 @@ fn apply_assist_desired_visible(app: &tauri::AppHandle, state: &AppState) -> Res
         target_os = "openbsd"
     ))]
     {
-        // The overlay parks its event box off-screen. Unmapping the WebKit
-        // widget itself leaves it blank the next time Downloads is shown.
+        // Opacity and pass-through hide the overlay child. Unmapping WebKit
+        // leaves the next show blank, and a 1×1 first allocation sticks.
         if let Ok(window) = main_window(app) {
             crate::linux_embed::set_visible(&window, visible)?;
+        }
+        if visible {
+            flush_pending_assist_navigation(app, state)?;
         }
     }
     #[cfg(not(any(
@@ -1224,16 +1357,6 @@ pub async fn open_download_assist_inner(
         )
         .map_err(|e| e.to_string())?;
 
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
-    crate::linux_embed::attach_assist(&window, bounds)?;
-
-    apply_assist_bounds(app, &webview, bounds)?;
     // Loader installs run mid-deploy: force the panel visible. Normal assist still
     // respects the Downloads-tab desired-visible flag.
     if matches!(
@@ -1242,7 +1365,6 @@ pub async fn open_download_assist_inner(
     ) {
         state.assist_desired_visible.store(true, Ordering::SeqCst);
     }
-    apply_assist_desired_visible(app, state)?;
 
     #[cfg(any(
         target_os = "linux",
@@ -1251,7 +1373,23 @@ pub async fn open_download_assist_inner(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    webview.navigate(parsed).map_err(|e| e.to_string())?;
+    crate::linux_embed::attach_assist(
+        &window,
+        bounds,
+        state.assist_desired_visible.load(Ordering::SeqCst),
+    )?;
+
+    apply_assist_bounds(app, &webview, bounds)?;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    store_pending_assist_url(state, &parsed);
+    // Flushes the pending URL when Downloads already wants the panel visible.
+    apply_assist_desired_visible(app, state)?;
 
     emit_assist_opened(app, autoclick, &domain, mod_id, file_id);
     Ok(())
@@ -1263,6 +1401,178 @@ pub fn close_download_assist(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     close_assist_intentionally(&app, &state)
+}
+
+/// Open the Nexus sign-in page in the Download Assist profile.
+///
+/// The WebKit data directory is the same one later downloads read cookies from.
+/// The webview closes after `nexusmods_session` is stored.
+#[tauri::command]
+pub async fn open_nexus_website_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if download_assist_in_use(&state) {
+        return Err(
+            "Download Assist is in use. Finish or cancel the queue before signing in.".into(),
+        );
+    }
+
+    if app.get_webview(ASSIST_LABEL).is_some() {
+        let gen = peek_assist_context(&state)
+            .map(|c| c.generation)
+            .unwrap_or_else(|| state.assist_window_gen.load(Ordering::SeqCst));
+        state.assist_closed_gen.store(gen, Ordering::SeqCst);
+        let _ = take_assist_context(&state);
+        let _ = close_assist_webview(&app);
+        wait_assist_webview_gone(&app).await;
+    }
+
+    let generation = state.assist_window_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let bounds = stored_bounds(&state);
+    set_assist_context(
+        &state,
+        AssistContext {
+            game_id: String::new(),
+            label: "Nexus sign-in".into(),
+            domain: String::new(),
+            mod_id: 0,
+            file_id: 0,
+            generation,
+            batch_id: None,
+            replace_staged_id: None,
+            version: None,
+            file_name: None,
+            purpose: AssistPurpose::WebsiteLogin,
+        },
+    );
+
+    let parsed = nexus_sign_in_url()?;
+    let assist_dir = state.paths.assist_webview_dir();
+    fs::create_dir_all(&assist_dir).map_err(|e| e.to_string())?;
+    let window = main_window(&app)?;
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    let initial_url = WebviewUrl::External(
+        "about:blank"
+            .parse()
+            .map_err(|e: url::ParseError| e.to_string())?,
+    );
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    let initial_url = WebviewUrl::External(parsed.clone());
+
+    let mut builder = WebviewBuilder::new(ASSIST_LABEL, initial_url)
+        .data_directory(assist_dir)
+        .on_navigation(|nav_url| intercept_login_navigation(nav_url));
+
+    let handle_new = app.clone();
+    builder = builder.on_new_window(move |url, _features| {
+        if let Some(webview) = handle_new.get_webview(ASSIST_LABEL) {
+            let _ = webview.navigate(url);
+        }
+        NewWindowResponse::Deny
+    });
+
+    builder = builder.on_download(|_webview, _event| false);
+
+    let handle_load = app.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    builder = builder.on_page_load(move |webview, payload| {
+        if payload.event() != PageLoadEvent::Finished {
+            return;
+        }
+        let href = payload.url().as_str().to_string();
+        if is_nexus_login_url(&href) || !href.to_ascii_lowercase().contains("nexusmods.com") {
+            return;
+        }
+        let Ok(cookie_url) = url::Url::parse("https://www.nexusmods.com/") else {
+            return;
+        };
+        let names = webview
+            .cookies_for_url(cookie_url)
+            .map(|cookies| {
+                cookies
+                    .iter()
+                    .map(|cookie| cookie.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if nexus_website_login_succeeded(&href, &names) {
+            if !done.swap(true, Ordering::SeqCst) {
+                schedule_nexus_login_close(handle_load.clone(), generation);
+            }
+            return;
+        }
+        poll_nexus_login_cookie(handle_load.clone(), generation, done.clone());
+    });
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        crate::linux_embed::prepare(&window)?;
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
+    let webview = match window.add_child(
+        builder,
+        LogicalPosition::new(bounds.x, bounds.y),
+        LogicalSize::new(bounds.width, bounds.height),
+    ) {
+        Ok(webview) => webview,
+        Err(e) => {
+            let _ = take_assist_context(&state);
+            return Err(e.to_string());
+        }
+    };
+
+    state.assist_desired_visible.store(true, Ordering::SeqCst);
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, true) {
+        let _ = take_assist_context(&state);
+        let _ = close_assist_webview(&app);
+        return Err(e);
+    }
+
+    if let Err(e) = apply_assist_bounds(&app, &webview, bounds) {
+        let _ = take_assist_context(&state);
+        let _ = close_assist_webview(&app);
+        return Err(e);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    store_pending_assist_url(&state, &parsed);
+    apply_assist_desired_visible(&app, &state)?;
+    Ok(())
 }
 
 /// Close Download Assist and delete its WebKit profile (Nexus website cookies).
@@ -1389,5 +1699,30 @@ mod tests {
         assert!(matches!(AssistPurpose::default(), AssistPurpose::StageMod));
         let json = serde_json::to_string(&AssistPurpose::default()).unwrap();
         assert_eq!(json, "\"stage_mod\"");
+    }
+
+    #[test]
+    fn website_login_succeeds_only_after_leaving_sign_in() {
+        let session = vec!["nexusmods_session".to_string()];
+        assert!(!nexus_website_login_succeeded(
+            "https://users.nexusmods.com/auth/sign_in",
+            &session
+        ));
+        assert!(!nexus_website_login_succeeded(
+            "https://users.nexusmods.com/auth/two-factor",
+            &session
+        ));
+        assert!(!nexus_website_login_succeeded(
+            "https://www.nexusmods.com/",
+            &[]
+        ));
+        assert!(nexus_website_login_succeeded(
+            "https://www.nexusmods.com/",
+            &session
+        ));
+        assert!(!nexus_website_login_succeeded(
+            "https://accounts.google.com/",
+            &session
+        ));
     }
 }

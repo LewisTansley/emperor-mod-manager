@@ -7,12 +7,13 @@ const FOCUSABLE =
 type ModalProps = {
   title: string;
   subtitle?: string;
+  className?: string;
   onClose: () => void;
   children: React.ReactNode;
   footer?: React.ReactNode;
 };
 
-export function Modal({ title, subtitle, onClose, children, footer }: ModalProps) {
+export function Modal({ title, subtitle, className, onClose, children, footer }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   // Closing must not steal focus from wherever the user was before opening.
   const opener = useRef<HTMLElement | null>(null);
@@ -61,7 +62,7 @@ export function Modal({ title, subtitle, onClose, children, footer }: ModalProps
   return createPortal(
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div
-        className="modal"
+        className={className ? `modal ${className}` : "modal"}
         role="dialog"
         aria-modal="true"
         aria-label={title}

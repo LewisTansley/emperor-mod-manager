@@ -29,6 +29,7 @@ import {
 import { ImageCarousel } from "./ImageCarousel";
 import { RichText } from "./RichText";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
+import { Modal } from "./Modal";
 import { ModOptionsDialog } from "./ModOptionsDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
 import {
@@ -872,6 +873,56 @@ function hasActiveDownloads(list: DownloadItem[]): boolean {
   return list.some((d) => isActiveDownloadStatus(d.status));
 }
 
+function measureHostBounds(host: HTMLElement): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} | null {
+  const rect = host.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8) return null;
+  const cs = getComputedStyle(host);
+  const bl = parseFloat(cs.borderLeftWidth) || 0;
+  const bt = parseFloat(cs.borderTopWidth) || 0;
+  const br = parseFloat(cs.borderRightWidth) || 0;
+  const bb = parseFloat(cs.borderBottomWidth) || 0;
+
+  let left = rect.left + bl;
+  let top = rect.top + bt;
+  let right = rect.right - br;
+  let bottom = rect.bottom - bb;
+
+  const clipsOverflow = (value: string) =>
+    value === "hidden" || value === "clip" || value === "auto" || value === "scroll";
+
+  let ancestor: HTMLElement | null = host.parentElement;
+  while (ancestor) {
+    const style = getComputedStyle(ancestor);
+    if (
+      clipsOverflow(style.overflow) ||
+      clipsOverflow(style.overflowX) ||
+      clipsOverflow(style.overflowY)
+    ) {
+      const a = ancestor.getBoundingClientRect();
+      left = Math.max(left, a.left);
+      top = Math.max(top, a.top);
+      right = Math.min(right, a.right);
+      bottom = Math.min(bottom, a.bottom);
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  left = Math.max(left, 0);
+  top = Math.max(top, 0);
+  right = Math.min(right, window.innerWidth);
+  bottom = Math.min(bottom, window.innerHeight);
+
+  const width = Math.max(0, Math.floor(right - left));
+  const height = Math.max(0, Math.floor(bottom - top));
+  if (width < 8 || height < 8) return null;
+  return { x: Math.round(left), y: Math.round(top), width, height };
+}
+
 export default function App() {
   const [tab, setTabState] = useState<Tab>("setup");
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -1012,6 +1063,10 @@ export default function App() {
   const activeBatchRef = useRef<ActiveDownloadBatch | null>(null);
   activeBatchRef.current = activeBatch;
   const assistHostRef = useRef<HTMLDivElement | null>(null);
+  const nexusLoginHostRef = useRef<HTMLDivElement | null>(null);
+  const nexusLoginOpenRef = useRef(false);
+  const nexusLoginGenRef = useRef(0);
+  const [nexusLoginOpen, setNexusLoginOpen] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
 
@@ -1731,59 +1786,18 @@ export default function App() {
   const syncAssistHost = useCallback(async () => {
     const gen = assistSyncGenRef.current;
     const host = assistHostRef.current;
-    if (!host || tabRef.current !== "downloads") return;
-    const rect = host.getBoundingClientRect();
-    // Not laid out yet. A hide here sticks if a later show loses the race.
-    if (rect.width < 8 || rect.height < 8) return;
-    const cs = getComputedStyle(host);
-    const bl = parseFloat(cs.borderLeftWidth) || 0;
-    const bt = parseFloat(cs.borderTopWidth) || 0;
-    const br = parseFloat(cs.borderRightWidth) || 0;
-    const bb = parseFloat(cs.borderBottomWidth) || 0;
-
-    let left = rect.left + bl;
-    let top = rect.top + bt;
-    let right = rect.right - br;
-    let bottom = rect.bottom - bb;
-
-    const clipsOverflow = (value: string) =>
-      value === "hidden" || value === "clip" || value === "auto" || value === "scroll";
-
-    let ancestor: HTMLElement | null = host.parentElement;
-    while (ancestor) {
-      const style = getComputedStyle(ancestor);
-      if (
-        clipsOverflow(style.overflow) ||
-        clipsOverflow(style.overflowX) ||
-        clipsOverflow(style.overflowY)
-      ) {
-        const a = ancestor.getBoundingClientRect();
-        left = Math.max(left, a.left);
-        top = Math.max(top, a.top);
-        right = Math.min(right, a.right);
-        bottom = Math.min(bottom, a.bottom);
-      }
-      ancestor = ancestor.parentElement;
-    }
-
-    left = Math.max(left, 0);
-    top = Math.max(top, 0);
-    right = Math.min(right, window.innerWidth);
-    bottom = Math.min(bottom, window.innerHeight);
-
-    const width = Math.max(0, Math.floor(right - left));
-    const height = Math.max(0, Math.floor(bottom - top));
-    if (width < 8 || height < 8) return;
+    if (!host || tabRef.current !== "downloads" || nexusLoginOpenRef.current) return;
+    const bounds = measureHostBounds(host);
+    if (!bounds) return;
 
     try {
-      await api.setAssistBounds({
-        x: Math.round(left),
-        y: Math.round(top),
-        width,
-        height,
-      });
+      await api.setAssistBounds(bounds);
       // A superseded sync must not hide the embed. Only leaving Downloads does.
-      if (gen !== assistSyncGenRef.current || tabRef.current !== "downloads") {
+      if (
+        gen !== assistSyncGenRef.current ||
+        tabRef.current !== "downloads" ||
+        nexusLoginOpenRef.current
+      ) {
         return;
       }
       await api.setAssistVisible(true);
@@ -1793,6 +1807,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (nexusLoginOpen) return;
     if (tab !== "downloads") {
       assistSyncGenRef.current += 1;
       api.setAssistVisible(false).catch(() => {});
@@ -1800,10 +1815,10 @@ export default function App() {
     }
     const syncSoon = () => {
       requestAnimationFrame(() => {
-        if (tabRef.current !== "downloads") return;
+        if (tabRef.current !== "downloads" || nexusLoginOpenRef.current) return;
         void syncAssistHost();
         requestAnimationFrame(() => {
-          if (tabRef.current !== "downloads") return;
+          if (tabRef.current !== "downloads" || nexusLoginOpenRef.current) return;
           void syncAssistHost();
         });
       });
@@ -1828,7 +1843,96 @@ export default function App() {
       window.visualViewport?.removeEventListener("scroll", onResize);
       observer?.disconnect();
     };
-  }, [tab, syncAssistHost, assistActive, assistQueue?.head]);
+  }, [tab, syncAssistHost, assistActive, assistQueue?.head, nexusLoginOpen]);
+
+  const syncNexusLoginHost = useCallback(async () => {
+    const host = nexusLoginHostRef.current;
+    if (!host || !nexusLoginOpenRef.current) return;
+    const bounds = measureHostBounds(host);
+    if (!bounds || !nexusLoginOpenRef.current) return;
+    try {
+      await api.setAssistBounds(bounds);
+      if (!nexusLoginOpenRef.current) return;
+      await api.setAssistVisible(true);
+    } catch {
+      /* host may not be ready yet */
+    }
+  }, []);
+
+  const closeNexusLogin = useCallback(() => {
+    nexusLoginOpenRef.current = false;
+    setNexusLoginOpen(false);
+    api.closeDownloadAssist().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!nexusLoginOpen) return;
+    const gen = nexusLoginGenRef.current + 1;
+    nexusLoginGenRef.current = gen;
+    nexusLoginOpenRef.current = true;
+    const stillOpen = () =>
+      gen === nexusLoginGenRef.current && nexusLoginOpenRef.current;
+    const syncSoon = () => {
+      requestAnimationFrame(() => {
+        if (!stillOpen()) return;
+        void syncNexusLoginHost();
+      });
+    };
+    syncSoon();
+    const open = async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+      if (!stillOpen()) return;
+      await syncNexusLoginHost();
+      if (!stillOpen()) return;
+      try {
+        await api.openNexusWebsiteLogin();
+        if (!stillOpen()) return;
+        await syncNexusLoginHost();
+      } catch (e) {
+        if (stillOpen()) {
+          nexusLoginOpenRef.current = false;
+          setNexusLoginOpen(false);
+          setError(String(e));
+        }
+      }
+    };
+    void open();
+    window.addEventListener("resize", syncSoon);
+    window.addEventListener("scroll", syncSoon, true);
+    window.visualViewport?.addEventListener("resize", syncSoon);
+    window.visualViewport?.addEventListener("scroll", syncSoon);
+    const observer = nexusLoginHostRef.current
+      ? new ResizeObserver(() => syncSoon())
+      : null;
+    if (nexusLoginHostRef.current && observer) {
+      observer.observe(nexusLoginHostRef.current);
+    }
+    return () => {
+      window.removeEventListener("resize", syncSoon);
+      window.removeEventListener("scroll", syncSoon, true);
+      window.visualViewport?.removeEventListener("resize", syncSoon);
+      window.visualViewport?.removeEventListener("scroll", syncSoon);
+      observer?.disconnect();
+    };
+  }, [nexusLoginOpen, syncNexusLoginHost]);
+
+  useEffect(() => {
+    const unlisten = listen("nexus-login-complete", () => {
+      if (!nexusLoginOpenRef.current) return;
+      nexusLoginOpenRef.current = false;
+      setNexusLoginOpen(false);
+      api.closeDownloadAssist().catch(() => {});
+      setNotice({
+        kind: "ok",
+        message: "Nexus website session saved.",
+      });
+    });
+    return () => {
+      unlisten.then((drop) => drop());
+    };
+  }, []);
 
   const setAssistQueueState = useCallback((next: AssistQueueState | null) => {
     assistQueueRef.current = next;
@@ -7663,16 +7767,30 @@ export default function App() {
               Autoclick free download button in Download Assist (Nexus Fast
               Download–style; waits for countdown)
             </label>
-            <button
-              type="button"
-              onClick={() =>
-                withBusy("Clearing Nexus website session…", async () => {
-                  await api.clearAssistSession();
-                })
-              }
-            >
-              Clear Nexus website session
-            </button>
+            <div className="actions">
+              <button
+                type="button"
+                disabled={Boolean(assistQueue && !assistQueue.cancelled)}
+                title={
+                  assistQueue && !assistQueue.cancelled
+                    ? "Finish or cancel the Download Assist queue before signing in."
+                    : undefined
+                }
+                onClick={() => setNexusLoginOpen(true)}
+              >
+                Log in to Nexus
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  withBusy("Clearing Nexus website session…", async () => {
+                    await api.clearAssistSession();
+                  })
+                }
+              >
+                Clear Nexus website session
+              </button>
+            </div>
             <div className="setting-block">
               <span>Mod recovery</span>
               <p className="note">
@@ -7750,8 +7868,9 @@ export default function App() {
             </div>
             <p className="note">
               Free accounts: Install opens the Downloads workspace with an embedded
-              Nexus Assist panel. Sign in there once with Stay signed in; that session
-              is saved separately from your API key. Autoclick can press Slow download
+              Nexus Assist panel. Sign in once with Stay signed in, using Log in to
+              Nexus above or that panel. The website session is saved separately
+              from your API key. Autoclick can press Slow download
               for you. Premium: one-click Install and Collections. Register{" "}
               <code>nxm://</code> via the desktop entry for browser “Download with
               manager” links.
@@ -7759,6 +7878,18 @@ export default function App() {
           </section>
         )}
       </main>
+      {nexusLoginOpen && (
+        <Modal
+          className="modal-nexus-login"
+          title="Log in to Nexus"
+          subtitle="Use Stay signed in. This window closes after Nexus accepts the login."
+          onClose={closeNexusLogin}
+        >
+          <div ref={nexusLoginHostRef} className="nexus-login-host">
+            <p className="note">Opening Nexus…</p>
+          </div>
+        </Modal>
+      )}
       {quickInstall && (
         <QuickInstallDialog
           modName={quickInstall.hit.name}
