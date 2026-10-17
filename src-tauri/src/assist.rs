@@ -949,8 +949,8 @@ fn apply_assist_desired_visible(app: &tauri::AppHandle, state: &AppState) -> Res
         target_os = "openbsd"
     ))]
     {
-        // The overlay hides its GtkFixed only. Unmapping the WebKit widget
-        // itself leaves it blank the next time Downloads is shown.
+        // The overlay parks its event box off-screen. Unmapping the WebKit
+        // widget itself leaves it blank the next time Downloads is shown.
         if let Ok(window) = main_window(app) {
             crate::linux_embed::set_visible(&window, visible)?;
         }
@@ -1100,7 +1100,30 @@ pub async fn open_download_assist_inner(
 
     let window = main_window(app)?;
 
-    let mut builder = WebviewBuilder::new(ASSIST_LABEL, WebviewUrl::External(parsed))
+    // On Linux the child is reparented after creation. Loading Nexus before that
+    // attaches WebKit's surface to the window box and the page freezes.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    let initial_url = WebviewUrl::External(
+        "about:blank"
+            .parse()
+            .map_err(|e: url::ParseError| e.to_string())?,
+    );
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    let initial_url = WebviewUrl::External(parsed.clone());
+
+    let mut builder = WebviewBuilder::new(ASSIST_LABEL, initial_url)
         .data_directory(assist_dir)
         .initialization_script(assist_context_js(mod_id, file_id))
         .initialization_script(NXM_HOOK_JS)
@@ -1186,7 +1209,12 @@ pub async fn open_download_assist_inner(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    crate::linux_embed::prepare(&window)?;
+    {
+        crate::linux_embed::prepare(&window)?;
+        // Inherited by the assist web process started below. The main UI
+        // webview is already running and keeps its own compositor.
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
 
     let webview = window
         .add_child(
@@ -1215,6 +1243,15 @@ pub async fn open_download_assist_inner(
         state.assist_desired_visible.store(true, Ordering::SeqCst);
     }
     apply_assist_desired_visible(app, state)?;
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    webview.navigate(parsed).map_err(|e| e.to_string())?;
 
     emit_assist_opened(app, autoclick, &domain, mod_id, file_id);
     Ok(())
