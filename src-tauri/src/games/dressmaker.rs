@@ -1,10 +1,12 @@
 //! Dressmaker (Yuuma's Mod Loader).
 //!
-//! Content packs (`mod.json`, no DLL) deploy under `Mods/<Pack>/`. Plugin DLLs
-//! deploy under `BepInEx/plugins/`. The loader itself (BepInEx + Doorstop) and
-//! game-folder overwrites (`Dressmaker_Data/`, `GameAssembly.dll`) deploy at
-//! the install root. A DLL wins over a sibling `mod.json`.
+//! A staged tree with `mod.json` is a content pack and deploys as
+//! `Mods/<Pack>/mod.json`, including a sibling DLL. Wrapper folders above that
+//! pack are dropped. A DLL archive with no `mod.json` deploys under
+//! `BepInEx/plugins/`. The loader itself (BepInEx + Doorstop) and game-folder
+//! overwrites (`Dressmaker_Data/`, `GameAssembly.dll`) deploy at the install root.
 
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
@@ -84,6 +86,9 @@ impl GamePlugin for DressmakerPlugin {
     fn should_deploy_file_ctx(&self, relative: &Path, ctx: &DeployContext<'_>) -> bool {
         match ctx.content_root.map(staged_kind) {
             Some(StagedKind::Plugin) => should_deploy_bepinex_file(ctx.content_root, relative),
+            Some(StagedKind::ContentPack) => {
+                file_belongs_to_content_pack(ctx.content_root, relative)
+            }
             _ => true,
         }
     }
@@ -106,7 +111,9 @@ impl GamePlugin for DressmakerPlugin {
     }
 
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
-        if looks_like_bepinex_pack(content_root) || looks_like_game_overwrite(content_root) {
+        if staged_kind(content_root) == StagedKind::InstallRoot
+            && (looks_like_bepinex_pack(content_root) || looks_like_game_overwrite(content_root))
+        {
             vec![format!(
                 "{mod_name} looks like the Dressmaker Mod Loader or a game-folder overwrite; files were deployed to the game root."
             )]
@@ -138,7 +145,7 @@ impl GamePlugin for DressmakerPlugin {
             .map(staged_kind)
             .unwrap_or(StagedKind::Plugin);
         Ok(match kind {
-            StagedKind::ContentPack => join_under(install_path, "Mods", relative),
+            StagedKind::ContentPack => content_pack_dest(install_path, ctx.content_root, relative),
             StagedKind::Assets => join_under(install_path, "Dressmaker_Data", relative),
             StagedKind::InstallRoot => install_path.join(normalize_relative(relative)),
             StagedKind::Plugin => return resolve_bepinex_deploy(install_path, relative),
@@ -155,19 +162,93 @@ impl GamePlugin for DressmakerPlugin {
 }
 
 fn staged_kind(content_root: &Path) -> StagedKind {
-    if looks_like_bepinex_pack(content_root) || looks_like_game_overwrite(content_root) {
+    if looks_like_bepinex_pack(content_root) {
         return StagedKind::InstallRoot;
+    }
+    // The loader's own installer treats any tree with mod.json as a content pack,
+    // even when a DLL sits beside it.
+    if mod_json_dir(content_root).is_some() {
+        return StagedKind::ContentPack;
     }
     if tree_has_file(content_root, |name| name.ends_with(".dll")) {
         return StagedKind::Plugin;
     }
-    if tree_has_file(content_root, |name| name == "mod.json") {
-        return StagedKind::ContentPack;
+    if looks_like_game_overwrite(content_root) {
+        return StagedKind::InstallRoot;
     }
     if tree_has_file(content_root, |name| name.ends_with(".assets")) {
         return StagedKind::Assets;
     }
     StagedKind::InstallRoot
+}
+
+/// Directory that directly contains `mod.json`, relative to `content_root`.
+///
+/// `Some("")` means `mod.json` is at `content_root`. `None` means there is no pack.
+fn mod_json_dir(content_root: &Path) -> Option<PathBuf> {
+    let mut queue = VecDeque::from([content_root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.eq_ignore_ascii_case("__MACOSX") || name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                children.push(path);
+            } else if name.eq_ignore_ascii_case("mod.json") {
+                let rel = dir.strip_prefix(content_root).unwrap_or(Path::new(""));
+                return Some(rel.to_path_buf());
+            }
+        }
+        queue.extend(children);
+    }
+    None
+}
+
+fn file_belongs_to_content_pack(content_root: Option<&Path>, relative: &Path) -> bool {
+    let Some(content_root) = content_root else {
+        return true;
+    };
+    let Some(pack_dir) = mod_json_dir(content_root) else {
+        return true;
+    };
+    if pack_dir.as_os_str().is_empty() {
+        return true;
+    }
+    normalize_relative(relative).starts_with(&pack_dir)
+}
+
+/// Place the directory that contains `mod.json` at `Mods/<Pack>/`.
+fn content_pack_dest(install_path: &Path, content_root: Option<&Path>, relative: &Path) -> PathBuf {
+    let Some(content_root) = content_root else {
+        return join_under(install_path, "Mods", relative);
+    };
+    let Some(pack_dir) = mod_json_dir(content_root) else {
+        return join_under(install_path, "Mods", relative);
+    };
+    if pack_dir.as_os_str().is_empty() {
+        // `mod.json` is at the content root, so deploy already wrapped one folder.
+        return join_under(install_path, "Mods", relative);
+    }
+    let pack_name = pack_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .filter(|n| !n.to_string_lossy().eq_ignore_ascii_case("Mods"))
+        .unwrap_or_else(|| "Pack".into());
+    let normalized = normalize_relative(relative);
+    let mut out = install_path.join("Mods").join(&pack_name);
+    if let Ok(rest) = normalized.strip_prefix(&pack_dir) {
+        if !rest.as_os_str().is_empty() {
+            out.push(rest);
+        }
+    }
+    out
 }
 
 fn looks_like_game_overwrite(content_root: &Path) -> bool {
@@ -451,20 +532,77 @@ mod tests {
     }
 
     #[test]
-    fn dll_wins_over_mod_json() {
+    fn dll_stays_inside_content_pack() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mod.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join("Plugin.dll"), b"x").unwrap();
+        let root = dir.path().join("MyPack");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("mod.json"), b"{}").unwrap();
+        std::fs::write(root.join("Plugin.dll"), b"x").unwrap();
 
-        assert!(!plugin().deploys_to_install_root(dir.path()));
+        assert!(plugin().should_wrap_as_mod_folder(&root));
+        assert!(!plugin().deploys_to_install_root(&root));
         let dest = plugin()
             .resolve_deploy_root_ctx(
                 Path::new("/game"),
-                Path::new("Plugin.dll"),
-                &ctx(dir.path()),
+                Path::new("MyPack/Plugin.dll"),
+                &ctx(&root),
             )
             .unwrap();
-        assert_eq!(dest, PathBuf::from("/game/BepInEx/plugins/Plugin.dll"));
+        assert_eq!(dest, PathBuf::from("/game/Mods/MyPack/Plugin.dll"));
+    }
+
+    #[test]
+    fn pack_folder_lands_directly_under_mods() {
+        let staging = tempfile::tempdir().unwrap();
+        let pack = staging.path().join("Pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("mod.json"), b"{}").unwrap();
+
+        let root = super::super::normalize_staging_root(staging.path(), &plugin()).unwrap();
+        assert_eq!(root, pack);
+        assert!(plugin().should_wrap_as_mod_folder(&root));
+        let folder = plugin().wrap_mod_folder_name(&root, "Ignored Title");
+        let dest = plugin()
+            .resolve_deploy_root_ctx(
+                Path::new("/game"),
+                &Path::new(&folder).join("mod.json"),
+                &ctx(&root),
+            )
+            .unwrap();
+        assert_eq!(dest, PathBuf::from("/game/Mods/Pack/mod.json"));
+    }
+
+    #[test]
+    fn nested_pack_beside_readme_drops_wrapper() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("README.txt"), b"hi").unwrap();
+        let pack = staging.path().join("Outer").join("Pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("mod.json"), b"{}").unwrap();
+        std::fs::write(pack.join("cotton.png"), b"x").unwrap();
+
+        let root = super::super::normalize_staging_root(staging.path(), &plugin()).unwrap();
+        assert_eq!(root, staging.path());
+        assert!(!plugin().should_wrap_as_mod_folder(&root));
+        assert!(!plugin().should_deploy_file_ctx(Path::new("README.txt"), &ctx(&root)));
+
+        let dest = plugin()
+            .resolve_deploy_root_ctx(
+                Path::new("/game"),
+                Path::new("Outer/Pack/mod.json"),
+                &ctx(&root),
+            )
+            .unwrap();
+        assert_eq!(dest, PathBuf::from("/game/Mods/Pack/mod.json"));
+
+        let texture = plugin()
+            .resolve_deploy_root_ctx(
+                Path::new("/game"),
+                Path::new("Outer/Pack/cotton.png"),
+                &ctx(&root),
+            )
+            .unwrap();
+        assert_eq!(texture, PathBuf::from("/game/Mods/Pack/cotton.png"));
     }
 
     #[test]
