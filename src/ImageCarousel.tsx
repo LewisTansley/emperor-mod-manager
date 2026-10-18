@@ -1,22 +1,37 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 
 export type GallerySlide = {
   url: string;
   caption?: string | null;
 };
 
+function readRatio(img: HTMLImageElement): number | null {
+  if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+    return img.naturalWidth / img.naturalHeight;
+  }
+  return null;
+}
+
 export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
   const [index, setIndex] = useState(0);
+  const [ratio, setRatio] = useState<number | null>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
   const slideKey = slides.map((slide) => slide.url).join("\n");
+  const current = slides.length === 0 ? 0 : Math.min(index, slides.length - 1);
+  const slide = slides[current];
 
   useEffect(() => {
     setIndex(0);
   }, [slideKey]);
 
-  if (slides.length === 0) return null;
+  useEffect(() => {
+    const img = imgRef.current;
+    const next = img?.complete ? readRatio(img) : null;
+    setRatio(next);
+  }, [slide?.url]);
 
-  const current = Math.min(index, slides.length - 1);
-  const slide = slides[current];
+  if (!slide) return null;
+
   const multiple = slides.length > 1;
 
   function step(delta: number) {
@@ -45,8 +60,25 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
         }
       }}
     >
-      <div className="detail-carousel-frame">
-        <img src={slide.url} alt={slide.caption?.trim() || "Mod image"} />
+      <div
+        className="detail-carousel-frame"
+        style={
+          ratio != null
+            ? ({ "--slide-ratio": String(ratio) } as CSSProperties)
+            : undefined
+        }
+      >
+        <img
+          ref={imgRef}
+          src={slide.url}
+          alt={slide.caption?.trim() || "Mod image"}
+          onLoad={(event) => {
+            const img = event.currentTarget;
+            if (img.getAttribute("src") !== slide.url) return;
+            const next = readRatio(img);
+            if (next != null) setRatio(next);
+          }}
+        />
         {multiple ? (
           <>
             <button

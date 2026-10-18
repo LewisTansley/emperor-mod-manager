@@ -531,7 +531,7 @@ fn is_thunderstore_metadata_root_file(relative: &Path) -> bool {
 
 /// Skip Thunderstore metadata for mods that merge into the shared `BepInEx/` tree,
 /// otherwise every package drops a `manifest.json` / `icon.png` into `BepInEx/plugins/`.
-fn should_deploy_bepinex_file(content_root: Option<&Path>, relative: &Path) -> bool {
+pub(crate) fn should_deploy_bepinex_file(content_root: Option<&Path>, relative: &Path) -> bool {
     let Some(content_root) = content_root else {
         return true;
     };
@@ -541,7 +541,7 @@ fn should_deploy_bepinex_file(content_root: Option<&Path>, relative: &Path) -> b
     !is_thunderstore_metadata_root_file(relative)
 }
 
-fn should_wrap_bepinex_mod(content_root: &Path) -> bool {
+pub(crate) fn should_wrap_bepinex_mod(content_root: &Path) -> bool {
     // Thunderstore layouts that already use plugins/ or patchers/ must map via
     // resolve_bepinex_deploy (BepInEx/plugins/...) — wrapping would nest them as
     // BepInEx/plugins/<mod>/plugins/...

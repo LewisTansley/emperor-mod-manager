@@ -13,6 +13,7 @@ mod controlresonant;
 mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
+mod dressmaker;
 mod fromsoft_loaders;
 mod fromsoftware;
 mod helldivers2;
@@ -46,6 +47,7 @@ pub use creation_engine::{
 };
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
+pub use dressmaker::DressmakerPlugin;
 pub use fromsoft_loaders::{
     ensure_fromsoft_loaders, finish_legacy_after_assist, install_legacy_from_archive,
     is_fromsoft_plugin, legacy_loader_ready, EnsureLoadersOutcome, LegacyAssistRequest,
@@ -272,6 +274,7 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &MountAndBladeWarbandPlugin,
         &KingdomComeDeliverance2Plugin,
         &KingdomComeDeliverancePlugin,
+        &DressmakerPlugin,
         &BepInExPlugin,
         &EldenRingPlugin,
         &DarkSouls3Plugin,
@@ -602,6 +605,7 @@ mod tests {
             match_plugin("My Summer Car", None).unwrap().id,
             "mysummercar"
         );
+        assert_eq!(match_plugin("Dressmaker", None).unwrap().id, "dressmaker");
         assert_eq!(
             match_plugin("CONTROL Resonant", None).unwrap().id,
             "controlresonant"
