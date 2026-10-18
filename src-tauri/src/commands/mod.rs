@@ -6405,14 +6405,41 @@ pub async fn deploy_mods(
     } else {
         Vec::new()
     };
+    let install = PathBuf::from(&game.install_path);
+    // A Dressmaker install saved as generic BepInEx would drop content packs
+    // in BepInEx/plugins, which the in-game Mod Manager does not list.
+    let plugin_id = games::plugin_id_for_install(&game.plugin_id, &install).to_string();
+    let mut plugin_warning = None;
+    if plugin_id != game.plugin_id {
+        match state.config.lock() {
+            Ok(mut cfg) => {
+                if let Some(saved) = cfg.managed_games.iter_mut().find(|g| g.id == game_id) {
+                    saved.plugin_id = plugin_id.clone();
+                }
+                if let Err(e) = config::save_config(&state.paths, &cfg) {
+                    plugin_warning = Some(format!(
+                        "Dressmaker content packs deploy under Mods/, but the saved game type could not be updated ({e:#})."
+                    ));
+                }
+            }
+            Err(e) => {
+                plugin_warning = Some(format!(
+                    "Dressmaker content packs deploy under Mods/, but the saved game type could not be updated ({e})."
+                ));
+            }
+        }
+    }
     let mut result = mods::deploy(
         &state.paths,
         &game_id,
-        &game.plugin_id,
-        &PathBuf::from(&game.install_path),
+        &plugin_id,
+        &install,
         game.project_name.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+    if let Some(warning) = plugin_warning {
+        result.warnings.insert(0, warning);
+    }
     result.warnings.splice(0..0, loader_warnings.drain(..));
     result.warnings.splice(0..0, repair_warnings);
     if !result.plugin_skips.is_empty() {

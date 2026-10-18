@@ -47,6 +47,7 @@ pub use creation_engine::{
 };
 pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
+pub(crate) use dressmaker::plugin_id_for_install;
 pub use dressmaker::DressmakerPlugin;
 pub use fromsoft_loaders::{
     ensure_fromsoft_loaders, finish_legacy_after_assist, install_legacy_from_archive,
