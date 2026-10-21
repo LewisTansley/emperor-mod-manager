@@ -43,6 +43,9 @@ impl Default for InstallClickBehavior {
 pub struct AppConfig {
     pub managed_games: Vec<ManagedGame>,
     pub adult_content: bool,
+    /// When true, staged mods that do not match the game version are called out.
+    #[serde(default = "default_true")]
+    pub game_version_warnings: bool,
     pub last_active_game_id: Option<String>,
     /// When true, the free-download WebView auto-clicks Mod Manager / Slow Download once ready.
     pub autoclick_free_download: bool,
@@ -100,6 +103,10 @@ fn default_use_global() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 pub const MIN_RECENT_DOWNLOADS_LIMIT: u32 = 1;
 pub const MAX_RECENT_DOWNLOADS_LIMIT: u32 = 500;
 
@@ -116,6 +123,7 @@ impl Default for AppConfig {
         Self {
             managed_games: Vec::new(),
             adult_content: true,
+            game_version_warnings: true,
             last_active_game_id: None,
             autoclick_free_download: true,
             theme: ThemePreference::System,
@@ -151,6 +159,9 @@ pub struct ManagedGame {
     /// Per-game Vulkan tool overrides (lsfg-vk, AutoHDR-VK).
     #[serde(default)]
     pub tool_overrides: Option<GameToolOverrides>,
+    /// User-set game version. Empty means use the version read from the executable.
+    #[serde(default)]
+    pub game_version: Option<String>,
 }
 
 pub struct Paths {
@@ -212,6 +223,14 @@ impl Paths {
 
     pub fn deploy_manifest(&self, game_id: &str) -> PathBuf {
         self.game_data_dir(game_id).join("deployed.json")
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.data_dir.join("logs")
+    }
+
+    pub fn log_file(&self) -> PathBuf {
+        self.logs_dir().join("emperor.log")
     }
 
     /// Local library of Emperor share codes (not per-game staging).

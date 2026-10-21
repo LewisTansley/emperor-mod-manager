@@ -226,6 +226,7 @@ mod tests {
             thunderstore_community: None,
             modio_game_id: None,
             tool_overrides: None,
+            game_version: None,
         }
     }
 

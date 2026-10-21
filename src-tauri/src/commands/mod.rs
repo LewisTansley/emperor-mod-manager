@@ -1000,6 +1000,7 @@ pub fn manage_game(
         thunderstore_community: ts_community,
         modio_game_id: modio_id,
         tool_overrides: None,
+        game_version: None,
     };
     let install_exists = Path::new(&install_path).is_dir();
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -1059,6 +1060,29 @@ pub fn update_managed_game(
             "Game needs a Nexus Mods domain, Thunderstore community, and/or mod.io game ID.".into(),
         );
     }
+    let managed = game.clone();
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    Ok(managed)
+}
+
+#[tauri::command]
+pub fn set_game_version(
+    state: State<'_, AppState>,
+    id: String,
+    version: Option<String>,
+) -> Result<ManagedGame, String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    let trimmed = version.unwrap_or_default().trim().to_string();
+    game.game_version = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
     let managed = game.clone();
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     Ok(managed)
@@ -1420,6 +1444,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
     let user = state.user.lock().map_err(|e| e.to_string())?.clone();
     Ok(serde_json::json!({
         "adult_content": cfg.adult_content,
+        "game_version_warnings": cfg.game_version_warnings,
         "autoclick_free_download": cfg.autoclick_free_download,
         "last_active_game_id": cfg.last_active_game_id,
         "theme": cfg.theme,
@@ -1468,6 +1493,13 @@ pub fn recover_legacy_mod_data(
 pub fn set_adult_content(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     cfg.adult_content = enabled;
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_game_version_warnings(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    cfg.game_version_warnings = enabled;
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
@@ -2483,6 +2515,7 @@ pub async fn download_thunderstore_mod(
             profile_code: None,
             mod_ids: member_ids,
             installed_at: String::new(),
+            game_versions: None,
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
@@ -2626,6 +2659,7 @@ pub async fn import_thunderstore_profile(
         profile_code: Some(code),
         mod_ids: member_ids,
         installed_at: String::new(),
+        game_versions: None,
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -2885,11 +2919,20 @@ fn staging_contains_filename(root: &Path, file_name: &str) -> bool {
         })
 }
 
-fn staged_nexus_keys(mods: &[StagedMod]) -> HashSet<(String, u64)> {
-    mods.iter()
-        .filter(|m| m.source == ModSource::Nexus && m.nexus_mod_id != 0 && !m.domain.is_empty())
-        .map(|m| (m.domain.to_lowercase(), m.nexus_mod_id))
-        .collect()
+fn staged_nexus_mods(mods: &[StagedMod]) -> HashMap<(String, u64), nexus::StagedNexusMod> {
+    let mut out = HashMap::new();
+    for m in mods {
+        if m.source != ModSource::Nexus || m.nexus_mod_id == 0 || m.domain.is_empty() {
+            continue;
+        }
+        out.entry((m.domain.to_lowercase(), m.nexus_mod_id))
+            .or_insert_with(|| nexus::StagedNexusMod {
+                staged_id: m.id.clone(),
+                name: m.name.clone(),
+                enabled: m.enabled,
+            });
+    }
+    out
 }
 
 struct RequirementSeed {
@@ -2914,7 +2957,7 @@ fn seed_from_staged(m: &StagedMod) -> Option<RequirementSeed> {
 async fn collect_requirement_seeds(
     state: &AppState,
     seeds: Vec<RequirementSeed>,
-    staged: HashSet<(String, u64)>,
+    staged: HashMap<(String, u64), nexus::StagedNexusMod>,
 ) -> nexus::MissingRequirements {
     if seeds.is_empty() {
         return nexus::MissingRequirements::default();
@@ -2993,7 +3036,7 @@ pub async fn missing_nexus_requirements(
     staged_id: Option<String>,
 ) -> Result<nexus::MissingRequirements, String> {
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-    let staged = staged_nexus_keys(&order.mods);
+    let staged = staged_nexus_mods(&order.mods);
     let seeds = match staged_id.as_deref().filter(|id| !id.is_empty()) {
         Some(id) => {
             let staged_mod = order
@@ -3010,6 +3053,202 @@ pub async fn missing_nexus_requirements(
     Ok(collect_requirement_seeds(&state, seeds, staged).await)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GameVersionReport {
+    pub installed: Option<String>,
+    pub override_version: Option<String>,
+    pub current: Option<String>,
+    /// `override`, `detected`, or `unknown`.
+    pub source: String,
+    pub mods: Vec<GameVersionModAdvice>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GameVersionModAdvice {
+    pub staged_id: String,
+    pub status: mods::game_version::ModVersionStatus,
+    pub supported: Vec<String>,
+    pub message: String,
+}
+
+#[tauri::command]
+pub async fn check_mod_game_versions(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<GameVersionReport, String> {
+    let (install_path, override_version, nexus_domain, adult) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let game = cfg
+            .managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .ok_or_else(|| "Managed game not found".to_string())?;
+        (
+            game.install_path.clone(),
+            game.game_version
+                .clone()
+                .filter(|version| !version.trim().is_empty()),
+            game.nexus_domain.clone(),
+            cfg.adult_content,
+        )
+    };
+    let installed = games::detect_install_version(Path::new(&install_path));
+    let current = override_version.clone().or_else(|| installed.clone());
+    let source = if override_version.is_some() {
+        "override"
+    } else if installed.is_some() {
+        "detected"
+    } else {
+        "unknown"
+    };
+
+    let mut order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let mut collections =
+        mods::list_installed_collections(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    refresh_version_support(
+        &state,
+        &game_id,
+        &nexus_domain,
+        adult,
+        &mut order,
+        &mut collections,
+    )
+    .await;
+
+    let mods = order
+        .mods
+        .iter()
+        .map(|staged| {
+            let tags = staged.supported_game_versions.clone().unwrap_or_default();
+            let mut collection_versions = Vec::new();
+            for collection in &collections {
+                if collection.mod_ids.iter().any(|id| id == &staged.id) {
+                    if let Some(versions) = &collection.game_versions {
+                        for version in versions {
+                            if !collection_versions
+                                .iter()
+                                .any(|existing: &String| existing.eq_ignore_ascii_case(version))
+                            {
+                                collection_versions.push(version.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let advice =
+                mods::game_version::advise(current.as_deref(), &tags, &collection_versions);
+            GameVersionModAdvice {
+                staged_id: staged.id.clone(),
+                status: advice.status,
+                supported: advice.supported,
+                message: advice.message,
+            }
+        })
+        .collect();
+
+    Ok(GameVersionReport {
+        installed,
+        override_version,
+        current,
+        source: source.into(),
+        mods,
+    })
+}
+
+async fn refresh_version_support(
+    state: &AppState,
+    game_id: &str,
+    nexus_domain: &str,
+    adult: bool,
+    order: &mut mods::LoadOrder,
+    collections: &mut [InstalledCollection],
+) {
+    let client = match state.client() {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let mut by_domain: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+    for staged in &order.mods {
+        if staged.source != ModSource::Nexus || staged.nexus_mod_id == 0 {
+            continue;
+        }
+        if staged.supported_game_versions.is_some() {
+            continue;
+        }
+        let domain = if staged.domain.trim().is_empty() {
+            nexus_domain.to_string()
+        } else {
+            staged.domain.clone()
+        };
+        if domain.is_empty() {
+            continue;
+        }
+        by_domain
+            .entry(domain)
+            .or_default()
+            .push((staged.id.clone(), staged.nexus_mod_id));
+    }
+    let mut tag_updates: HashMap<String, Vec<String>> = HashMap::new();
+    for (domain, rows) in &by_domain {
+        let ids: Vec<u64> = rows.iter().map(|(_, id)| *id).collect();
+        match client.mod_version_tags(domain, &ids).await {
+            Ok(found) => {
+                for (staged_id, mod_id) in rows {
+                    tag_updates.insert(
+                        staged_id.clone(),
+                        found.get(mod_id).cloned().unwrap_or_default(),
+                    );
+                }
+            }
+            Err(e) => log::warn!("mod version tags failed for {domain}: {e}"),
+        }
+    }
+    if !tag_updates.is_empty() {
+        match mods::cache_supported_game_versions(&state.paths, game_id, &tag_updates) {
+            Ok(()) => {
+                for staged in &mut order.mods {
+                    if let Some(versions) = tag_updates.get(&staged.id) {
+                        staged.supported_game_versions = Some(versions.clone());
+                    }
+                }
+            }
+            Err(e) => log::warn!("could not cache mod version tags: {e}"),
+        }
+    }
+
+    let mut collection_updates: HashMap<String, Vec<String>> = HashMap::new();
+    for collection in collections.iter() {
+        if collection.source != CollectionSource::Nexus || collection.game_versions.is_some() {
+            continue;
+        }
+        let Some(slug) = collection.slug.as_deref().filter(|slug| !slug.is_empty()) else {
+            continue;
+        };
+        match client
+            .collection_game_versions(slug, collection.revision, adult)
+            .await
+        {
+            Ok(versions) => {
+                collection_updates.insert(collection.id.clone(), versions);
+            }
+            Err(e) => log::warn!("collection game versions failed for {slug}: {e}"),
+        }
+    }
+    if collection_updates.is_empty() {
+        return;
+    }
+    match mods::cache_collection_game_versions(&state.paths, game_id, &collection_updates) {
+        Ok(()) => {
+            for collection in collections.iter_mut() {
+                if let Some(versions) = collection_updates.get(&collection.id) {
+                    collection.game_versions = Some(versions.clone());
+                }
+            }
+        }
+        Err(e) => log::warn!("could not cache collection game versions: {e}"),
+    }
+}
+
 #[tauri::command]
 pub async fn nexus_mod_requirements(
     state: State<'_, AppState>,
@@ -3019,7 +3258,7 @@ pub async fn nexus_mod_requirements(
     name: String,
 ) -> Result<nexus::MissingRequirements, String> {
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-    let staged = staged_nexus_keys(&order.mods);
+    let staged = staged_nexus_mods(&order.mods);
     let existing = mods::find_nexus_mod(&order, &domain, mod_id);
     let seed = RequirementSeed {
         staged_id: existing.map(|m| m.id.clone()).unwrap_or_default(),
@@ -3943,6 +4182,7 @@ pub async fn install_collection(
             profile_code: None,
             mod_ids: member_ids,
             installed_at: String::new(),
+            game_versions: None,
         };
         mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
             .map_err(|e| e.to_string())?;
@@ -5597,6 +5837,7 @@ pub fn record_nexus_collection(
         profile_code: None,
         mod_ids: member_ids,
         installed_at: String::new(),
+        game_versions: None,
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -6012,6 +6253,7 @@ pub async fn import_share_code(
             profile_code: Some(code),
             mod_ids: member_ids.clone(),
             installed_at: String::new(),
+            game_versions: None,
         };
         Some(
             mods::record_installed_collection(&state.paths, &game_id, col, &new_ids)
@@ -6089,6 +6331,7 @@ pub fn record_emperor_share(
         profile_code: code,
         mod_ids: ids,
         installed_at: String::new(),
+        game_versions: None,
     };
     mods::record_installed_collection(&state.paths, &game_id, collection, &new_ids)
         .map_err(|e| e.to_string())
@@ -6183,6 +6426,53 @@ fn plugin_for_game(state: &AppState, game_id: &str) -> Result<&'static dyn GameP
         .ok_or_else(|| "Managed game not found".to_string())?;
     drop(cfg);
     games::plugin_by_id(&plugin_id).ok_or_else(|| format!("Unknown game plugin: {plugin_id}"))
+}
+
+#[tauri::command]
+pub fn diagnose_load(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<crate::diagnostics::LoadDiagnosis, String> {
+    let game = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        cfg.managed_games
+            .iter()
+            .find(|g| g.id == game_id)
+            .cloned()
+            .ok_or_else(|| "Managed game not found".to_string())?
+    };
+    let plugin = games::plugin_by_id(&game.plugin_id)
+        .ok_or_else(|| format!("Unknown game plugin: {}", game.plugin_id))?;
+    let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
+    let enabled_mods: Vec<String> = order
+        .mods
+        .iter()
+        .filter(|staged| staged.enabled)
+        .map(|staged| staged.name.clone())
+        .collect();
+    let manifest_path = state.paths.deploy_manifest(&game_id);
+    let deployed_paths = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<mods::DeployManifest>(&raw).ok())
+        .map(|manifest| manifest.paths)
+        .unwrap_or_default();
+    let deployed_at = std::fs::metadata(&manifest_path)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let manager_log = crate::app_log::recent_warn_lines(&state.paths.log_file());
+    Ok(crate::diagnostics::diagnose(
+        &crate::diagnostics::DiagnoseInput {
+            plugin,
+            install_path: Path::new(&game.install_path),
+            game_title: &game.title,
+            plugin_id: &game.plugin_id,
+            app_version: APP_VERSION,
+            enabled_mods: &enabled_mods,
+            deployed_paths: &deployed_paths,
+            deployed_at,
+            manager_log: &manager_log,
+        },
+    ))
 }
 
 /// The staged content root a plugin inspects, i.e. what deploy would use.
@@ -6463,7 +6753,7 @@ pub async fn deploy_mods(
             }
             let seeds = owners.iter().filter_map(seed_from_staged).collect();
             result.missing_requirements =
-                collect_requirement_seeds(&state, seeds, staged_nexus_keys(&order.mods)).await;
+                collect_requirement_seeds(&state, seeds, staged_nexus_mods(&order.mods)).await;
         }
     }
     Ok(result)

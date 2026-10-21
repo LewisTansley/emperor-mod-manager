@@ -340,6 +340,16 @@ fn ds2_preflight_injector_hints(game_root: &Path) -> Vec<String> {
     warnings
 }
 
+fn ds2_log_sources(install_path: &Path) -> Vec<super::LogSource> {
+    let root = resolve_game_root(install_path);
+    let path = find_file_ci(&root, "DS2LE.log").unwrap_or_else(|| root.join("DS2LE.log"));
+    vec![super::LogSource {
+        label: "DS2LE".into(),
+        kind: super::LogKind::Ds2Lighting,
+        path,
+    }]
+}
+
 fn missing_modengine_message(plugin_id: &str) -> String {
     if plugin_id == "darksouls2" {
         "Legacy Mod Engine (dinput8.dll) was not found next to the game executable. Deploy again to auto-install it from GitHub when you enable loose asset mods under Game/mod/, or copy dinput8.dll into the Game folder manually."
@@ -1214,6 +1224,14 @@ macro_rules! fromsoft_legacy_plugin {
 
             fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
                 legacy_preflight_warnings($id, install_path)
+            }
+
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                if $id == "darksouls2" {
+                    ds2_log_sources(install_path)
+                } else {
+                    Vec::new()
+                }
             }
 
             fn after_deploy(

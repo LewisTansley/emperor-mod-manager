@@ -358,6 +358,7 @@ a {
 }
 
 .filters select,
+.filters input,
 button.tag-picker-trigger {
   border: 1px solid var(--line);
   background: var(--input-bg);
@@ -739,6 +740,49 @@ button.tag-picker-trigger[aria-expanded="true"] {
   align-items: center;
 }
 
+.modal.modal-load-logs {
+  width: min(46rem, 100%);
+}
+
+.load-findings {
+  margin: 0.85rem 0 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.load-findings .note {
+  white-space: pre-wrap;
+  margin: 0.25rem 0 0;
+}
+
+.load-findings li.info {
+  color: var(--muted);
+}
+
+.load-excerpt {
+  margin: 0;
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: var(--bg);
+}
+
+.load-excerpt-label {
+  display: block;
+  margin: 0.85rem 0 0.35rem;
+  font-family: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
 .modal.modal-nexus-login {
   width: min(64rem, calc(100vw - 3rem));
   height: min(44rem, calc(100vh - 3rem));
@@ -839,6 +883,11 @@ button.tag-picker-trigger[aria-expanded="true"] {
 .list.mods .mod-identity-text {
   flex: 1;
   min-width: 0;
+}
+
+.list.mods .mod-version-warn {
+  display: block;
+  color: var(--warn);
 }
 
 .list.mods .actions {
@@ -1507,6 +1556,20 @@ button.danger {
 
 .requirements-select-all {
   margin-bottom: 0.5rem;
+}
+
+.requirements-versions {
+  margin: 1rem 0 0.5rem;
+}
+
+.requirements-versions summary {
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 1.17em;
+}
+
+.requirements-versions .list {
+  margin-top: 0.65rem;
 }
 
 .requirements-list li > div {

@@ -75,6 +75,14 @@ impl GamePlugin for ControlResonantPlugin {
         warnings
     }
 
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        vec![super::LogSource {
+            label: "crloader".into(),
+            kind: super::LogKind::CrLoader,
+            path: install_path.join("crloader.log"),
+        }]
+    }
+
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
         if looks_like_loader_pack(content_root) {
             vec![format!(

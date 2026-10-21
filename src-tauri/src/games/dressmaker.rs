@@ -111,6 +111,10 @@ impl GamePlugin for DressmakerPlugin {
         }
     }
 
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        super::unity_bepinex::bepinex_log_sources(install_path)
+    }
+
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
         if staged_kind(content_root) == StagedKind::InstallRoot
             && (looks_like_bepinex_pack(content_root) || looks_like_game_overwrite(content_root))

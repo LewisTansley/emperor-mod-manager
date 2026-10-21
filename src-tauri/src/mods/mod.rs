@@ -1,5 +1,6 @@
 //! Mod staging, extraction, load order, and deploy.
 
+pub mod game_version;
 pub mod options;
 
 use std::{
@@ -88,6 +89,9 @@ pub struct StagedMod {
     /// Catalog poster. `None` has not been looked up. `Some("")` has no image.
     #[serde(default)]
     pub picture_url: Option<String>,
+    /// Version-like Nexus tags. `None` has not been looked up.
+    #[serde(default)]
+    pub supported_game_versions: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -120,6 +124,7 @@ impl Default for StagedMod {
             option_selection: None,
             file_name: None,
             picture_url: None,
+            supported_game_versions: None,
         }
     }
 }
@@ -196,6 +201,9 @@ pub struct InstalledCollection {
     pub mod_ids: Vec<String>,
     #[serde(default)]
     pub installed_at: String,
+    /// Game versions this collection revision was built for. `None` has not been looked up.
+    #[serde(default)]
+    pub game_versions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -982,6 +990,9 @@ pub fn record_installed_collection(
 
     let mut store = load_collections(paths, game_id)?;
     if let Some(existing) = store.collections.iter_mut().find(|c| c.id == collection.id) {
+        if collection.game_versions.is_none() && existing.revision == collection.revision {
+            collection.game_versions = existing.game_versions.clone();
+        }
         let mut ids = existing.mod_ids.clone();
         for id in &collection.mod_ids {
             push_unique(&mut ids, id.clone());
@@ -1074,6 +1085,41 @@ pub fn list_installed_collections(
     game_id: &str,
 ) -> Result<Vec<InstalledCollection>> {
     Ok(load_collections(paths, game_id)?.collections)
+}
+
+pub fn cache_supported_game_versions(
+    paths: &Paths,
+    game_id: &str,
+    updates: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    mutate_load_order(paths, game_id, |order| {
+        for staged in &mut order.mods {
+            if let Some(versions) = updates.get(&staged.id) {
+                staged.supported_game_versions = Some(versions.clone());
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn cache_collection_game_versions(
+    paths: &Paths,
+    game_id: &str,
+    updates: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut store = load_collections(paths, game_id)?;
+    for collection in &mut store.collections {
+        if let Some(versions) = updates.get(&collection.id) {
+            collection.game_versions = Some(versions.clone());
+        }
+    }
+    save_collections(paths, game_id, &store)
 }
 
 fn copy_dir_all(src: &Path, dest: &Path) -> Result<()> {
@@ -1552,6 +1598,13 @@ fn stage_mod_inner(
             option_selection: provenance.option_selection,
             file_name: stored_file_name,
             picture_url: resolve_picture_url(None, &removed),
+            supported_game_versions: removed.iter().find_map(|old| {
+                if old.nexus_mod_id == mod_id {
+                    old.supported_game_versions.clone()
+                } else {
+                    None
+                }
+            }),
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -1675,6 +1728,7 @@ pub fn stage_thunderstore_mod(
             option_selection: provenance.option_selection,
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
+            supported_game_versions: None,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -1744,6 +1798,7 @@ pub fn stage_modio_mod(
             option_selection: provenance.option_selection,
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
+            supported_game_versions: None,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -2187,14 +2242,7 @@ pub fn deploy(
             .map(|set| IncludeFilter::build(&set, staged.option_selection.as_ref()))
             .filter(|f| !f.is_passthrough());
         let to_root = plugin.deploys_to_install_root(&root);
-        let wrap =
-            !to_root && (plugin.prefers_mod_folder() || plugin.should_wrap_as_mod_folder(&root));
-        if wrap {
-            let folder_name = plugin.wrap_mod_folder_name(&root, &staged.name);
-            if !folder_name.is_empty() {
-                enabled_mod_folders.push(folder_name);
-            }
-        }
+        enabled_mod_folders.extend(plugin.load_order_entries(&root, &staged.name));
         let deploy_root = if to_root {
             bepinex_pack_deploy_root(&root)
         } else {
@@ -4011,6 +4059,7 @@ mod tests {
                     profile_code: None,
                     mod_ids: vec!["1_10".into(), "1_20".into()],
                     installed_at: "t".into(),
+                    game_versions: None,
                 }],
             },
         )
@@ -4203,6 +4252,7 @@ mod tests {
                         profile_code: None,
                         mod_ids: vec!["A".into(), "Z".into()],
                         installed_at: "t".into(),
+                        game_versions: None,
                     },
                     InstalledCollection {
                         id: "col-b".into(),
@@ -4218,6 +4268,7 @@ mod tests {
                         profile_code: None,
                         mod_ids: vec!["B".into()],
                         installed_at: "t".into(),
+                        game_versions: None,
                     },
                 ],
             },

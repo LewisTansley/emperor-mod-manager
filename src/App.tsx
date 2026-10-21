@@ -10,7 +10,7 @@ import {
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api } from "./api";
 import {
   createQueueEntry,
@@ -28,11 +28,14 @@ import {
 } from "./catalogSources";
 import { ImageCarousel } from "./ImageCarousel";
 import { RichText } from "./RichText";
+import { browseGameVersionOptions } from "./gameVersion";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
 import { Modal } from "./Modal";
+import { LoadLogDialog } from "./LoadLogDialog";
 import { ModOptionsDialog } from "./ModOptionsDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
 import {
+  disabledRequirementWarnings,
   MissingRequirementsStrip,
   RequirementsDialog,
   requirementsNeedAttention,
@@ -55,11 +58,13 @@ import type {
   DownloadItem,
   GameHealth,
   GameInfo,
+  GameVersionReport,
   InstalledCollection,
   ManagedGame,
   ModDetail,
   ModFileInfo,
   MissingRequirements,
+  LoadDiagnosis,
   NexusRequirementDownload,
   Settings,
   StagedMod,
@@ -548,7 +553,7 @@ function openExternal(url: string) {
 function openPathInExplorer(path: string) {
   void (async () => {
     try {
-      await openPath(path);
+      await revealItemInDir(path);
     } catch (e) {
       console.error("Failed to open path", e);
     }
@@ -953,6 +958,9 @@ export default function App() {
     useState<MissingRequirements | null>(null);
   const [requirementsModal, setRequirementsModal] =
     useState<MissingRequirements | null>(null);
+  const [gameVersionReport, setGameVersionReport] =
+    useState<GameVersionReport | null>(null);
+  const [gameVersionDraft, setGameVersionDraft] = useState("");
   const [quickInstall, setQuickInstall] = useState<{
     hit: CatalogHit;
     mains: ModFileInfo[];
@@ -963,6 +971,7 @@ export default function App() {
   );
   const [modsWithOptions, setModsWithOptions] = useState<Set<string>>(new Set());
   const [modOptionsFor, setModOptionsFor] = useState<StagedMod | null>(null);
+  const [loadDiagnosis, setLoadDiagnosis] = useState<LoadDiagnosis | null>(null);
   const [modsQuery, setModsQuery] = useState("");
   const [modsStatusFilter, setModsStatusFilter] =
     useState<ModsStatusFilter>("all");
@@ -1132,6 +1141,7 @@ export default function App() {
   const pendingDownloadPageRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
   const modUpdatesReqRef = useRef(0);
   const missingReqRef = useRef(0);
+  const gameVersionReqRef = useRef(0);
   const pendingRequirementLinksRef = useRef<Map<string, string[]>>(new Map());
   const pictureFillInFlightRef = useRef(false);
   const pictureFillSkippedRef = useRef(new Set<string>());
@@ -1442,6 +1452,18 @@ export default function App() {
     }
   }, []);
 
+  const refreshGameVersions = useCallback(async (gameId: string) => {
+    const req = ++gameVersionReqRef.current;
+    try {
+      const report = await api.checkModGameVersions(gameId);
+      if (req !== gameVersionReqRef.current) return;
+      if (activeGameRef.current?.id !== gameId) return;
+      setGameVersionReport(report);
+    } catch (e) {
+      console.warn("check_mod_game_versions failed", e);
+    }
+  }, []);
+
   const refreshCollections = useCallback(async (gameId: string) => {
     const list = await api.listInstalledCollections(gameId);
     if (activeGameRef.current?.id !== gameId) return;
@@ -1651,6 +1673,30 @@ export default function App() {
     };
   }, [activeGame, libraryDetail?.tab, refreshModUpdates]);
 
+  const stagedDisabledRequirements = useMemo(
+    () => disabledRequirementWarnings(mods, missingRequirements),
+    [mods, missingRequirements],
+  );
+  const showGameVersionWarnings = settings?.game_version_warnings !== false;
+  const versionWarnings = useMemo(() => {
+    if (!showGameVersionWarnings) return [];
+    const names = new Map(mods.map((mod) => [mod.id, mod.name]));
+    return (gameVersionReport?.mods ?? [])
+      .filter((row) => row.status !== "ok")
+      .map((row) => ({
+        stagedId: row.staged_id,
+        name: names.get(row.staged_id) ?? "Mod",
+        message: row.message,
+      }));
+  }, [mods, gameVersionReport, showGameVersionWarnings]);
+  const modalDisabledRequirements = useMemo(
+    () =>
+      requirementsModal
+        ? disabledRequirementWarnings(mods, requirementsModal)
+        : [],
+    [mods, requirementsModal],
+  );
+
   const nexusModsKey = useMemo(
     () =>
       mods
@@ -1668,6 +1714,20 @@ export default function App() {
     if (libraryDetail?.tab !== "mods") return;
     void refreshMissingRequirements(activeGame.id);
   }, [activeGame, libraryDetail?.tab, nexusModsKey, refreshMissingRequirements]);
+
+  const stagedVersionKey = useMemo(
+    () => mods.map((mod) => `${mod.id}:${mod.nexus_mod_id}:${mod.collection_ids?.join(",") ?? ""}`).join("|"),
+    [mods],
+  );
+
+  useEffect(() => {
+    setGameVersionDraft(gameVersionReport?.current ?? "");
+  }, [gameVersionReport]);
+
+  useEffect(() => {
+    if (!activeGame || libraryDetail?.tab !== "mods") return;
+    void refreshGameVersions(activeGame.id);
+  }, [activeGame, libraryDetail?.tab, stagedVersionKey, refreshGameVersions]);
 
   useEffect(() => {
     setModsQuery("");
@@ -4330,6 +4390,34 @@ export default function App() {
     await refreshMods(activeGame.id);
   }
 
+  async function enableStagedMods(ids: string[]) {
+    if (!activeGame || ids.length === 0) return;
+    setError(null);
+    try {
+      for (const id of ids) {
+        await api.setModEnabled(activeGame.id, id, true);
+      }
+      await refreshMods(activeGame.id);
+    } catch (e) {
+      setError(String(e));
+      if (activeGame) await refreshMods(activeGame.id);
+    }
+  }
+
+  async function disableStagedMods(ids: string[]) {
+    if (!activeGame || ids.length === 0) return;
+    setError(null);
+    try {
+      for (const id of ids) {
+        await api.setModEnabled(activeGame.id, id, false);
+      }
+      await refreshMods(activeGame.id);
+    } catch (e) {
+      setError(String(e));
+      if (activeGame) await refreshMods(activeGame.id);
+    }
+  }
+
   async function moveMod(modId: string, dir: -1 | 1) {
     if (!activeGame || !canReorderMods) return;
     const next = [...mods];
@@ -4457,6 +4545,28 @@ export default function App() {
     }
   }
 
+  async function commitGameVersion(next: string) {
+    if (!activeGame || !gameVersionReport) return;
+    const trimmed = next.trim();
+    const saved = gameVersionReport.override_version ?? "";
+    const installed = gameVersionReport.installed ?? "";
+    const nextOverride = !trimmed || trimmed === installed ? "" : trimmed;
+    if (nextOverride === saved) {
+      setGameVersionDraft(gameVersionReport.current ?? "");
+      return;
+    }
+    try {
+      const updated = await api.setGameVersion(activeGame.id, nextOverride || null);
+      setManaged((prev) => prev.map((game) => (game.id === updated.id ? updated : game)));
+      setLibraryDetail((detail) =>
+        detail && detail.game.id === updated.id ? { ...detail, game: updated } : detail,
+      );
+      await refreshGameVersions(activeGame.id);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function deploy() {
     if (!activeGame) return;
     await withBusy("Deploying mods…", async () => {
@@ -4467,6 +4577,14 @@ export default function App() {
           setRequirementsModal(requirements);
         }),
       );
+    });
+  }
+
+  async function checkLoadLogs() {
+    if (!activeGame) return;
+    await withBusy("Checking loader logs…", async () => {
+      const result = await api.diagnoseLoad(activeGame.id);
+      setLoadDiagnosis(result);
     });
   }
 
@@ -4655,9 +4773,8 @@ export default function App() {
                 Account → API Access
               </a>
               . The API key authenticates browsing and Premium downloads. Free
-              accounts also need a one-time Nexus website sign-in inside Download
-              Assist (use Stay signed in); that session is saved in the app
-              separately from the API key.
+              accounts also need the Nexus website sign-in below (use Stay signed
+              in). That session is saved in the app separately from the API key.
             </p>
             {settings?.user && (
               <div className="status-card">
@@ -4693,6 +4810,25 @@ export default function App() {
                 Clear Nexus API key
               </button>
             )}
+            <h2 style={{ marginTop: "1.5rem" }}>Nexus website sign-in</h2>
+            <p>
+              Free accounts need a one-time website sign-in. Use Stay signed in.
+              The session is stored separately from the API key.
+            </p>
+            <div className="actions">
+              <button
+                type="button"
+                disabled={Boolean(assistQueue && !assistQueue.cancelled)}
+                title={
+                  assistQueue && !assistQueue.cancelled
+                    ? "Finish or cancel the Download Assist queue before signing in."
+                    : undefined
+                }
+                onClick={() => setNexusLoginOpen(true)}
+              >
+                Log in to Nexus
+              </button>
+            </div>
             <h2 style={{ marginTop: "1.5rem" }}>mod.io</h2>
             <p>
               Optional read-only API key from{" "}
@@ -5190,6 +5326,32 @@ export default function App() {
                       </div>
                       <div className="filters">
                         <label>
+                          Game version
+                          <input
+                            value={gameVersionDraft}
+                            placeholder={
+                              gameVersionReport ? "Unknown" : "Checking…"
+                            }
+                            aria-label="Game version"
+                            onChange={(e) => setGameVersionDraft(e.target.value)}
+                            onBlur={() => void commitGameVersion(gameVersionDraft)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.currentTarget.blur();
+                              }
+                            }}
+                          />
+                        </label>
+                        {gameVersionReport?.source === "override" && (
+                          <button
+                            type="button"
+                            className="filters-clear"
+                            onClick={() => void commitGameVersion("")}
+                          >
+                            Use detected
+                          </button>
+                        )}
+                        <label>
                           Status
                           <select
                             value={modsStatusFilter}
@@ -5275,6 +5437,9 @@ export default function App() {
                           <button type="button" onClick={deploy}>
                             Deploy
                           </button>
+                          <button type="button" onClick={() => void checkLoadLogs()}>
+                            Check logs
+                          </button>
                           <button type="button" onClick={purge}>
                             Purge
                           </button>
@@ -5298,14 +5463,37 @@ export default function App() {
                           Showing {visibleMods.length} of {mods.length}
                         </p>
                       )}
-                    </div>
-                    {missingRequirements &&
-                      requirementsNeedAttention(missingRequirements) && (
-                        <MissingRequirementsStrip
-                          requirements={missingRequirements}
-                          onReview={() => setRequirementsModal(missingRequirements)}
-                        />
+                      {gameVersionReport && !gameVersionReport.current && (
+                        <p className="note">
+                          Game version is unknown. Set it to check which mods support this install.
+                        </p>
                       )}
+                    </div>
+                    {((missingRequirements &&
+                      requirementsNeedAttention(missingRequirements)) ||
+                      stagedDisabledRequirements.length > 0 ||
+                      versionWarnings.length > 0) && (
+                      <MissingRequirementsStrip
+                        requirements={
+                          missingRequirements ?? {
+                            nexus: [],
+                            external: [],
+                            dlc: [],
+                          }
+                        }
+                        disabled={stagedDisabledRequirements}
+                        versions={versionWarnings}
+                        onReview={() =>
+                          setRequirementsModal(
+                            missingRequirements ?? {
+                              nexus: [],
+                              external: [],
+                              dlc: [],
+                            },
+                          )
+                        }
+                      />
+                    )}
                     <ul className="list mods">
                       {visibleMods.map((m) => {
                         const idx = modIndexById.get(m.id) ?? -1;
@@ -5320,12 +5508,20 @@ export default function App() {
                         const pageHit = activeGame
                           ? catalogHitFromStaged(m, activeGame)
                           : null;
+                        const versionWarning = versionWarnings.find(
+                          (row) => row.stagedId === m.id,
+                        );
                         const identity = (
                           <>
                             <ListPoster src={mediaSrc(null, m.picture_url)} />
                             <div className="mod-identity-text">
                               <strong>{m.name}</strong>
                               <small>{stagedModSourceLine(m)}</small>
+                              {versionWarning && (
+                                <small className="mod-version-warn">
+                                  {versionWarning.message}
+                                </small>
+                              )}
                             </div>
                           </>
                         );
@@ -6929,29 +7125,32 @@ export default function App() {
                           ))}
                         </select>
                       </label>
-                      {browseMode === "collections" && (
-                        <label>
-                          Game version
-                          <select
-                            value={browseVersion}
-                            onChange={(e) => {
-                              const gameVersion = e.target.value;
-                              setBrowseVersion(gameVersion);
-                              runSearch(browseMode, searchQuery, {
-                                ...browseOpts,
-                                gameVersion: gameVersion || null,
-                              });
-                            }}
-                          >
-                            <option value="">Any</option>
-                            {(browseMeta?.game_versions ?? []).map((v) => (
-                              <option key={v} value={v}>
-                                {v}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      )}
+                      <label>
+                        Game version
+                        <select
+                          value={browseVersion}
+                          title={
+                            browseMode === "mods"
+                              ? "Nexus mods tagged with this game version"
+                              : undefined
+                          }
+                          onChange={(e) => {
+                            const gameVersion = e.target.value;
+                            setBrowseVersion(gameVersion);
+                            runSearch(browseMode, searchQuery, {
+                              ...browseOpts,
+                              gameVersion: gameVersion || null,
+                            });
+                          }}
+                        >
+                          <option value="">Any</option>
+                          {browseGameVersionOptions(browseMeta, browseMode).map((v) => (
+                            <option key={v} value={v}>
+                              {v}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                       <div className="tag-picker" ref={tagPickerRef}>
                         <span className="tag-picker-label" id="browse-tags-label">
                           Tags
@@ -7756,6 +7955,19 @@ export default function App() {
             <label className="inline">
               <input
                 type="checkbox"
+                checked={settings?.game_version_warnings !== false}
+                onChange={(e) =>
+                  withBusy("Saving…", async () => {
+                    await api.setGameVersionWarnings(e.target.checked);
+                    await refreshSettings();
+                  })
+                }
+              />
+              Warn when a mod does not match the game version
+            </label>
+            <label className="inline">
+              <input
+                type="checkbox"
                 checked={settings?.autoclick_free_download ?? true}
                 onChange={(e) =>
                   withBusy("Saving…", async () => {
@@ -7878,6 +8090,13 @@ export default function App() {
           </section>
         )}
       </main>
+      {loadDiagnosis && (
+        <LoadLogDialog
+          diagnosis={loadDiagnosis}
+          gameTitle={activeGame?.title}
+          onClose={() => setLoadDiagnosis(null)}
+        />
+      )}
       {nexusLoginOpen && (
         <Modal
           className="modal-nexus-login"
@@ -7904,10 +8123,14 @@ export default function App() {
       {requirementsModal && (
         <RequirementsDialog
           requirements={requirementsModal}
+          disabled={modalDisabledRequirements}
+          versions={versionWarnings}
           isPremium={isPremium}
           busy={Boolean(busy)}
           onClose={() => setRequirementsModal(null)}
           onAddSelected={(rows) => void queueSelectedRequirements(rows)}
+          onEnable={(ids) => void enableStagedMods(ids)}
+          onDisable={(ids) => void disableStagedMods(ids)}
         />
       )}
       {modOptionsFor && activeGame && (

@@ -14,15 +14,18 @@ mod creation_engine;
 mod cyberpunk2077;
 mod daysgone;
 mod dressmaker;
+mod exe_version;
 mod fromsoft_loaders;
 mod fromsoftware;
 mod helldivers2;
 mod kingdomcome;
+mod log_sources;
 mod melonloader;
 mod monsterhunterworld;
 mod mountandblade;
 mod mysummercar;
 mod nomanssky;
+mod projectzomboid;
 mod re_engine;
 mod rimworld;
 mod sevendaystodie;
@@ -49,6 +52,7 @@ pub use cyberpunk2077::Cyberpunk2077Plugin;
 pub use daysgone::DaysGonePlugin;
 pub(crate) use dressmaker::plugin_id_for_install;
 pub use dressmaker::DressmakerPlugin;
+pub use exe_version::detect_install_version;
 pub use fromsoft_loaders::{
     ensure_fromsoft_loaders, finish_legacy_after_assist, install_legacy_from_archive,
     is_fromsoft_plugin, legacy_loader_ready, EnsureLoadersOutcome, LegacyAssistRequest,
@@ -63,6 +67,7 @@ pub use monsterhunterworld::MonsterHunterWorldPlugin;
 pub use mountandblade::{MountAndBlade2BannerlordPlugin, MountAndBladeWarbandPlugin};
 pub use mysummercar::MySummerCarPlugin;
 pub use nomanssky::NoMansSkyPlugin;
+pub use projectzomboid::ProjectZomboidPlugin;
 pub use re_engine::{
     MonsterHunterRisePlugin, MonsterHunterWildsPlugin, ResidentEvil22019Plugin,
     ResidentEvil32020Plugin, ResidentEvil42023Plugin, ResidentEvil7Plugin,
@@ -127,6 +132,13 @@ pub trait GamePlugin: Send + Sync {
         &[]
     }
 
+    /// When true, a single top-level archive folder with this name is kept.
+    fn preserves_staging_root(&self, name: &str) -> bool {
+        self.preserve_staging_root_names()
+            .iter()
+            .any(|root| name.eq_ignore_ascii_case(root))
+    }
+
     /// When true, deploy under a sanitized mod-name folder (e.g. REDmod info.json packs).
     fn should_wrap_as_mod_folder(&self, _content_root: &Path) -> bool {
         false
@@ -188,8 +200,26 @@ pub trait GamePlugin: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Called after files are linked. `enabled_mod_folders` are resolved wrap names
-    /// for mods that should appear in a native load-order file (may be empty).
+    /// Names this staged mod contributes to a native load-order file.
+    ///
+    /// The default is the wrap folder name when the mod is deployed under one
+    /// folder, which is what `after_deploy` has always received.
+    fn load_order_entries(&self, content_root: &Path, staged_name: &str) -> Vec<String> {
+        let wrap = !self.deploys_to_install_root(content_root)
+            && (self.prefers_mod_folder() || self.should_wrap_as_mod_folder(content_root));
+        if !wrap {
+            return Vec::new();
+        }
+        let name = self.wrap_mod_folder_name(content_root, staged_name);
+        if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![name]
+        }
+    }
+
+    /// Called after files are linked. `enabled_mod_folders` are load-order entries
+    /// from `load_order_entries` (wrap folder names, unless a plugin overrides that).
     /// Returns optional warning strings (deploy succeeds even if warnings are returned).
     fn after_deploy(
         &self,
@@ -203,6 +233,41 @@ pub trait GamePlugin: Send + Sync {
     fn plugin_skips(&self, _install_path: &Path) -> Vec<PluginSkip> {
         Vec::new()
     }
+
+    /// Loader and crash logs this game writes. Missing files are included so a
+    /// diagnosis can say the loader never ran.
+    fn load_log_sources(&self, _install_path: &Path) -> Vec<LogSource> {
+        Vec::new()
+    }
+}
+
+/// A loader or engine log the diagnosis pass knows how to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogKind {
+    BepInEx,
+    MelonLoader,
+    Smapi,
+    ReFramework,
+    Ue4ss,
+    ScriptExtender,
+    CrashLog,
+    /// A plugin's own text log next to the script extender log.
+    PluginLog,
+    /// Papyrus script log. Only useful when it is from the same launch.
+    Papyrus,
+    /// Binary minidump. Mentioned, never parsed.
+    CrashDump,
+    Ds2Lighting,
+    CrLoader,
+    Player,
+    Console,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogSource {
+    pub label: String,
+    pub kind: LogKind,
+    pub path: PathBuf,
 }
 
 /// A plugin omitted at deploy because one of its masters is not loadable.
@@ -262,6 +327,7 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &TheForestPlugin,
         &MySummerCarPlugin,
         &SevenDaysToDiePlugin,
+        &ProjectZomboidPlugin,
         &RimWorldPlugin,
         &NoMansSkyPlugin,
         &Sims4Plugin,
@@ -415,10 +481,7 @@ pub fn normalize_staging_root(staging_dir: &Path, plugin: &dyn GamePlugin) -> Re
         if only.file_type()?.is_dir() {
             let name = only.file_name();
             let name = name.to_string_lossy();
-            let preserve = plugin
-                .preserve_staging_root_names()
-                .iter()
-                .any(|root| name.eq_ignore_ascii_case(root));
+            let preserve = plugin.preserves_staging_root(&name);
             if !preserve {
                 return Ok(only.path());
             }

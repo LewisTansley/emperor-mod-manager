@@ -19,7 +19,7 @@ use tokio::io::AsyncWriteExt;
 use crate::config::{APP_NAME, APP_VERSION};
 
 pub mod requirements;
-pub use requirements::{collect_missing, MissingRequirements, RequirementRoot};
+pub use requirements::{collect_missing, MissingRequirements, RequirementRoot, StagedNexusMod};
 
 const REST_BASE: &str = "https://api.nexusmods.com/v1";
 const GQL_URL: &str = "https://api.nexusmods.com/v2/graphql";
@@ -1497,6 +1497,101 @@ impl NexusClient {
             .collect())
     }
 
+    /// Version-like author tags for the given mod ids, keyed by mod id.
+    pub async fn mod_version_tags(
+        &self,
+        domain: &str,
+        mod_ids: &[u64],
+    ) -> Result<std::collections::HashMap<u64, Vec<String>>> {
+        let mut out = std::collections::HashMap::new();
+        if mod_ids.is_empty() {
+            return Ok(out);
+        }
+        let gql = r#"
+        query ModVersionTags($filter: ModsFilter, $count: Int!) {
+          mods(filter: $filter, count: $count) {
+            nodes {
+              modId
+              tags { name }
+            }
+          }
+        }
+        "#;
+        for chunk in mod_ids.chunks(40) {
+            let data = self
+                .graphql(
+                    gql,
+                    json!({
+                        "filter": mods_id_filter(domain, chunk),
+                        "count": chunk.len().max(1),
+                    }),
+                )
+                .await?;
+            let nodes = data
+                .pointer("/mods/nodes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for node in nodes {
+                let Some(id) = node.get("modId").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let tags = node
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                t.get("name").and_then(|v| v.as_str()).map(str::to_string)
+                            })
+                            .filter(|t| looks_like_version(t))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.insert(id, tags);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Game versions a collection revision says it was built for.
+    pub async fn collection_game_versions(
+        &self,
+        slug: &str,
+        revision: Option<i64>,
+        adult_content: bool,
+    ) -> Result<Vec<String>> {
+        let gql = r#"
+        query CollectionRevisionVersions($revision: Int, $slug: String!, $viewAdultContent: Boolean) {
+          collectionRevision(revision: $revision, slug: $slug, viewAdultContent: $viewAdultContent) {
+            gameVersions { reference }
+          }
+        }
+        "#;
+        let data = self
+            .graphql(
+                gql,
+                json!({
+                    "slug": slug,
+                    "revision": revision,
+                    "viewAdultContent": adult_content,
+                }),
+            )
+            .await?;
+        let mut versions = Vec::new();
+        if let Some(arr) = data
+            .pointer("/collectionRevision/gameVersions")
+            .and_then(|v| v.as_array())
+        {
+            for item in arr {
+                if let Some(reference) = item.get("reference").and_then(|v| v.as_str()) {
+                    push_unique(&mut versions, reference);
+                }
+            }
+        }
+        Ok(versions)
+    }
+
     pub(super) async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let resp = self
             .http
@@ -1867,8 +1962,19 @@ fn build_mods_filter(
     if let Some(cat) = opts.category.as_ref().filter(|s| !s.is_empty()) {
         filter["categoryName"] = json!([{ "value": cat, "op": "EQUALS" }]);
     }
-    // ModsFilter has no gameVersion field; do not stuff versions into tag.
-    apply_tag_filters(&mut filter, &opts.tags_include, &opts.tags_exclude);
+    // ModsFilter has no gameVersion field. Authors publish support as tags.
+    let mut include = opts.tags_include.clone();
+    if let Some(ver) = opts
+        .game_version
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if !include.iter().any(|t| t.eq_ignore_ascii_case(ver)) {
+            include.insert(0, ver.to_string());
+        }
+    }
+    apply_tag_filters(&mut filter, &include, &opts.tags_exclude);
     filter
 }
 
@@ -1998,7 +2104,25 @@ fn merge_facet_bucket(
     }
 }
 
-fn looks_like_version(s: &str) -> bool {
+pub(crate) fn mods_id_filter(domain: &str, mod_ids: &[u64]) -> Value {
+    if mod_ids.len() == 1 {
+        return json!({
+            "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
+            "modId": [{ "value": mod_ids[0].to_string(), "op": "EQUALS" }],
+        });
+    }
+    let nested: Vec<Value> = mod_ids
+        .iter()
+        .map(|id| json!({ "modId": [{ "value": id.to_string(), "op": "EQUALS" }] }))
+        .collect();
+    json!({
+        "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
+        "op": "AND",
+        "filter": [{ "op": "OR", "filter": nested }],
+    })
+}
+
+pub(crate) fn looks_like_version(s: &str) -> bool {
     let trimmed = s.trim();
     if trimmed.is_empty() || trimmed.len() > 24 {
         return false;
@@ -2325,12 +2449,41 @@ mod tests {
     }
 
     #[test]
-    fn mods_filter_ignores_game_version() {
+    fn mods_id_filter_ors_multiple_ids() {
+        let filter = mods_id_filter("skyrim", &[1, 2]);
+        assert_eq!(filter["op"], json!("AND"));
+        assert_eq!(
+            filter["filter"][0]["filter"],
+            json!([
+                { "modId": [{ "value": "1", "op": "EQUALS" }] },
+                { "modId": [{ "value": "2", "op": "EQUALS" }] },
+            ])
+        );
+    }
+
+    #[test]
+    fn mods_filter_game_version_is_a_tag() {
         let mut opts = base_opts();
         opts.game_version = Some("1.6.0".into());
         let filter = build_mods_filter("skyrim", "", true, &opts);
-        assert!(filter.get("tag").is_none());
         assert!(filter.get("gameVersion").is_none());
+        assert_eq!(filter["tag"], json!([{ "value": "1.6.0", "op": "EQUALS" }]));
+    }
+
+    #[test]
+    fn mods_filter_game_version_ands_with_tags() {
+        let mut opts = base_opts();
+        opts.game_version = Some("1.6.0".into());
+        opts.tags_include = vec!["Gameplay".into()];
+        let filter = build_mods_filter("skyrim", "", true, &opts);
+        assert_eq!(filter["op"], json!("AND"));
+        assert_eq!(
+            filter["filter"],
+            json!([
+                { "tag": [{ "value": "1.6.0", "op": "EQUALS" }] },
+                { "tag": [{ "value": "Gameplay", "op": "EQUALS" }] },
+            ])
+        );
     }
 
     #[test]

@@ -492,6 +492,10 @@ macro_rules! ue_title_plugin {
                 let preferred = ctx.project_name.or(Some($project));
                 ue_preflight_warnings(install_path, preferred)
             }
+
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                super::log_sources::ue4ss_log_sources(install_path)
+            }
         }
     };
 }
@@ -704,6 +708,10 @@ impl GamePlugin for MarvelRivalsPlugin {
         );
         warnings
     }
+
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        super::log_sources::ue4ss_log_sources(&marvel_ue_install_root(install_path))
+    }
 }
 
 pub struct PavlovPlugin;
@@ -758,6 +766,10 @@ impl GamePlugin for PavlovPlugin {
         );
         warnings
     }
+
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        super::log_sources::ue4ss_log_sources(install_path)
+    }
 }
 
 /// Generic UE plugin: any install with detected (or overridden) project folder.
@@ -800,6 +812,10 @@ impl GamePlugin for UnrealEnginePlugin {
 
     fn preflight_warnings_ctx(&self, install_path: &Path, ctx: &DeployContext<'_>) -> Vec<String> {
         ue_preflight_warnings(install_path, ctx.project_name)
+    }
+
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        super::log_sources::ue4ss_log_sources(install_path)
     }
 }
 

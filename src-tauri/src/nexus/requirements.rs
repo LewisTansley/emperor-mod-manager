@@ -45,11 +45,33 @@ pub struct DlcRequirementNote {
     pub required_by_names: Vec<String>,
 }
 
+/// A staged mod that already satisfies a Nexus requirement. Enabled and disabled
+/// both count, so the UI can warn when an unticked copy is still required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedRequirementNote {
+    pub staged_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub required_by: Vec<String>,
+    pub required_by_names: Vec<String>,
+}
+
+/// Staged Nexus mod already on disk for this game.
+#[derive(Debug, Clone)]
+pub struct StagedNexusMod {
+    pub staged_id: String,
+    pub name: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MissingRequirements {
     pub nexus: Vec<NexusRequirementDownload>,
     pub external: Vec<ExternalRequirementLink>,
     pub dlc: Vec<DlcRequirementNote>,
+    /// Staged mods that match a Nexus requirement. Not offered as downloads.
+    #[serde(default)]
+    pub staged: Vec<StagedRequirementNote>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -220,6 +242,7 @@ struct Listed {
     nexus: HashMap<(u64, u64), usize>,
     external: HashMap<String, usize>,
     dlc: HashMap<String, usize>,
+    staged: HashMap<(u64, u64), usize>,
 }
 
 impl Listed {
@@ -228,6 +251,7 @@ impl Listed {
             nexus: HashMap::new(),
             external: HashMap::new(),
             dlc: HashMap::new(),
+            staged: HashMap::new(),
         }
     }
 }
@@ -236,12 +260,13 @@ impl Listed {
 ///
 /// `pages` is keyed by `(game_id, mod_id)`. `files` is keyed by `(domain, mod_id)`.
 /// `staged` is `(domain lowercase, mod_id)` already installed for this game.
+/// Those mods are recorded on `staged` notes and are not offered as downloads.
 pub fn assemble_missing(
     roots: &[RequirementRoot],
     pages: &HashMap<(u64, u64), RequirementPage>,
     files: &HashMap<(String, u64), Vec<ModFileInfo>>,
     domains: &HashMap<u64, String>,
-    staged: &HashSet<(String, u64)>,
+    staged: &HashMap<(String, u64), StagedNexusMod>,
 ) -> MissingRequirements {
     let mut out = MissingRequirements::default();
     let mut listed = Listed::new();
@@ -304,7 +329,7 @@ fn walk_node(
     pages: &HashMap<(u64, u64), RequirementPage>,
     files: &HashMap<(String, u64), Vec<ModFileInfo>>,
     domains: &HashMap<u64, String>,
-    staged: &HashSet<(String, u64)>,
+    staged: &HashMap<(String, u64), StagedNexusMod>,
     out: &mut MissingRequirements,
     listed: &mut Listed,
     emitted: &mut HashSet<(u64, u64)>,
@@ -361,16 +386,41 @@ fn walk_node(
     }
 }
 
-fn is_staged(
+fn lookup_staged<'a>(
     domains: &HashMap<u64, String>,
-    staged: &HashSet<(String, u64)>,
+    staged: &'a HashMap<(String, u64), StagedNexusMod>,
     game_id: u64,
     mod_id: u64,
-) -> Option<String> {
+) -> Option<&'a StagedNexusMod> {
     let domain = domains.get(&game_id)?;
-    staged
-        .contains(&(domain.to_lowercase(), mod_id))
-        .then(|| domain.clone())
+    staged.get(&(domain.to_lowercase(), mod_id))
+}
+
+fn add_staged(
+    out: &mut MissingRequirements,
+    listed: &mut Listed,
+    hit: &StagedNexusMod,
+    game_id: u64,
+    mod_id: u64,
+    root: &RequirementRoot,
+) {
+    let key = (game_id, mod_id);
+    if let Some(idx) = listed.staged.get(&key).copied() {
+        let row = &mut out.staged[idx];
+        remember_root(&mut row.required_by, &mut row.required_by_names, root);
+        return;
+    }
+    let mut required_by = Vec::new();
+    let mut required_by_names = Vec::new();
+    remember_root(&mut required_by, &mut required_by_names, root);
+    listed.staged.insert(key, out.staged.len());
+    out.staged.push(StagedRequirementNote {
+        staged_id: hit.staged_id.clone(),
+        name: hit.name.clone(),
+        enabled: hit.enabled,
+        required_by,
+        required_by_names,
+    });
 }
 
 fn emit_nexus_or_link(
@@ -379,14 +429,15 @@ fn emit_nexus_or_link(
     node: &RequirementNode,
     files: &HashMap<(String, u64), Vec<ModFileInfo>>,
     domains: &HashMap<u64, String>,
-    staged: &HashSet<(String, u64)>,
+    staged: &HashMap<(String, u64), StagedNexusMod>,
     root: &RequirementRoot,
 ) {
     let Some(domain) = domains.get(&node.game_id).cloned() else {
         add_external(out, listed, node, None, root);
         return;
     };
-    if is_staged(domains, staged, node.game_id, node.mod_id).is_some() {
+    if let Some(hit) = lookup_staged(domains, staged, node.game_id, node.mod_id) {
+        add_staged(out, listed, hit, node.game_id, node.mod_id, root);
         return;
     }
     let chosen = files
@@ -543,6 +594,10 @@ fn attach_existing(
         let row = &mut out.external[idx];
         remember_root(&mut row.required_by, &mut row.required_by_names, root);
     }
+    if let Some(idx) = listed.staged.get(&(node.game_id, node.mod_id)).copied() {
+        let row = &mut out.staged[idx];
+        remember_root(&mut row.required_by, &mut row.required_by_names, root);
+    }
 }
 
 impl NexusClient {
@@ -604,7 +659,7 @@ pub async fn collect_missing(
     client: &NexusClient,
     roots: &[RequirementRoot],
     domains: &HashMap<u64, String>,
-    staged: &HashSet<(String, u64)>,
+    staged: &HashMap<(String, u64), StagedNexusMod>,
 ) -> MissingRequirements {
     let mut pages: HashMap<(u64, u64), RequirementPage> = HashMap::new();
     let mut errors = Vec::new();
@@ -656,7 +711,7 @@ pub async fn collect_missing(
             let Some(domain) = domains.get(&node.game_id) else {
                 continue;
             };
-            if staged.contains(&(domain.to_lowercase(), node.mod_id)) {
+            if staged.contains_key(&(domain.to_lowercase(), node.mod_id)) {
                 continue;
             }
             let key = (domain.clone(), node.mod_id);
@@ -706,6 +761,14 @@ mod tests {
             name: name.into(),
             notes: None,
             url: url.into(),
+        }
+    }
+
+    fn staged_hit(id: &str, name: &str, enabled: bool) -> StagedNexusMod {
+        StagedNexusMod {
+            staged_id: id.into(),
+            name: name.into(),
+            enabled,
         }
     }
 
@@ -857,8 +920,11 @@ mod tests {
         files.insert(("skyrim".into(), 40), vec![file(400, "MAIN", true)]);
         let mut domains = HashMap::new();
         domains.insert(1, "skyrim".into());
-        let mut staged = HashSet::new();
-        staged.insert(("skyrim".into(), 40));
+        let mut staged = HashMap::new();
+        staged.insert(
+            ("skyrim".into(), 40),
+            staged_hit("40_1", "Already installed", true),
+        );
 
         let missing = assemble_missing(
             &[root("10_1", "My Mod", 1, 10)],
@@ -872,8 +938,72 @@ mod tests {
         assert_eq!(missing.nexus[0].file_id, 300);
         assert_eq!(missing.nexus[0].required_by, vec!["10_1".to_string()]);
         assert!(missing.nexus.iter().all(|n| n.mod_id != 40));
+        assert_eq!(missing.staged.len(), 1);
+        assert_eq!(missing.staged[0].staged_id, "40_1");
+        assert!(missing.staged[0].enabled);
+        assert_eq!(missing.staged[0].required_by, vec!["10_1".to_string()]);
         assert_eq!(missing.dlc[0].name, "Expansion");
         assert!(missing.external.is_empty());
+    }
+
+    #[test]
+    fn staged_requirements_are_noted_and_not_offered_as_downloads() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            (1, 10),
+            RequirementPage {
+                nodes: vec![
+                    node(false, 1, 20, "Disabled req", ""),
+                    node(false, 1, 30, "Enabled req", ""),
+                ],
+                total_count: 2,
+                dlc: vec![],
+            },
+        );
+        pages.insert((1, 20), RequirementPage::default());
+        pages.insert((1, 30), RequirementPage::default());
+        let mut files = HashMap::new();
+        files.insert(("skyrim".into(), 20), vec![file(200, "MAIN", true)]);
+        files.insert(("skyrim".into(), 30), vec![file(300, "MAIN", true)]);
+        let mut domains = HashMap::new();
+        domains.insert(1, "skyrim".into());
+        let mut staged = HashMap::new();
+        staged.insert(("skyrim".into(), 20), staged_hit("20_1", "SkyUI", false));
+        staged.insert(
+            ("skyrim".into(), 30),
+            staged_hit("30_1", "Address Library", true),
+        );
+        let missing = assemble_missing(
+            &[root("10_1", "First", 1, 10), root("11_1", "Second", 1, 10)],
+            &pages,
+            &files,
+            &domains,
+            &staged,
+        );
+        assert!(missing.nexus.is_empty());
+        assert_eq!(missing.staged.len(), 2);
+        let disabled = missing
+            .staged
+            .iter()
+            .find(|n| n.staged_id == "20_1")
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.name, "SkyUI");
+        assert_eq!(
+            disabled.required_by,
+            vec!["10_1".to_string(), "11_1".to_string()]
+        );
+        assert_eq!(
+            disabled.required_by_names,
+            vec!["First".to_string(), "Second".to_string()]
+        );
+        let enabled = missing
+            .staged
+            .iter()
+            .find(|n| n.staged_id == "30_1")
+            .unwrap();
+        assert!(enabled.enabled);
+        assert_eq!(enabled.name, "Address Library");
     }
 
     #[test]
@@ -896,7 +1026,7 @@ mod tests {
             &pages,
             &files,
             &domains,
-            &HashSet::new(),
+            &HashMap::new(),
         );
         assert_eq!(missing.nexus.len(), 1);
         assert_eq!(
@@ -939,7 +1069,7 @@ mod tests {
             &pages,
             &HashMap::new(),
             &domains,
-            &HashSet::new(),
+            &HashMap::new(),
         );
         assert!(missing.nexus.is_empty());
         assert_eq!(missing.external.len(), 3);
@@ -980,7 +1110,7 @@ mod tests {
         );
         let mut domains = HashMap::new();
         domains.insert(1704, "skyrimspecialedition".into());
-        let mut missing = assemble_missing(&roots, &pages, &files, &domains, &HashSet::new());
+        let mut missing = assemble_missing(&roots, &pages, &files, &domains, &HashMap::new());
         missing.error = missing_error(&errors);
         assert!(missing.error.is_none());
         assert_eq!(missing.nexus.len(), 1);

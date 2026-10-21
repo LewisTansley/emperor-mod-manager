@@ -46,6 +46,8 @@ export type ManagedGame = {
   thunderstore_community?: string | null;
   modio_game_id?: number | null;
   tool_overrides?: GameToolOverrides | null;
+  /** User-set game version. Empty means use the detected executable version. */
+  game_version?: string | null;
 };
 
 export type ToolGameState = {
@@ -411,6 +413,8 @@ export type InstalledCollection = {
   profile_code?: string | null;
   mod_ids: string[];
   installed_at: string;
+  /** Game versions this collection revision was built for. */
+  game_versions?: string[] | null;
 };
 
 export type ShareGameHint = {
@@ -499,6 +503,23 @@ export type ImportCodeResult =
   | { kind: "emperor"; result: ShareImportResult }
   | { kind: "thunderstore_profile"; collection: InstalledCollection };
 
+export type ModVersionStatus = "ok" | "mismatch" | "unknown";
+
+export type ModVersionAdvice = {
+  staged_id: string;
+  status: ModVersionStatus;
+  supported: string[];
+  message: string;
+};
+
+export type GameVersionReport = {
+  installed: string | null;
+  override_version: string | null;
+  current: string | null;
+  source: "override" | "detected" | "unknown";
+  mods: ModVersionAdvice[];
+};
+
 export type StagedMod = {
   id: string;
   name: string;
@@ -524,6 +545,8 @@ export type StagedMod = {
   file_name?: string | null;
   /** Catalog poster. Null means not looked up yet; empty means there is no image. */
   picture_url?: string | null;
+  /** Version-like Nexus tags. Null means not looked up yet. */
+  supported_game_versions?: string[] | null;
 };
 
 export type ModSubOption = {
@@ -625,10 +648,20 @@ export type DlcRequirementNote = {
   required_by_names: string[];
 };
 
+/** A staged mod that matches a Nexus requirement. Not offered as a download. */
+export type StagedRequirementNote = {
+  staged_id: string;
+  name: string;
+  enabled: boolean;
+  required_by: string[];
+  required_by_names: string[];
+};
+
 export type MissingRequirements = {
   nexus: NexusRequirementDownload[];
   external: ExternalRequirementLink[];
   dlc: DlcRequirementNote[];
+  staged?: StagedRequirementNote[];
   error?: string | null;
 };
 
@@ -643,6 +676,22 @@ export type DeployResult = {
   warnings: string[];
   plugin_skips?: PluginSkip[];
   missing_requirements?: MissingRequirements;
+};
+
+export type LoadFinding = {
+  severity: string;
+  title: string;
+  detail: string;
+  related_mod?: string | null;
+};
+
+export type LoadDiagnosis = {
+  summary: string;
+  findings: LoadFinding[];
+  report: string;
+  excerpt_label: string;
+  excerpt_path: string;
+  excerpt: string;
 };
 
 export type RecoveryReport = {
@@ -700,6 +749,7 @@ export type DownloadItem = {
 
 export type Settings = {
   adult_content: boolean;
+  game_version_warnings: boolean;
   autoclick_free_download: boolean;
   last_active_game_id: string | null;
   theme?: ThemePreference;

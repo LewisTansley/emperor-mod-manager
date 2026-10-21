@@ -163,6 +163,10 @@ macro_rules! ce_title_plugin {
                 extender_preflight(install_path, $title)
             }
 
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                extender_log_sources(install_path, $title.steam_app_id, $title.id)
+            }
+
             fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
                 if looks_like_script_extender(content_root) {
                     vec![format!(
@@ -255,6 +259,14 @@ impl GamePlugin for OblivionRemasteredPlugin {
         warnings
     }
 
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        extender_log_sources(
+            install_path,
+            OBLIVION_REMASTERED_APP_ID,
+            "oblivionremastered",
+        )
+    }
+
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
         Ok(resolve_obr_deploy(install_path, relative))
     }
@@ -309,6 +321,284 @@ fn looks_like_script_extender(content_root: &Path) -> bool {
         }
     }
     false
+}
+
+struct ExtenderLogs {
+    folder: &'static str,
+    my_games: &'static str,
+    /// Listed even when the file is missing, so a game that never launched
+    /// still reports that the loader did not run.
+    expected: &'static [&'static str],
+    /// Older names. Included only when the file is actually there.
+    legacy: &'static [&'static str],
+}
+
+fn extender_logs(plugin_id: &str) -> Option<ExtenderLogs> {
+    Some(match plugin_id {
+        "skyrimspecialedition" => ExtenderLogs {
+            folder: "SKSE",
+            my_games: "Skyrim Special Edition",
+            expected: &["skse64.log", "skse64_loader.log"],
+            legacy: &[],
+        },
+        "fallout4" => ExtenderLogs {
+            folder: "F4SE",
+            my_games: "Fallout4",
+            expected: &["f4se.log", "f4se_loader.log"],
+            legacy: &[],
+        },
+        "starfield" => ExtenderLogs {
+            folder: "SFSE",
+            my_games: "Starfield",
+            expected: &["Logs/sfse.txt", "Logs/sfse_loader.log"],
+            legacy: &[
+                "sfse.log",
+                "sfse_loader.txt",
+                "Logs/sfse.log",
+                "Logs/sfse_loader.txt",
+            ],
+        },
+        "oblivionremastered" => ExtenderLogs {
+            folder: "OBSE",
+            my_games: "Oblivion Remastered",
+            expected: &["obse64.log", "obse64_loader.log"],
+            legacy: &[],
+        },
+        _ => return None,
+    })
+}
+
+fn extender_log_sources(
+    install_path: &Path,
+    steam_app_id: &str,
+    plugin_id: &str,
+) -> Vec<super::LogSource> {
+    let Some(spec) = extender_logs(plugin_id) else {
+        return Vec::new();
+    };
+    let Some(docs) = super::user_data::documents_dir(install_path, steam_app_id) else {
+        return Vec::new();
+    };
+    let base = ci_join(
+        &docs,
+        &format!("My Games/{}/{}", spec.my_games, spec.folder),
+    );
+    let mut sources = Vec::new();
+    for relative in spec.expected {
+        push_extender_log(
+            &mut sources,
+            spec.folder,
+            ci_join(&base, relative),
+            super::LogKind::ScriptExtender,
+        );
+    }
+    for relative in spec.legacy {
+        let path = ci_join(&base, relative);
+        if path.is_file() {
+            push_extender_log(
+                &mut sources,
+                spec.folder,
+                path,
+                super::LogKind::ScriptExtender,
+            );
+        }
+    }
+    let scan_dirs = ["", "Logs", "Crashlogs"]
+        .into_iter()
+        .map(|relative| {
+            if relative.is_empty() {
+                base.clone()
+            } else {
+                ci_join(&base, relative)
+            }
+        })
+        .collect::<Vec<_>>();
+    for path in newest_crash_logs(&scan_dirs) {
+        push_extender_log(&mut sources, spec.folder, path, super::LogKind::CrashLog);
+    }
+    for path in newest_plugin_logs(&plugin_log_dirs(&base), &sources) {
+        push_extender_log(&mut sources, spec.folder, path, super::LogKind::PluginLog);
+    }
+    if let Some(path) = papyrus_log(&base) {
+        push_extender_log(&mut sources, spec.folder, path, super::LogKind::Papyrus);
+    }
+    if let Some(path) = newest_crash_dump(&scan_dirs) {
+        push_extender_log(&mut sources, spec.folder, path, super::LogKind::CrashDump);
+    }
+    sources
+}
+
+fn push_extender_log(
+    sources: &mut Vec<super::LogSource>,
+    folder: &str,
+    path: PathBuf,
+    kind: super::LogKind,
+) {
+    if sources.iter().any(|source| source.path == path) {
+        return;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let label = match kind {
+        super::LogKind::CrashLog => format!("{folder} crash log"),
+        super::LogKind::CrashDump => format!("{folder} crash dump"),
+        super::LogKind::Papyrus => format!("{folder} Papyrus log"),
+        super::LogKind::PluginLog if !name.is_empty() => format!("{folder} plugin log {name}"),
+        super::LogKind::PluginLog => format!("{folder} plugin log"),
+        _ if name.to_lowercase().contains("loader") => format!("{folder} loader log"),
+        _ => format!("{folder} log"),
+    };
+    sources.push(super::LogSource { label, kind, path });
+}
+
+/// Walk `relative` from `root`, keeping the on-disk spelling when a folder exists.
+fn ci_join(root: &Path, relative: &str) -> PathBuf {
+    let mut out = root.to_path_buf();
+    for part in relative.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        let matches = ci_child_names(&out, part);
+        if matches.len() == 1 {
+            out.push(&matches[0]);
+        } else {
+            out.push(part);
+        }
+    }
+    out
+}
+
+fn is_text_crash_log(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "crashlogger.log" || !lower.ends_with(".log") {
+        return false;
+    }
+    let stem = &lower[..lower.len() - 4];
+    stem.starts_with("crash_") || stem.starts_with("crash-")
+}
+
+fn newest_crash_logs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !is_text_crash_log(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_file() && !found.iter().any(|existing: &PathBuf| existing == &path) {
+                found.push(path);
+            }
+        }
+    }
+    sort_newest(&mut found);
+    found.truncate(2);
+    found
+}
+
+/// `Logs/` when the extender uses one (Starfield). Otherwise the extender folder
+/// itself, where SKSE/F4SE/OBSE keep plugin logs next to the loader log.
+fn plugin_log_dirs(base: &Path) -> Vec<PathBuf> {
+    let logs = ci_join(base, "Logs");
+    if logs.is_dir() {
+        vec![logs]
+    } else if base.is_dir() {
+        vec![base.to_path_buf()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_extender_log_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("sfse")
+        || lower.starts_with("skse")
+        || lower.starts_with("f4se")
+        || lower.starts_with("obse")
+}
+
+fn is_plugin_side_log(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if is_extender_log_name(name) || is_text_crash_log(name) {
+        return false;
+    }
+    lower.ends_with(".log") || lower.ends_with(".txt")
+}
+
+fn newest_plugin_logs(dirs: &[PathBuf], already: &[super::LogSource]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !is_plugin_side_log(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_file() || found.iter().any(|existing: &PathBuf| existing == &path) {
+                continue;
+            }
+            if already.iter().any(|source| source.path == path) {
+                continue;
+            }
+            found.push(path);
+        }
+    }
+    sort_newest(&mut found);
+    found.truncate(3);
+    found
+}
+
+fn papyrus_log(extender_base: &Path) -> Option<PathBuf> {
+    let game_docs = extender_base.parent()?;
+    let path = ci_join(game_docs, "Logs/Script/Papyrus.0.log");
+    path.is_file().then_some(path)
+}
+
+fn is_crash_dump(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".dmp")
+}
+
+fn newest_crash_dump(dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !is_crash_dump(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_file() && !found.iter().any(|existing: &PathBuf| existing == &path) {
+                found.push(path);
+            }
+        }
+    }
+    sort_newest(&mut found);
+    found.into_iter().next()
+}
+
+fn sort_newest(paths: &mut [PathBuf]) {
+    paths.sort_by(|a, b| {
+        let modified = |path: &Path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        };
+        modified(b).cmp(&modified(a))
+    });
 }
 
 fn extender_preflight(install_path: &Path, title: CreationTitle) -> Vec<String> {
@@ -1056,6 +1346,86 @@ mod tests {
             .preflight_warnings(tempfile::tempdir().unwrap().path())
             .iter()
             .any(|w| w.contains("script extender")));
+    }
+
+    #[test]
+    fn starfield_log_sources_include_sfse_and_newest_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp
+            .path()
+            .join("steamapps")
+            .join("common")
+            .join("Starfield");
+        std::fs::create_dir_all(&install).unwrap();
+        let sfse = tmp
+            .path()
+            .join("steamapps/compatdata/1716740/pfx/drive_c/users/steamuser/Documents/my games/starfield/sfse");
+        let logs = sfse.join("logs");
+        let crashes = sfse.join("crashlogs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&crashes).unwrap();
+        std::fs::write(
+            logs.join("sfse.txt"),
+            b"SFSE runtime: initialize\ninit complete\n",
+        )
+        .unwrap();
+        std::fs::write(logs.join("sfse_loader.log"), b"SFSE loader: initialize\n").unwrap();
+        std::fs::write(crashes.join("CrashLogger.log"), b"startup\n").unwrap();
+        let old = crashes.join("crash_old.log");
+        let mid = crashes.join("crash_mid.log");
+        let new = crashes.join("crash_new.log");
+        std::fs::write(&old, b"old\n").unwrap();
+        std::fs::write(&mid, b"mid\n").unwrap();
+        std::fs::write(&new, b"new\n").unwrap();
+        let now = std::time::SystemTime::now();
+        set_mtime(&old, now - std::time::Duration::from_secs(7200));
+        set_mtime(&mid, now - std::time::Duration::from_secs(3600));
+        set_mtime(&new, now);
+
+        let sources = StarfieldPlugin.load_log_sources(&install);
+        assert!(
+            sources.iter().any(|source| {
+                source.kind == super::super::LogKind::ScriptExtender
+                    && source
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("sfse.txt"))
+            }),
+            "{sources:?}"
+        );
+        assert!(sources.iter().any(|source| source.path == new));
+        assert!(sources.iter().any(|source| source.path == mid));
+        assert!(!sources.iter().any(|source| source.path == old));
+        assert!(!sources.iter().any(|source| {
+            source
+                .path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("CrashLogger.log"))
+        }));
+    }
+
+    #[test]
+    fn starfield_lists_expected_sfse_log_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp
+            .path()
+            .join("steamapps")
+            .join("common")
+            .join("Starfield");
+        std::fs::create_dir_all(&install).unwrap();
+        let sources = StarfieldPlugin.load_log_sources(&install);
+        assert!(sources.iter().any(|source| {
+            source.kind == super::super::LogKind::ScriptExtender
+                && source.path.ends_with("SFSE/Logs/sfse.txt")
+        }));
+        assert!(sources
+            .iter()
+            .all(|source| source.kind != super::super::LogKind::CrashLog));
+    }
+
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(when).unwrap();
     }
 
     #[test]

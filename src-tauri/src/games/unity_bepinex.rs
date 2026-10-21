@@ -769,6 +769,25 @@ pub fn bepinex_preflight_warnings(install_path: &Path) -> Vec<String> {
     warnings
 }
 
+pub fn bepinex_log_sources(install_path: &Path) -> Vec<super::LogSource> {
+    let root = detect_bepinex_root(install_path).unwrap_or_else(|| install_path.join("BepInEx"));
+    let mut sources = vec![super::LogSource {
+        label: "BepInEx".into(),
+        kind: super::LogKind::BepInEx,
+        path: root.join("LogOutput.log"),
+    }];
+    let error_log = root.join("ErrorLog.log");
+    if error_log.is_file() {
+        sources.push(super::LogSource {
+            label: "BepInEx errors".into(),
+            kind: super::LogKind::BepInEx,
+            path: error_log,
+        });
+    }
+    sources.extend(super::log_sources::proton_player_logs(install_path));
+    sources
+}
+
 pub fn resolve_bepinex_deploy(install_path: &Path, relative: &Path) -> Result<PathBuf> {
     let normalized = normalize_relative(relative);
     let parts: Vec<_> = normalized
@@ -879,6 +898,10 @@ macro_rules! bepinex_title_plugin {
 
             fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
                 bepinex_preflight_warnings(install_path)
+            }
+
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                bepinex_log_sources(install_path)
             }
 
             fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
@@ -1091,6 +1114,10 @@ impl GamePlugin for BepInExPlugin {
 
     fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
         bepinex_preflight_warnings(install_path)
+    }
+
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        bepinex_log_sources(install_path)
     }
 
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {

@@ -51,6 +51,23 @@ impl GamePlugin for StardewValleyPlugin {
         }
     }
 
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        let mut sources = vec![
+            super::LogSource {
+                label: "SMAPI".into(),
+                kind: super::LogKind::Smapi,
+                path: install_path.join("SMAPI-latest.txt"),
+            },
+            super::LogSource {
+                label: "SMAPI".into(),
+                kind: super::LogKind::Smapi,
+                path: install_path.join("SMAPI-latest.log"),
+            },
+        ];
+        sources.extend(super::log_sources::proton_player_logs(install_path));
+        sources
+    }
+
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
         if looks_like_smapi_installer(content_root) {
             vec![format!(

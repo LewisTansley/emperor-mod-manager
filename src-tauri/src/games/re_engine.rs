@@ -159,6 +159,10 @@ macro_rules! re_engine_plugin {
             fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
                 Ok(resolve_re_engine_deploy(install_path, relative))
             }
+
+            fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+                super::log_sources::reframework_log_sources(install_path)
+            }
         }
     };
 }

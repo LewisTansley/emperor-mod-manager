@@ -61,6 +61,10 @@ impl GamePlugin for BonelabPlugin {
         melonloader_preflight(install_path)
     }
 
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        melonloader_log_sources(install_path)
+    }
+
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
         melon_staging_warnings(content_root, mod_name)
     }
@@ -98,6 +102,10 @@ impl GamePlugin for BoneworksPlugin {
 
     fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
         melonloader_preflight(install_path)
+    }
+
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        melonloader_log_sources(install_path)
     }
 
     fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
@@ -159,6 +167,16 @@ fn melonloader_preflight(install_path: &Path) -> Vec<String> {
                 .into(),
         ]
     }
+}
+
+pub fn melonloader_log_sources(install_path: &Path) -> Vec<super::LogSource> {
+    let mut sources = vec![super::LogSource {
+        label: "MelonLoader".into(),
+        kind: super::LogKind::MelonLoader,
+        path: install_path.join("MelonLoader").join("Latest.log"),
+    }];
+    sources.extend(super::log_sources::proton_player_logs(install_path));
+    sources
 }
 
 fn melon_staging_warnings(content_root: &Path, mod_name: &str) -> Vec<String> {

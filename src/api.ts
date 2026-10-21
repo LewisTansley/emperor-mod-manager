@@ -9,10 +9,12 @@ import type {
   CollectionModFile,
   CollectionSearchPage,
   DeployResult,
+  LoadDiagnosis,
   DetectedGame,
   DownloadItem,
   GameHealth,
   GameInfo,
+  GameVersionReport,
   InstalledCollection,
   ManagedGame,
   ModDetail,
@@ -64,6 +66,8 @@ export const api = {
   clearModioApiKey: () => invoke<void>("clear_modio_api_key"),
   setAdultContent: (enabled: boolean) =>
     invoke<void>("set_adult_content", { enabled }),
+  setGameVersionWarnings: (enabled: boolean) =>
+    invoke<void>("set_game_version_warnings", { enabled }),
   setAutoclickFreeDownload: (enabled: boolean) =>
     invoke<void>("set_autoclick_free_download", { enabled }),
   setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
@@ -100,6 +104,10 @@ export const api = {
     thunderstoreCommunity?: string | null;
     modioGameId?: number | null;
   }) => invoke<ManagedGame>("update_managed_game", args),
+  setGameVersion: (id: string, version: string | null) =>
+    invoke<ManagedGame>("set_game_version", { id, version }),
+  checkModGameVersions: (gameId: string) =>
+    invoke<GameVersionReport>("check_mod_game_versions", { gameId }),
   detectUeLayout: (installPath: string, projectName?: string | null) =>
     invoke<UeLayoutInfo | null>("detect_ue_layout", {
       installPath,
@@ -421,6 +429,8 @@ export const api = {
   removeAllMods: (gameId: string) =>
     invoke<void>("remove_all_mods", { gameId }),
   deployMods: (gameId: string) => invoke<DeployResult>("deploy_mods", { gameId }),
+  diagnoseLoad: (gameId: string) =>
+    invoke<LoadDiagnosis>("diagnose_load", { gameId }),
   purgeMods: (gameId: string) => invoke<void>("purge_mods", { gameId }),
   listDownloads: () => invoke<DownloadItem[]>("list_downloads"),
   clearRecentDownloads: (ids: string[]) =>

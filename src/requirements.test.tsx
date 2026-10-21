@@ -2,7 +2,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { act } from "react";
 import { describe, expect, it } from "vitest";
 
-import { MissingRequirementsStrip, RequirementsDialog } from "./RequirementsDialog";
+import {
+  disabledRequirementWarnings,
+  MissingRequirementsStrip,
+  RequirementsDialog,
+} from "./RequirementsDialog";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { MissingRequirements, NexusRequirementDownload } from "./types";
 
@@ -58,6 +62,117 @@ describe("MissingRequirementsStrip", () => {
     expect(html).toContain("Review");
     expect(opened).toBe(false);
   });
+
+  it("counts disabled requirements beside missing ones", () => {
+    const html = renderToStaticMarkup(
+      <MissingRequirementsStrip
+        requirements={{ nexus: [], external: [], dlc: [], error: null }}
+        disabled={[
+          {
+            stagedId: "skyui",
+            name: "SkyUI",
+            requiredByNames: ["My Mod"],
+            requiredByIds: ["parent"],
+          },
+        ]}
+        onReview={() => {}}
+      />,
+    );
+    expect(html).toContain("1 disabled requirement");
+    expect(html).toContain("SkyUI");
+    expect(html).not.toContain("missing requirement");
+    expect(html).not.toContain("Could not check requirements");
+  });
+
+  it("counts game version warnings", () => {
+    const html = renderToStaticMarkup(
+      <MissingRequirementsStrip
+        requirements={{ nexus: [], external: [], dlc: [], error: null }}
+        versions={[
+          {
+            stagedId: "skyui",
+            name: "SkyUI",
+            message: "Does not officially support 1.6.1170",
+          },
+        ]}
+        onReview={() => {}}
+      />,
+    );
+    expect(html).toContain("1 game version warning");
+    expect(html).toContain("SkyUI");
+  });
+});
+
+describe("disabledRequirementWarnings", () => {
+  const mods = [
+    { id: "parent", name: "My Mod", enabled: true, depends_on: ["skyui", "local"] },
+    { id: "other", name: "Quiet", enabled: false, depends_on: ["skyui"] },
+    { id: "skyui", name: "SkyUI", enabled: false, depends_on: [] },
+    { id: "library", name: "Address Library", enabled: true, depends_on: [] },
+    { id: "local", name: "Local Dep", enabled: false, depends_on: [] },
+  ];
+
+  it("keeps disabled staged requirements of enabled mods and live unticks", () => {
+    const warnings = disabledRequirementWarnings(mods, {
+      nexus: [],
+      external: [],
+      dlc: [],
+      staged: [
+        {
+          staged_id: "skyui",
+          name: "SkyUI snapshot",
+          enabled: true,
+          required_by: ["parent", "other"],
+          required_by_names: ["My Mod", "Quiet"],
+        },
+        {
+          staged_id: "library",
+          name: "Address Library",
+          enabled: true,
+          required_by: ["parent"],
+          required_by_names: ["My Mod"],
+        },
+      ],
+    });
+    expect(warnings).toEqual([
+      {
+        stagedId: "skyui",
+        name: "SkyUI",
+        requiredByNames: ["My Mod"],
+        requiredByIds: ["parent"],
+      },
+      {
+        stagedId: "local",
+        name: "Local Dep",
+        requiredByNames: ["My Mod"],
+        requiredByIds: ["parent"],
+      },
+    ]);
+  });
+
+  it("drops a disabled mod that only a disabled mod requires", () => {
+    const warnings = disabledRequirementWarnings(
+      [
+        { id: "other", name: "Quiet", enabled: false, depends_on: ["skyui"] },
+        { id: "skyui", name: "SkyUI", enabled: false, depends_on: [] },
+      ],
+      {
+        nexus: [],
+        external: [],
+        dlc: [],
+        staged: [
+          {
+            staged_id: "skyui",
+            name: "SkyUI",
+            enabled: false,
+            required_by: ["other"],
+            required_by_names: ["Quiet"],
+          },
+        ],
+      },
+    );
+    expect(warnings).toEqual([]);
+  });
 });
 
 describe("RequirementsDialog", () => {
@@ -70,12 +185,15 @@ describe("RequirementsDialog", () => {
       root.render(
         <RequirementsDialog
           requirements={sample}
+          disabled={[]}
           isPremium
           busy={false}
           onClose={() => {}}
           onAddSelected={(rows) => {
             chosen.push(rows);
           }}
+          onEnable={() => {}}
+          onDisable={() => {}}
         />,
       );
     });
@@ -97,6 +215,152 @@ describe("RequirementsDialog", () => {
     expect(document.body.textContent).toContain("SKSE");
     expect(document.body.textContent).toContain("Outside Nexus");
     expect(document.body.textContent).toContain("Far Harbor");
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("enables one disabled requirement or all of them", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const enabled: string[][] = [];
+    const disabled = [
+      {
+        stagedId: "skyui",
+        name: "SkyUI",
+        requiredByNames: ["My Mod"],
+        requiredByIds: ["parent"],
+      },
+      {
+        stagedId: "local",
+        name: "Local Dep",
+        requiredByNames: ["My Mod", "Other Mod"],
+        requiredByIds: ["parent", "other"],
+      },
+    ];
+    await act(async () => {
+      root.render(
+        <RequirementsDialog
+          requirements={{ nexus: [], external: [], dlc: [], error: null }}
+          disabled={disabled}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={(ids) => {
+            enabled.push(ids);
+          }}
+          onDisable={() => {}}
+        />,
+      );
+    });
+    expect(document.body.textContent).toContain("Required by My Mod");
+    const enableSky = [...document.querySelectorAll("button")].find(
+      (el) => el.textContent === "Enable",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      enableSky.click();
+    });
+    const enableAll = [...document.querySelectorAll("button")].find(
+      (el) => el.textContent === "Enable all",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      enableAll.click();
+    });
+    expect(enabled).toEqual([["skyui"], ["skyui", "local"]]);
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("lists game version warnings in the review", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    await act(async () => {
+      root.render(
+        <RequirementsDialog
+          requirements={{ nexus: [], external: [], dlc: [], error: null }}
+          disabled={[]}
+          versions={[
+            {
+              stagedId: "skyui",
+              name: "SkyUI",
+              message: "Does not officially support 1.6.1170",
+            },
+          ]}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={() => {}}
+        />,
+      );
+    });
+    const section = document.querySelector("details.requirements-versions") as HTMLDetailsElement;
+    expect(section.open).toBe(true);
+    expect(section.querySelector("summary")?.textContent).toBe("Game version (1)");
+    expect(document.body.textContent).toContain("Game version");
+    expect(document.body.textContent).toContain("Does not officially support 1.6.1170");
+    expect(document.body.textContent).not.toContain("No missing requirements");
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("disables the mods that require a missing or disabled requirement", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const turnedOff: string[][] = [];
+    await act(async () => {
+      root.render(
+        <RequirementsDialog
+          requirements={sample}
+          disabled={[
+            {
+              stagedId: "skyui",
+              name: "SkyUI",
+              requiredByNames: ["My Mod"],
+              requiredByIds: ["parent"],
+            },
+            {
+              stagedId: "local",
+              name: "Local Dep",
+              requiredByNames: ["My Mod", "Other Mod"],
+              requiredByIds: ["parent", "other"],
+            },
+          ]}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={(ids) => {
+            turnedOff.push(ids);
+          }}
+        />,
+      );
+    });
+    const disableOne = [...document.querySelectorAll("button")].find(
+      (el) => el.textContent === "Disable",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      disableOne.click();
+    });
+    const disableAll = [...document.querySelectorAll("button")].find(
+      (el) => el.textContent === "Disable all",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      disableAll.click();
+    });
+    expect(turnedOff[0]).toEqual(["1_2"]);
+    expect(turnedOff[turnedOff.length - 1]).toEqual(["parent", "other"]);
     await act(async () => {
       root.unmount();
     });

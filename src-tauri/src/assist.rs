@@ -63,6 +63,7 @@ const AUTOCLICK_JS: &str = r#"
   var done = false;
   var assist = window.__emperorModManagerAssist || {};
   var targetFileId = (assist.fileId || '') + '';
+  var targetModId = (assist.modId || '') + '';
   var state = window.__emperorModManagerAutoclickState || {};
   window.__emperorModManagerAutoclickState = state;
   state.installed = true;
@@ -109,17 +110,56 @@ const AUTOCLICK_JS: &str = r#"
     return true;
   }
 
+  function classString(el) {
+    if (!el || !el.className) return '';
+    if (typeof el.className === 'string') return el.className;
+    if (el.className.baseVal) return el.className.baseVal + '';
+    return el.className + '';
+  }
+
+  function visuallyHidden(node) {
+    try {
+      var style = window.getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return true;
+      var overflow = (style.overflow || '') + (style.overflowX || '') + (style.overflowY || '');
+      if (overflow.indexOf('hidden') !== -1) {
+        var box = node.getBoundingClientRect();
+        if (box.width < 4 || box.height < 4) return true;
+      }
+    } catch (e) {
+      return true;
+    }
+    return false;
+  }
+
   function rendered(el) {
     if (!enabled(el)) return false;
     try {
+      if (visuallyHidden(el)) return false;
       var style = window.getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return false;
       var rect = el.getBoundingClientRect();
       if (rect.width < 4 || rect.height < 4) return false;
       if (el.offsetParent === null && style.position !== 'fixed' && style.position !== 'sticky') {
         var rootNode = el.getRootNode && el.getRootNode();
         var inShadow = rootNode && rootNode !== document && rootNode.host;
         if (!inShadow && (!document.body || !document.body.contains(el))) return false;
+      }
+      var node = el;
+      var guard = 0;
+      while (node && guard < 40) {
+        guard += 1;
+        if (node !== el && visuallyHidden(node)) return false;
+        if (node === document.body || node === document.documentElement) break;
+        if (node.parentElement) {
+          node = node.parentElement;
+          continue;
+        }
+        var root = node.getRootNode && node.getRootNode();
+        if (root && root.host && root.host !== node) {
+          node = root.host;
+          continue;
+        }
+        break;
       }
     } catch (e) {
       return false;
@@ -247,6 +287,88 @@ const AUTOCLICK_JS: &str = r#"
       t.indexOf('get premium') !== -1;
   }
 
+  function hrefOf(el) {
+    return ((el && (el.href || (el.getAttribute && el.getAttribute('href')))) || '') + '';
+  }
+
+  function isBlockedHref(href) {
+    var lower = ((href || '') + '').toLowerCase();
+    if (lower.indexOf('tab=download+history') !== -1) return true;
+    if (lower.indexOf('tab=download%20history') !== -1) return true;
+    if (lower.indexOf('tab=download history') !== -1) return true;
+    if (lower.indexOf('download-history') !== -1) return true;
+    if (lower.indexOf('next.nexusmods.com/vortex') !== -1) return true;
+    return false;
+  }
+
+  function isHistoryUrl(href) {
+    var lower = ((href || '') + '').toLowerCase();
+    if (lower.indexOf('tab=download+history') !== -1) return true;
+    if (lower.indexOf('tab=download%20history') !== -1) return true;
+    if (lower.indexOf('tab=download history') !== -1) return true;
+    if (lower.indexOf('download-history') !== -1) return true;
+    return false;
+  }
+
+  function isBlockedLabel(t) {
+    t = (t || '').toLowerCase();
+    if (t.indexOf('download history') !== -1) return true;
+    if (t.indexOf('download app') !== -1) return true;
+    return false;
+  }
+
+  function isAccountOrMarketing(el) {
+    if (!el) return false;
+    if (isBlockedLabel(label(el))) return true;
+    if (isBlockedHref(hrefOf(el))) return true;
+    return false;
+  }
+
+  function nextNodeUp(node) {
+    if (!node) return null;
+    if (node.parentElement) return node.parentElement;
+    var root = node.getRootNode && node.getRootNode();
+    if (root && root.host && root.host !== node) return root.host;
+    return null;
+  }
+
+  function inSiteChrome(el) {
+    var node = el;
+    var guard = 0;
+    while (node && guard < 40) {
+      guard += 1;
+      var tag = (node.tagName || '').toUpperCase();
+      if (tag === 'HEADER' || tag === 'NAV') return true;
+      var cls = classString(node);
+      if (cls.indexOf('rj-profile-tray') !== -1 || cls.indexOf('new-head') !== -1) return true;
+      node = nextNodeUp(node);
+    }
+    return false;
+  }
+
+  function inDownloadSurface(el) {
+    if (!el || inSiteChrome(el)) return false;
+    if (el.classList && el.classList.contains('nxm-button')) return true;
+    if ((el.id || '') === 'slowDownloadButton') return true;
+    var node = el;
+    var guard = 0;
+    while (node && node !== document.body && node !== document.documentElement && guard < 40) {
+      guard += 1;
+      var tag = (node.tagName || '').toUpperCase();
+      if (tag === 'HEADER' || tag === 'NAV') return false;
+      if (tag === 'MOD-DOWNLOAD-MODAL' || tag === 'DIALOG') return true;
+      if ((node.id || '') === 'slowDownloadButton') return true;
+      var cls = classString(node).toLowerCase();
+      if (cls.indexOf('nxm-modal') !== -1 || cls.indexOf('mod-download') !== -1 ||
+          cls.indexOf('file-expander') !== -1 || cls.indexOf('files-tabs') !== -1 ||
+          cls.indexOf('mod-file') !== -1) return true;
+      var root = node.getRootNode && node.getRootNode();
+      if (root && root.host && (root.host.tagName || '').toUpperCase() === 'MOD-DOWNLOAD-MODAL') return true;
+      node = nextNodeUp(node);
+    }
+    return false;
+  }
+
   function isDownloadStartingPage() {
     var body = bodyTextDeep();
     return body.indexOf('your download is starting') !== -1 ||
@@ -256,7 +378,7 @@ const AUTOCLICK_JS: &str = r#"
 
   function succeeded() {
     var nowKey = (location.href || '').split('#')[0];
-    if (nowKey !== pageKeyAtStart) return true;
+    if (nowKey !== pageKeyAtStart && !isHistoryUrl(nowKey)) return true;
     if (isDownloadStartingPage()) return true;
     return false;
   }
@@ -272,6 +394,27 @@ const AUTOCLICK_JS: &str = r#"
       return;
     }
     window.location.href = 'https://emperor-mod-manager.invalid/capture-nxm?url=' + encodeURIComponent(href);
+  }
+
+  function isCdnHref(href) {
+    href = (href || '') + '';
+    if (href.indexOf('http') !== 0) return false;
+    try {
+      var u = new URL(href);
+      var host = (u.hostname || '').toLowerCase();
+      if (host.indexOf('nexus-cdn') !== -1) return true;
+      if (host === 'cf-files.nexusmods.com') return true;
+      if (host.indexOf('nexusmods.com') !== -1 && u.pathname.indexOf('/cdn/') !== -1) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function bridgeCdn(href) {
+    if (typeof window.__emperorModManagerBridgeCdn === 'function') {
+      window.__emperorModManagerBridgeCdn(href);
+      return;
+    }
+    window.location.href = 'https://emperor-mod-manager.invalid/capture-download?url=' + encodeURIComponent(href);
   }
 
   function realisticClick(el) {
@@ -311,9 +454,9 @@ const AUTOCLICK_JS: &str = r#"
   }
 
   function matchesNxmSlowButton(el) {
-    if (!el || !rendered(el)) return false;
+    if (!el || !rendered(el) || !inDownloadSurface(el) || isAccountOrMarketing(el)) return false;
     var t = label(el);
-    if (!hasSlowDownloadText(t) || isCardHeading(t)) return false;
+    if (!hasSlowDownloadText(t) || isCardHeading(t) || isBlockedLabel(t)) return false;
     return t === 'slow download' || t.length < 40;
   }
 
@@ -349,7 +492,7 @@ const AUTOCLICK_JS: &str = r#"
       var climbed = climbClickable(el);
       totalHits += climbed.hits;
       var target = climbed.el || (isClickableAncestor(el) ? el : null);
-      if (!target) continue;
+      if (!target || !inDownloadSurface(target) || isAccountOrMarketing(target)) continue;
       var score = full === 'slow download' ? 0 : full.length;
       if (score < bestScore) {
         bestScore = score;
@@ -360,54 +503,148 @@ const AUTOCLICK_JS: &str = r#"
     return best;
   }
 
+  function markupHasFileIdToken(text) {
+    if (!targetFileId || text === undefined || text === null) return false;
+    var hay = (text + '').toLowerCase();
+    var id = (targetFileId + '').toLowerCase();
+    var keys = [
+      'file_id=' + id,
+      'file_id%3d' + id,
+      'fid=' + id,
+      'data-file-id="' + id + '"',
+      "data-file-id='" + id + "'",
+      '/files/' + id
+    ];
+    for (var i = 0; i < keys.length; i++) {
+      if (hay.indexOf(keys[i]) !== -1) return true;
+    }
+    return false;
+  }
+
   function elementMentionsFileId(el) {
-    if (!targetFileId) return false;
+    if (!targetFileId || !el) return false;
     try {
-      var html = (el.outerHTML || '') + '';
-      if (html.indexOf(targetFileId) !== -1) return true;
-      var href = ((el.href || el.getAttribute('href') || '') + '');
-      if (href.indexOf(targetFileId) !== -1) return true;
-      var data = el.getAttribute('data-file-id') || el.getAttribute('data-id') || '';
-      if (('' + data).indexOf(targetFileId) !== -1) return true;
+      if (markupHasFileIdToken(hrefOf(el))) return true;
+      var data = (el.getAttribute('data-file-id') || '') + '';
+      if (data === (targetFileId + '')) return true;
+      if (markupHasFileIdToken(el.getAttribute('href') || '')) return true;
     } catch (e) {}
     return false;
   }
 
+  function withinFileRow(el) {
+    var node = el;
+    var guard = 0;
+    while (node && guard < 8) {
+      guard += 1;
+      var tag = (node.tagName || '').toUpperCase();
+      if (tag === 'HEADER' || tag === 'BODY' || tag === 'HTML' || tag === 'NAV') return false;
+      if (elementMentionsFileId(node) || markupHasFileIdToken(node.outerHTML || '')) return true;
+      node = nextNodeUp(node);
+    }
+    return false;
+  }
+
+  function usableDownloadControl(el) {
+    return !!el && rendered(el) && inDownloadSurface(el) && !isAccountOrMarketing(el) && !inSiteChrome(el);
+  }
+
   function findOpenDialogControl() {
-    var nodes = candidates();
+    var nodes = candidates().filter(usableDownloadControl);
     var manual = nodes.find(function (el) {
-      return isManualDownload(label(el)) && !isFastOrPremium(label(el));
+      return isManualDownload(label(el)) && !isFastOrPremium(label(el)) && !isBlockedLabel(label(el));
     });
     if (manual) return { el: manual, action: 'clickManual' };
 
     if (targetFileId) {
       var nearFile = nodes.find(function (el) {
         var t = label(el);
-        if (isFastOrPremium(t) || hasSlowDownloadText(t)) return false;
-        if (!(isShortDownload(t) || isManualDownload(t) || t.indexOf('download') !== -1 && t.length < 24)) return false;
-        if (elementMentionsFileId(el)) return true;
-        var p = el.parentElement;
-        for (var d = 0; d < 6 && p; d++) {
-          if (elementMentionsFileId(p)) return true;
-          p = p.parentElement;
-        }
-        return false;
+        if (isFastOrPremium(t) || hasSlowDownloadText(t) || isBlockedLabel(t)) return false;
+        if (!(isShortDownload(t) || isManualDownload(t))) return false;
+        return withinFileRow(el);
       });
       if (nearFile) return { el: nearFile, action: 'clickFileDownload' };
     }
 
     var shortDl = nodes.find(function (el) {
       var t = label(el);
-      return isShortDownload(t) && !isFastOrPremium(t);
+      return isShortDownload(t) && !isFastOrPremium(t) && !isBlockedLabel(t);
     });
     if (shortDl) return { el: shortDl, action: 'clickDownload' };
 
     var modManager = nodes.find(function (el) {
-      return isModManager(label(el));
+      return isModManager(label(el)) && !isBlockedLabel(label(el));
     });
     if (modManager) return { el: modManager, action: 'clickModManager' };
 
     return null;
+  }
+
+  function hrefHasModId(href) {
+    if (!targetModId) return false;
+    return new RegExp('/mods/' + targetModId + '(?:[^0-9]|$)').test((href || '') + '');
+  }
+
+  function modLinksIn(root) {
+    var nodes;
+    try {
+      nodes = root.querySelectorAll('a[href]');
+    } catch (e) {
+      return 0;
+    }
+    var n = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      if (hrefHasModId(hrefOf(nodes[i]))) n += 1;
+    }
+    return n;
+  }
+
+  function downloadControlIn(root, modLink) {
+    var nodes;
+    try {
+      nodes = root.querySelectorAll('a, button, [role=button], input[type=button], input[type=submit]');
+    } catch (e) {
+      return null;
+    }
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el === modLink || !rendered(el) || isAccountOrMarketing(el) || inSiteChrome(el)) continue;
+      var href = hrefOf(el);
+      if (isBlockedHref(href)) continue;
+      var nxm = nxmHref(el);
+      if (nxm) return { el: el, action: 'bridgeNxmHistory', href: nxm };
+      if (isCdnHref(href)) return { el: el, action: 'bridgeCdnHistory', href: href };
+      var t = label(el);
+      if (isFastOrPremium(t) || isBlockedLabel(t)) continue;
+      if (hasSlowDownloadText(t) || isManualDownload(t) || isShortDownload(t) || isModManager(t)) {
+        return { el: el, action: 'clickHistoryRow' };
+      }
+    }
+    return null;
+  }
+
+  function findHistoryRowDownload() {
+    if (!targetModId) return null;
+    var links = queryDeep('a[href]');
+    var fallback = null;
+    for (var i = 0; i < links.length; i++) {
+      var link = links[i];
+      if (inSiteChrome(link) || isAccountOrMarketing(link) || !hrefHasModId(hrefOf(link))) continue;
+      var node = link;
+      for (var depth = 0; depth < 6 && node; depth++) {
+        var tag = (node.tagName || '').toUpperCase();
+        if (tag === 'HEADER' || tag === 'NAV' || tag === 'BODY' || tag === 'HTML') break;
+        if (modLinksIn(node) > 4) break;
+        var choice = downloadControlIn(node, link);
+        if (choice) {
+          if (elementMentionsFileId(node) || markupHasFileIdToken(node.innerHTML || '')) return choice;
+          if (!fallback) fallback = choice;
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    return fallback;
   }
 
   window.__emperorModManagerAutoclickTimer = setInterval(function () {
@@ -439,13 +676,33 @@ const AUTOCLICK_JS: &str = r#"
     state.candidates = candidates().length;
     state.downloadLabels = collectDownloadLabels();
 
+    if (isHistoryUrl(location.href)) {
+      var historyClick = findHistoryRowDownload();
+      if (!historyClick) return;
+      lastClickAt = Date.now();
+      state.phase = 'historyRow';
+      if (historyClick.action === 'bridgeNxmHistory') {
+        touch('bridgeNxmHistory');
+        bridgeNxm(historyClick.href);
+        return;
+      }
+      if (historyClick.action === 'bridgeCdnHistory') {
+        touch('bridgeCdnHistory');
+        bridgeCdn(historyClick.href);
+        return;
+      }
+      touch('clickHistoryRow');
+      realisticClick(historyClick.el);
+      return;
+    }
+
     var nxmLinks = queryDeep('a[href^="nxm://"]');
     var nxmLink = null;
     for (var n = 0; n < nxmLinks.length; n++) {
       if (rendered(nxmLinks[n])) { nxmLink = nxmLinks[n]; break; }
     }
     if (!nxmLink) nxmLink = document.querySelector('a[href^="nxm://"]');
-    if (nxmLink && rendered(nxmLink)) {
+    if (nxmLink && rendered(nxmLink) && !inSiteChrome(nxmLink) && !isBlockedHref(hrefOf(nxmLink))) {
       lastClickAt = Date.now();
       state.phase = 'clickSlow';
       touch('bridgeNxm');
@@ -468,7 +725,7 @@ const AUTOCLICK_JS: &str = r#"
 
     state.phase = 'openDialog';
     var opener = findOpenDialogControl();
-    if (!opener) return;
+    if (!opener || isAccountOrMarketing(opener.el) || isBlockedHref(hrefOf(opener.el))) return;
 
     lastClickAt = Date.now();
     var href = nxmHref(opener.el);
@@ -1682,9 +1939,20 @@ mod tests {
         assert!(AUTOCLICK_JS.contains("nxmButtonCount"));
         assert!(AUTOCLICK_JS.contains("realisticClick"));
         assert!(AUTOCLICK_JS.contains("your download is starting"));
+        assert!(AUTOCLICK_JS.contains("tab=download+history"));
+        assert!(AUTOCLICK_JS.contains("download-history"));
+        assert!(AUTOCLICK_JS.contains("next.nexusmods.com/vortex"));
+        assert!(AUTOCLICK_JS.contains("download history"));
+        assert!(AUTOCLICK_JS.contains("download app"));
+        assert!(AUTOCLICK_JS.contains("visuallyHidden"));
+        assert!(AUTOCLICK_JS.contains("inDownloadSurface"));
+        assert!(AUTOCLICK_JS.contains("markupHasFileIdToken"));
+        assert!(AUTOCLICK_JS.contains("findHistoryRowDownload"));
+        assert!(AUTOCLICK_JS.contains("clickHistoryRow"));
+        assert!(AUTOCLICK_JS.contains("isHistoryUrl"));
         assert!(!AUTOCLICK_JS.contains("innerHeight"));
         assert!(!AUTOCLICK_JS.contains("innerWidth"));
-        assert!(!AUTOCLICK_JS.contains("vortex"));
+        assert!(!AUTOCLICK_JS.contains("clickVortex"));
     }
 
     #[test]

@@ -1,8 +1,10 @@
+mod app_log;
 mod app_update;
 mod assist;
 mod commands;
 mod config;
 mod detection;
+mod diagnostics;
 mod games;
 mod github_release;
 #[cfg(any(
@@ -34,7 +36,8 @@ pub fn run() {
         let _ = linux_startup::ensure_writable_tmpdir();
     }
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let log_path = config::Paths::resolve().ok().map(|paths| paths.log_file());
+    app_log::init(log_path);
 
     let state = match AppState::new() {
         Ok(s) => s,
@@ -66,6 +69,7 @@ pub fn run() {
             commands::list_managed,
             commands::manage_game,
             commands::update_managed_game,
+            commands::set_game_version,
             commands::detect_ue_layout,
             commands::suggest_catalog_ids,
             commands::suggest_catalog_ids_batch,
@@ -74,6 +78,7 @@ pub fn run() {
             commands::relink_managed_game,
             commands::get_settings,
             commands::set_adult_content,
+            commands::set_game_version_warnings,
             commands::set_theme,
             commands::set_autoclick_free_download,
             commands::set_install_click_behavior,
@@ -94,6 +99,7 @@ pub fn run() {
             commands::get_game,
             commands::get_mod,
             commands::missing_nexus_requirements,
+            commands::check_mod_game_versions,
             commands::nexus_mod_requirements,
             commands::link_staged_requirements,
             commands::mod_files,
@@ -137,6 +143,7 @@ pub fn run() {
             commands::remove_mod,
             commands::remove_all_mods,
             commands::deploy_mods,
+            commands::diagnose_load,
             commands::purge_mods,
             commands::list_downloads,
             commands::clear_recent_downloads,
