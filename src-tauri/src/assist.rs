@@ -941,6 +941,9 @@ fn stored_bounds(state: &AppState) -> AssistBounds {
 
 fn clear_pending_assist_url(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
+        state
+            .assist_hide_until_loaded
+            .store(false, Ordering::SeqCst);
         if let Ok(mut pending) = state.assist_pending_url.lock() {
             *pending = None;
         }
@@ -948,9 +951,21 @@ fn clear_pending_assist_url(app: &tauri::AppHandle) {
 }
 
 fn store_pending_assist_url(state: &AppState, url: &url::Url) {
-    if let Ok(mut pending) = state.assist_pending_url.lock() {
-        *pending = Some(url.to_string());
+    match state.assist_pending_url.lock() {
+        Ok(mut pending) => {
+            state
+                .assist_hide_until_loaded
+                .store(true, Ordering::SeqCst);
+            *pending = Some(url.to_string());
+        }
+        Err(_) => release_assist_load_hold(state),
     }
+}
+
+fn release_assist_load_hold(state: &AppState) {
+    state
+        .assist_hide_until_loaded
+        .store(false, Ordering::SeqCst);
 }
 
 fn flush_pending_assist_navigation(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
@@ -962,11 +977,45 @@ fn flush_pending_assist_navigation(app: &tauri::AppHandle, state: &AppState) -> 
     let Some(raw) = raw else {
         return Ok(());
     };
-    let url = url::Url::parse(&raw).map_err(|e| e.to_string())?;
-    if let Some(webview) = app.get_webview(ASSIST_LABEL) {
-        webview.navigate(url).map_err(|e| e.to_string())?;
+    let url = match url::Url::parse(&raw) {
+        Ok(url) => url,
+        Err(e) => {
+            release_assist_load_hold(state);
+            return Err(e.to_string());
+        }
+    };
+    let Some(webview) = app.get_webview(ASSIST_LABEL) else {
+        release_assist_load_hold(state);
+        return Ok(());
+    };
+    if let Err(e) = webview.navigate(url) {
+        release_assist_load_hold(state);
+        return Err(e.to_string());
     }
     Ok(())
+}
+
+fn is_blank_assist_document(href: &str) -> bool {
+    let href = href.trim();
+    if href.is_empty() {
+        return true;
+    }
+    let lower = href.to_ascii_lowercase();
+    lower == "about:blank" || lower.starts_with("about:blank?") || lower.starts_with("about:blank#")
+}
+
+/// Reveal the overlay after the first real document, if Downloads wants it shown.
+fn note_assist_document_ready(app: &tauri::AppHandle, href: &str) {
+    if is_blank_assist_document(href) {
+        return;
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if !state.assist_hide_until_loaded.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let _ = apply_assist_desired_visible(app, &state);
 }
 
 fn apply_assist_bounds(
@@ -1326,8 +1375,13 @@ fn inject_assist_scripts(
     }
 }
 
+fn assist_overlay_shown(state: &AppState) -> bool {
+    state.assist_desired_visible.load(Ordering::SeqCst)
+        && !state.assist_hide_until_loaded.load(Ordering::SeqCst)
+}
+
 fn apply_assist_desired_visible(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
-    let visible = state.assist_desired_visible.load(Ordering::SeqCst);
+    let visible = assist_overlay_shown(state);
     #[cfg(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -1338,11 +1392,21 @@ fn apply_assist_desired_visible(app: &tauri::AppHandle, state: &AppState) -> Res
     {
         // Opacity and pass-through hide the overlay child. Unmapping WebKit
         // leaves the next show blank, and a 1×1 first allocation sticks.
+        // Navigate after attach even while hidden, so assist runs off the Downloads tab.
+        // about:blank stays hidden until the first real document finishes.
         if let Ok(window) = main_window(app) {
             crate::linux_embed::set_visible(&window, visible)?;
         }
-        if visible {
-            flush_pending_assist_navigation(app, state)?;
+        if let Err(e) = flush_pending_assist_navigation(app, state) {
+            // A failed navigation releases the hold. Show the panel if Downloads
+            // still wants it, instead of leaving the overlay hidden.
+            let visible_after = assist_overlay_shown(state);
+            if visible_after != visible {
+                if let Ok(window) = main_window(app) {
+                    crate::linux_embed::set_visible(&window, visible_after)?;
+                }
+            }
+            return Err(e);
         }
     }
     #[cfg(not(any(
@@ -1578,6 +1642,7 @@ pub async fn open_download_assist_inner(
             return;
         }
         let href = payload.url().as_str().to_string();
+        note_assist_document_ready(&handle_load, &href);
         if !href.contains("nexusmods.com") {
             return;
         }
@@ -1623,6 +1688,7 @@ pub async fn open_download_assist_inner(
         state.assist_desired_visible.store(true, Ordering::SeqCst);
     }
 
+    // Stay hidden through about:blank. Visibility is applied after the real page loads.
     #[cfg(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -1630,11 +1696,15 @@ pub async fn open_download_assist_inner(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    crate::linux_embed::attach_assist(
-        &window,
-        bounds,
-        state.assist_desired_visible.load(Ordering::SeqCst),
-    )?;
+    {
+        state
+            .assist_hide_until_loaded
+            .store(true, Ordering::SeqCst);
+        if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, false) {
+            release_assist_load_hold(state);
+            return Err(e);
+        }
+    }
 
     apply_assist_bounds(app, &webview, bounds)?;
     #[cfg(any(
@@ -1645,7 +1715,7 @@ pub async fn open_download_assist_inner(
         target_os = "openbsd"
     ))]
     store_pending_assist_url(state, &parsed);
-    // Flushes the pending URL when Downloads already wants the panel visible.
+    // Flushes the pending URL even while the overlay stays hidden.
     apply_assist_desired_visible(app, state)?;
 
     emit_assist_opened(app, autoclick, &domain, mod_id, file_id);
@@ -1751,6 +1821,7 @@ pub async fn open_nexus_website_login(
             return;
         }
         let href = payload.url().as_str().to_string();
+        note_assist_document_ready(&handle_load, &href);
         if is_nexus_login_url(&href) || !href.to_ascii_lowercase().contains("nexusmods.com") {
             return;
         }
@@ -1808,10 +1879,16 @@ pub async fn open_nexus_website_login(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, true) {
-        let _ = take_assist_context(&state);
-        let _ = close_assist_webview(&app);
-        return Err(e);
+    {
+        state
+            .assist_hide_until_loaded
+            .store(true, Ordering::SeqCst);
+        if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, false) {
+            release_assist_load_hold(&state);
+            let _ = take_assist_context(&state);
+            let _ = close_assist_webview(&app);
+            return Err(e);
+        }
     }
 
     if let Err(e) = apply_assist_bounds(&app, &webview, bounds) {
@@ -1955,6 +2032,20 @@ mod tests {
         assert!(!AUTOCLICK_JS.contains("innerHeight"));
         assert!(!AUTOCLICK_JS.contains("innerWidth"));
         assert!(!AUTOCLICK_JS.contains("clickVortex"));
+    }
+
+    #[test]
+    fn blank_assist_document_is_only_about_blank() {
+        assert!(is_blank_assist_document(""));
+        assert!(is_blank_assist_document("  about:blank  "));
+        assert!(is_blank_assist_document("about:blank?x=1"));
+        assert!(is_blank_assist_document("ABOUT:BLANK#frag"));
+        assert!(!is_blank_assist_document(
+            "https://www.nexusmods.com/skyrimspecialedition/mods/1?tab=files&file_id=2"
+        ));
+        assert!(!is_blank_assist_document(
+            "https://users.nexusmods.com/auth/sign_in"
+        ));
     }
 
     #[test]

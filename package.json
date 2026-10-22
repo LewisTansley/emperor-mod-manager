@@ -1,7 +1,7 @@
 {
   "name": "emperor-mod-manager",
   "private": true,
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "scripts": {
@@ -17,6 +17,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@fontsource-variable/dm-sans": "^5.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-deep-link": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.2",

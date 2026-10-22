@@ -17,6 +17,12 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
   const dialogRef = useRef<HTMLDivElement>(null);
   // Closing must not steal focus from wherever the user was before opening.
   const opener = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  function requestClose() {
+    onCloseRef.current();
+  }
 
   useEffect(() => {
     opener.current = document.activeElement as HTMLElement | null;
@@ -29,7 +35,7 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        onClose();
+        requestClose();
         return;
       }
       if (e.key !== "Tab" || !dialogRef.current) return;
@@ -49,7 +55,7 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
     };
     document.addEventListener("keydown", onKeyDown, true);
     return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [onClose]);
+  }, []);
 
   useEffect(() => {
     const previous = document.body.style.overflow;
@@ -60,7 +66,10 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
   }, []);
 
   return createPortal(
-    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div
+      className="modal-backdrop"
+      onMouseDown={(e) => e.target === e.currentTarget && requestClose()}
+    >
       <div
         className={className ? `modal ${className}` : "modal"}
         role="dialog"
@@ -74,7 +83,7 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
             <h2>{title}</h2>
             {subtitle ? <small>{subtitle}</small> : null}
           </div>
-          <button type="button" className="linkish" onClick={onClose} aria-label="Close">
+          <button type="button" className="linkish" onClick={requestClose} aria-label="Close">
             Close
           </button>
         </div>

@@ -48,6 +48,13 @@ export type ManagedGame = {
   tool_overrides?: GameToolOverrides | null;
   /** User-set game version. Empty means use the detected executable version. */
   game_version?: string | null;
+  /** Requirements hidden from the review until the user unignores them. */
+  ignored_requirements?: IgnoredRequirement[];
+};
+
+export type IgnoredRequirement = {
+  key: string;
+  name: string;
 };
 
 export type ToolGameState = {
@@ -520,6 +527,19 @@ export type GameVersionReport = {
   mods: ModVersionAdvice[];
 };
 
+export type WineDllNeed = {
+  dll: string;
+  reason: string;
+};
+
+export type WineOverrideAdvice = {
+  needs: WineDllNeed[];
+  launch_options: string;
+  typo: boolean;
+  can_apply: boolean;
+  summary: string;
+};
+
 export type StagedMod = {
   id: string;
   name: string;
@@ -545,8 +565,10 @@ export type StagedMod = {
   file_name?: string | null;
   /** Catalog poster. Null means not looked up yet; empty means there is no image. */
   picture_url?: string | null;
-  /** Version-like Nexus tags. Null means not looked up yet. */
+  /** Version-line Nexus tags. Null means not looked up yet. */
   supported_game_versions?: string[] | null;
+  /** 0 means the dotted-only tag cache still needs a refresh. */
+  version_support_generation?: number;
 };
 
 export type ModSubOption = {

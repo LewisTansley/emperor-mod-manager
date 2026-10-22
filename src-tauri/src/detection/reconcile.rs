@@ -227,6 +227,7 @@ mod tests {
             modio_game_id: None,
             tool_overrides: None,
             game_version: None,
+            ignored_requirements: Vec::new(),
         }
     }
 

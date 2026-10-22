@@ -16,6 +16,7 @@ import type {
   GameInfo,
   GameVersionReport,
   InstalledCollection,
+  IgnoredRequirement,
   ManagedGame,
   ModDetail,
   ModFileInfo,
@@ -32,6 +33,7 @@ import type {
   Settings,
   StagedMod,
   StagedModUpdate,
+  WineOverrideAdvice,
   ThemePreference,
   InstallClickBehavior,
   TsPackageDetail,
@@ -106,6 +108,8 @@ export const api = {
   }) => invoke<ManagedGame>("update_managed_game", args),
   setGameVersion: (id: string, version: string | null) =>
     invoke<ManagedGame>("set_game_version", { id, version }),
+  setIgnoredRequirements: (id: string, ignored: IgnoredRequirement[]) =>
+    invoke<ManagedGame>("set_ignored_requirements", { id, ignored }),
   checkModGameVersions: (gameId: string) =>
     invoke<GameVersionReport>("check_mod_game_versions", { gameId }),
   detectUeLayout: (installPath: string, projectName?: string | null) =>
@@ -408,6 +412,10 @@ export const api = {
   importAssistDownload: (path: string) =>
     invoke<StagedMod | null>("import_assist_download", { path }),
   listMods: (gameId: string) => invoke<StagedMod[]>("list_mods", { gameId }),
+  wineOverrideAdvice: (gameId: string) =>
+    invoke<WineOverrideAdvice | null>("wine_override_advice", { gameId }),
+  applyWineOverrides: (gameId: string) =>
+    invoke<WineOverrideAdvice | null>("apply_wine_overrides", { gameId }),
   fillStagedPictures: (gameId: string) =>
     invoke<StagedMod[]>("fill_staged_pictures", { gameId }),
   checkStagedModUpdates: (gameId: string) =>

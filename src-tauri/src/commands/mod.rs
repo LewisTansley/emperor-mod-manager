@@ -119,8 +119,10 @@ pub struct AppState {
     pub assist_bounds: Mutex<AssistBounds>,
     /// Whether the assist webview should be shown (Downloads tab). Bounds/open must not force-show.
     pub assist_desired_visible: AtomicBool,
-    /// Nexus URL waiting until the Linux embed has a real, visible allocation.
+    /// Nexus URL waiting until the Linux embed is attached. Flushed even while the overlay is hidden.
     pub assist_pending_url: Mutex<Option<String>>,
+    /// Linux overlay stays hidden until the first non-blank assist document finishes loading.
+    pub assist_hide_until_loaded: AtomicBool,
     /// Cached Nexus game metadata (categories, counts) keyed by domain.
     pub game_info_cache: Mutex<HashMap<String, GameInfo>>,
     /// Cached Thunderstore community package lists.
@@ -288,6 +290,7 @@ impl AppState {
             assist_bounds: Mutex::new(AssistBounds::default()),
             assist_desired_visible: AtomicBool::new(false),
             assist_pending_url: Mutex::new(None),
+            assist_hide_until_loaded: AtomicBool::new(false),
             game_info_cache: Mutex::new(HashMap::new()),
             ts_package_cache: Mutex::new(HashMap::new()),
             nexus_games_cache: Mutex::new(None),
@@ -1001,6 +1004,7 @@ pub fn manage_game(
         modio_game_id: modio_id,
         tool_overrides: None,
         game_version: None,
+        ignored_requirements: Vec::new(),
     };
     let install_exists = Path::new(&install_path).is_dir();
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
@@ -1083,6 +1087,36 @@ pub fn set_game_version(
     } else {
         Some(trimmed)
     };
+    let managed = game.clone();
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    Ok(managed)
+}
+
+#[tauri::command]
+pub fn set_ignored_requirements(
+    state: State<'_, AppState>,
+    id: String,
+    ignored: Vec<config::IgnoredRequirement>,
+) -> Result<ManagedGame, String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let game = cfg
+        .managed_games
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| "Managed game not found".to_string())?;
+    let mut seen = HashSet::new();
+    game.ignored_requirements = ignored
+        .into_iter()
+        .filter_map(|mut row| {
+            row.key = row.key.trim().to_string();
+            row.name = row.name.trim().to_string();
+            if row.key.is_empty() || row.name.is_empty() || !seen.insert(row.key.clone()) {
+                None
+            } else {
+                Some(row)
+            }
+        })
+        .collect();
     let managed = game.clone();
     config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
     Ok(managed)
@@ -3135,8 +3169,14 @@ pub async fn check_mod_game_versions(
                     }
                 }
             }
-            let advice =
-                mods::game_version::advise(current.as_deref(), &tags, &collection_versions);
+            let advice = mods::game_version::advise(&mods::game_version::AdviseInput {
+                domain: &nexus_domain,
+                current: current.as_deref(),
+                tags: &tags,
+                file_name: staged.file_name.as_deref(),
+                mod_version: staged.version.as_deref(),
+                collection_versions: &collection_versions,
+            });
             GameVersionModAdvice {
                 staged_id: staged.id.clone(),
                 status: advice.status,
@@ -3172,7 +3212,9 @@ async fn refresh_version_support(
         if staged.source != ModSource::Nexus || staged.nexus_mod_id == 0 {
             continue;
         }
-        if staged.supported_game_versions.is_some() {
+        if staged.supported_game_versions.is_some()
+            && staged.version_support_generation >= mods::game_version::VERSION_SUPPORT_GENERATION
+        {
             continue;
         }
         let domain = if staged.domain.trim().is_empty() {
@@ -3209,6 +3251,8 @@ async fn refresh_version_support(
                 for staged in &mut order.mods {
                     if let Some(versions) = tag_updates.get(&staged.id) {
                         staged.supported_game_versions = Some(versions.clone());
+                        staged.version_support_generation =
+                            mods::game_version::VERSION_SUPPORT_GENERATION;
                     }
                 }
             }
@@ -5287,6 +5331,90 @@ pub fn list_mods(state: State<'_, AppState>, game_id: String) -> Result<Vec<Stag
     Ok(order.mods)
 }
 
+struct PreparedWineOverrides {
+    advice: Option<games::WineOverrideAdvice>,
+    app_id: Option<String>,
+}
+
+fn prepare_wine_overrides(
+    state: &AppState,
+    game_id: &str,
+) -> Result<PreparedWineOverrides, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, game_id);
+        return Ok(PreparedWineOverrides {
+            advice: None,
+            app_id: None,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let game = managed_game(state, game_id)?;
+        let order = mods::load_loadorder(&state.paths, game_id).map_err(|e| e.to_string())?;
+        let staged: Vec<games::StagedProxySource<'_>> = order
+            .mods
+            .iter()
+            .map(|staged| games::StagedProxySource {
+                name: staged.name.as_str(),
+                path: Path::new(&staged.staging_path),
+                enabled: staged.enabled,
+            })
+            .collect();
+        let app_id = crate::tools::executables::steam_app_id_from_install(&game.install_path);
+        let (launch_options, can_apply, steam_note) = match &app_id {
+            None => (String::new(), false, None),
+            Some(app_id) => match crate::tools::steam_launch::read_launch_options(app_id) {
+                Ok(options) => (options.unwrap_or_default(), true, None),
+                Err(err) => (
+                    String::new(),
+                    false,
+                    Some(format!(
+                        "Steam launch options could not be read ({err:#}). The line below does not include them, so merge it in by hand."
+                    )),
+                ),
+            },
+        };
+        let advice = games::advise_wine_overrides(
+            Path::new(&game.install_path),
+            game.project_name.as_deref(),
+            &staged,
+            &launch_options,
+            can_apply,
+            steam_note.as_deref(),
+        );
+        Ok(PreparedWineOverrides { advice, app_id })
+    }
+}
+
+#[tauri::command]
+pub fn wine_override_advice(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Option<games::WineOverrideAdvice>, String> {
+    Ok(prepare_wine_overrides(&state, &game_id)?.advice)
+}
+
+#[tauri::command]
+pub fn apply_wine_overrides(
+    state: State<'_, AppState>,
+    game_id: String,
+) -> Result<Option<games::WineOverrideAdvice>, String> {
+    let prepared = prepare_wine_overrides(&state, &game_id)?;
+    let Some(advice) = prepared.advice else {
+        return Ok(None);
+    };
+    if !advice.can_apply {
+        return Err("No Steam app id for this install. Copy the launch options instead.".into());
+    }
+    let app_id = prepared.app_id.ok_or_else(|| {
+        "No Steam app id for this install. Copy the launch options instead.".to_string()
+    })?;
+    crate::tools::steam_launch::write_launch_options(&app_id, &advice.launch_options)
+        .map_err(|e| e.to_string())?;
+    Ok(prepare_wine_overrides(&state, &game_id)?.advice)
+}
+
 enum PosterLookup {
     Empty(String),
     Nexus {
@@ -6484,6 +6612,25 @@ fn staged_content_root(staged: &StagedMod, plugin: &dyn GamePlugin) -> Option<Pa
     games::normalize_staging_root(&staging, plugin).ok()
 }
 
+fn enabled_deploy_roots(
+    paths: &crate::config::Paths,
+    game_id: &str,
+    plugin_id: &str,
+) -> Vec<PathBuf> {
+    let Some(plugin) = games::plugin_by_id(plugin_id) else {
+        return Vec::new();
+    };
+    let Ok(order) = mods::load_loadorder(paths, game_id) else {
+        return Vec::new();
+    };
+    order
+        .mods
+        .iter()
+        .filter(|staged| staged.enabled)
+        .filter_map(|staged| staged_content_root(staged, plugin))
+        .collect()
+}
+
 #[tauri::command]
 pub fn get_mod_options(
     state: State<'_, AppState>,
@@ -6663,62 +6810,69 @@ pub async fn deploy_mods(
             .ok_or_else(|| "Managed game not found".to_string())?
     };
     let repair_warnings = repair_damaged_staging(&app, &state, &game_id).await;
-    let mut loader_warnings = if games::is_fromsoft_plugin(&game.plugin_id) {
-        let nexus = state.client().ok();
-        let premium = state.is_premium();
-        match games::ensure_fromsoft_loaders(
-            &state.paths,
-            &game.plugin_id,
-            Path::new(&game.install_path),
-            nexus.as_ref(),
-            premium,
-        )
-        .await
-        {
-            games::EnsureLoadersOutcome::Done(w) => w,
-            games::EnsureLoadersOutcome::NeedsAssist { warnings, request } => {
-                let mut w = warnings;
-                if let Err(e) =
-                    wait_for_legacy_loader_assist(&app, &state, &game_id, &request).await
-                {
-                    w.push(e);
-                } else if let Ok(extra) = games::finish_legacy_after_assist(
-                    &state.paths,
-                    &request.plugin_id,
-                    &request.install_path,
-                ) {
-                    w.extend(extra);
-                }
-                w
-            }
-        }
-    } else {
-        Vec::new()
-    };
     let install = PathBuf::from(&game.install_path);
-    // A Dressmaker install saved as generic BepInEx would drop content packs
-    // in BepInEx/plugins, which the in-game Mod Manager does not list.
-    let plugin_id = games::plugin_id_for_install(&game.plugin_id, &install).to_string();
+    let Some(saved_plugin) = games::plugin_by_id(&game.plugin_id) else {
+        return Err(format!("Unknown game plugin: {}", game.plugin_id));
+    };
+    // The saved plugin can name a more specific title for this install.
+    // The plugin decides; this command only persists the id.
+    let preferred = saved_plugin.preferred_plugin_id(&install);
+    let mut plugin_id = game.plugin_id.clone();
     let mut plugin_warning = None;
-    if plugin_id != game.plugin_id {
-        match state.config.lock() {
-            Ok(mut cfg) => {
-                if let Some(saved) = cfg.managed_games.iter_mut().find(|g| g.id == game_id) {
-                    saved.plugin_id = plugin_id.clone();
+    let plugin: &dyn GamePlugin = if preferred != game.plugin_id {
+        if let Some(next) = games::plugin_by_id(preferred) {
+            let display = next.info().display_name;
+            plugin_id = preferred.to_string();
+            match state.config.lock() {
+                Ok(mut cfg) => {
+                    if let Some(saved) = cfg.managed_games.iter_mut().find(|g| g.id == game_id) {
+                        saved.plugin_id = plugin_id.clone();
+                    }
+                    if let Err(e) = config::save_config(&state.paths, &cfg) {
+                        plugin_warning = Some(format!(
+                            "{display} was detected, but the saved game type could not be updated ({e:#})."
+                        ));
+                    }
                 }
-                if let Err(e) = config::save_config(&state.paths, &cfg) {
+                Err(e) => {
                     plugin_warning = Some(format!(
-                        "Dressmaker content packs deploy under Mods/, but the saved game type could not be updated ({e:#})."
+                        "{display} was detected, but the saved game type could not be updated ({e})."
                     ));
                 }
             }
-            Err(e) => {
-                plugin_warning = Some(format!(
-                    "Dressmaker content packs deploy under Mods/, but the saved game type could not be updated ({e})."
-                ));
-            }
+            next
+        } else {
+            saved_plugin
         }
-    }
+    } else {
+        saved_plugin
+    };
+    let nexus = state.client().ok();
+    let premium = state.is_premium();
+    let content_roots = enabled_deploy_roots(&state.paths, &game_id, &plugin_id);
+    let content_refs: Vec<&Path> = content_roots.iter().map(PathBuf::as_path).collect();
+    let prep = games::RuntimePrep {
+        paths: &state.paths,
+        install_path: &install,
+        nexus: nexus.as_ref(),
+        premium,
+        content_roots: &content_refs,
+    };
+    let mut loader_warnings = match plugin.prepare_runtime(&prep).await {
+        Ok(games::RuntimePrepOutcome::Done(warnings)) => warnings,
+        Ok(games::RuntimePrepOutcome::NeedsAssist { warnings, request }) => {
+            let mut warnings = warnings;
+            if let Err(e) =
+                wait_for_loader_assist(&app, &state, &game_id, plugin, &prep, &request).await
+            {
+                warnings.push(e);
+            } else if let Ok(extra) = plugin.finish_runtime_prep(&prep) {
+                warnings.extend(extra);
+            }
+            warnings
+        }
+        Err(e) => vec![format!("{e:#}")],
+    };
     let mut result = mods::deploy(
         &state.paths,
         &game_id,
@@ -6759,11 +6913,13 @@ pub async fn deploy_mods(
     Ok(result)
 }
 
-async fn wait_for_legacy_loader_assist(
+async fn wait_for_loader_assist(
     app: &tauri::AppHandle,
     state: &AppState,
     game_id: &str,
-    request: &games::LegacyAssistRequest,
+    plugin: &dyn GamePlugin,
+    prep: &games::RuntimePrep<'_>,
+    request: &games::LoaderAssistRequest,
 ) -> Result<(), String> {
     crate::assist::open_download_assist_inner(
         app,
@@ -6786,15 +6942,15 @@ async fn wait_for_legacy_loader_assist(
 
     let deadline = Instant::now() + Duration::from_secs(180);
     while Instant::now() < deadline {
-        if games::legacy_loader_ready(&state.paths, &request.plugin_id, &request.install_path) {
+        if plugin.loader_assist_ready(prep) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(
-        "Timed out waiting for Mod Engine Download Assist (180s). Complete the download in Assist and deploy again."
-            .into(),
-    )
+    Err(format!(
+        "Timed out waiting for {} (180s). Complete the download in Assist and deploy again.",
+        request.label
+    ))
 }
 
 #[tauri::command]

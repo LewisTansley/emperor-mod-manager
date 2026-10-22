@@ -69,6 +69,7 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
         }
       >
         <img
+          key={slide.url}
           ref={imgRef}
           src={slide.url}
           alt={slide.caption?.trim() || "Mod image"}

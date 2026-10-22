@@ -27,6 +27,7 @@ import {
   type CatalogSourceFilter,
 } from "./catalogSources";
 import { ImageCarousel } from "./ImageCarousel";
+import { ViewSlot } from "./motion";
 import { RichText } from "./RichText";
 import { browseGameVersionOptions } from "./gameVersion";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
@@ -36,9 +37,12 @@ import { ModOptionsDialog } from "./ModOptionsDialog";
 import { QuickInstallDialog } from "./QuickInstallDialog";
 import {
   disabledRequirementWarnings,
+  IgnoredRequirementsDialog,
   MissingRequirementsStrip,
   RequirementsDialog,
   requirementsNeedAttention,
+  withoutIgnoredDisabled,
+  withoutIgnoredRequirements,
 } from "./RequirementsDialog";
 import {
   StatusBanner,
@@ -46,6 +50,7 @@ import {
   type BannerAction,
   type StatusNotice,
 } from "./StatusBanner";
+import { WineOverrideNotice } from "./WineOverrideNotice";
 import type {
   BrowseMeta,
   BrowseSearchOpts,
@@ -59,6 +64,7 @@ import type {
   GameHealth,
   GameInfo,
   GameVersionReport,
+  IgnoredRequirement,
   InstalledCollection,
   ManagedGame,
   ModDetail,
@@ -69,6 +75,7 @@ import type {
   Settings,
   StagedMod,
   StagedModUpdate,
+  WineOverrideAdvice,
   TagFilterState,
   ThemePreference,
   InstallClickBehavior,
@@ -91,6 +98,8 @@ type BrowseListDensity = "compact" | "posters";
 type DetailTab = "info" | "files";
 type GameDetailTab = "info" | "mods" | "collections" | "tools";
 type BrowseTagMap = Record<string, TagFilterState>;
+
+const EMPTY_IGNORED: IgnoredRequirement[] = [];
 
 const UNREAL_PLUGIN_IDS = new Set([
   "unreal",
@@ -247,6 +256,15 @@ export function installedCatalogIds(mods: StagedMod[], game: ManagedGame): Set<s
     if (hit) ids.add(hit.id);
   }
   return ids;
+}
+
+/** Staged rows for a browse catalog id. Several files of one mod all match. */
+export function stagedModsForCatalogId(
+  mods: StagedMod[],
+  game: ManagedGame,
+  catalogId: string,
+): StagedMod[] {
+  return mods.filter((mod) => catalogHitFromStaged(mod, game)?.id === catalogId);
 }
 
 
@@ -929,7 +947,7 @@ function measureHostBounds(host: HTMLElement): {
 }
 
 export default function App() {
-  const [tab, setTabState] = useState<Tab>("setup");
+  const [tab, setTabState] = useState<Tab | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
@@ -954,10 +972,14 @@ export default function App() {
   } | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [mods, setMods] = useState<StagedMod[]>([]);
+  const [wineAdvice, setWineAdvice] = useState<WineOverrideAdvice | null>(null);
+  const [wineApplyBusy, setWineApplyBusy] = useState(false);
   const [missingRequirements, setMissingRequirements] =
     useState<MissingRequirements | null>(null);
   const [requirementsModal, setRequirementsModal] =
     useState<MissingRequirements | null>(null);
+  const [ignoredRequirementsOpen, setIgnoredRequirementsOpen] = useState(false);
+  const [ignoreSaving, setIgnoreSaving] = useState(false);
   const [gameVersionReport, setGameVersionReport] =
     useState<GameVersionReport | null>(null);
   const [gameVersionDraft, setGameVersionDraft] = useState("");
@@ -1140,6 +1162,7 @@ export default function App() {
   const prevActiveGameIdRef = useRef<string | null>(null);
   const pendingDownloadPageRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
   const modUpdatesReqRef = useRef(0);
+  const wineAdviceReqRef = useRef(0);
   const missingReqRef = useRef(0);
   const gameVersionReqRef = useRef(0);
   const pendingRequirementLinksRef = useRef<Map<string, string[]>>(new Map());
@@ -1386,6 +1409,18 @@ export default function App() {
     return list;
   }, [refreshGameHealth]);
 
+  const refreshWineAdvice = useCallback(async (gameId: string) => {
+    const req = ++wineAdviceReqRef.current;
+    try {
+      const advice = await api.wineOverrideAdvice(gameId);
+      if (req !== wineAdviceReqRef.current) return;
+      if (activeGameRef.current?.id !== gameId) return;
+      setWineAdvice(advice);
+    } catch (e) {
+      console.warn("wine_override_advice failed", e);
+    }
+  }, []);
+
   const refreshMods = useCallback(async (gameId: string) => {
     const list = await api.listMods(gameId);
     if (activeGameRef.current?.id !== gameId) return;
@@ -1399,7 +1434,8 @@ export default function App() {
     } catch (e) {
       console.warn("list_mods_with_options failed", e);
     }
-  }, []);
+    void refreshWineAdvice(gameId);
+  }, [refreshWineAdvice]);
 
   const refreshModUpdates = useCallback(async (gameId: string) => {
     const req = ++modUpdatesReqRef.current;
@@ -1508,9 +1544,15 @@ export default function App() {
   }, [refreshGameHealth]);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
+      let choseTab = false;
       try {
         const s = await refreshSettings();
+        if (!cancelled && tabRef.current == null) {
+          setTab(s.has_api_key ? "library" : "setup");
+          choseTab = true;
+        }
         await refreshManaged();
         await refreshOrphanScan();
         await scan();
@@ -1521,12 +1563,16 @@ export default function App() {
           } catch {
             /* key may be stale */
           }
-          setTab("library");
         }
       } catch (e) {
+        if (cancelled) return;
         setError(String(e));
+        if (!choseTab && tabRef.current == null) setTab("setup");
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [refreshManaged, refreshOrphanScan, refreshSettings, scan]);
 
   useEffect(() => {
@@ -1555,6 +1601,8 @@ export default function App() {
     if (gameChanged) {
       prevActiveGameIdRef.current = nextId;
       modUpdatesReqRef.current += 1;
+      wineAdviceReqRef.current += 1;
+      setWineAdvice(null);
       if (prevId !== null) {
         resetBrowseState();
         resetLibraryEphemeralState();
@@ -1571,6 +1619,7 @@ export default function App() {
       setModUpdates({});
     } else {
       setModUpdates({});
+      setWineAdvice(null);
     }
 
     const pending = pendingDownloadPageRef.current;
@@ -1682,7 +1731,7 @@ export default function App() {
     if (!showGameVersionWarnings) return [];
     const names = new Map(mods.map((mod) => [mod.id, mod.name]));
     return (gameVersionReport?.mods ?? [])
-      .filter((row) => row.status !== "ok")
+      .filter((row) => row.status === "mismatch")
       .map((row) => ({
         stagedId: row.staged_id,
         name: names.get(row.staged_id) ?? "Mod",
@@ -1695,6 +1744,18 @@ export default function App() {
         ? disabledRequirementWarnings(mods, requirementsModal)
         : [],
     [mods, requirementsModal],
+  );
+  const ignoredRequirements = activeGame?.ignored_requirements ?? EMPTY_IGNORED;
+  const visibleMissingRequirements = useMemo(
+    () =>
+      missingRequirements
+        ? withoutIgnoredRequirements(missingRequirements, ignoredRequirements)
+        : null,
+    [missingRequirements, ignoredRequirements],
+  );
+  const visibleDisabledRequirements = useMemo(
+    () => withoutIgnoredDisabled(stagedDisabledRequirements, ignoredRequirements),
+    [stagedDisabledRequirements, ignoredRequirements],
   );
 
   const nexusModsKey = useMemo(
@@ -3857,6 +3918,25 @@ export default function App() {
     await queueNexusFile(browseDetail.hit, file);
   }
 
+  async function uninstallCatalogMod(hit: CatalogHit) {
+    if (!activeGame) return;
+    const game = activeGame;
+    const matches = stagedModsForCatalogId(mods, game, hit.id);
+    if (matches.length === 0) return;
+    await withBusy(`Uninstalling ${hit.name}…`, async () => {
+      for (const staged of matches) {
+        await api.removeMod(game.id, staged.id);
+      }
+      await refreshMods(game.id);
+      await refreshCollections(game.id);
+      setModUpdates((prev) => {
+        const next = { ...prev };
+        for (const staged of matches) delete next[staged.id];
+        return next;
+      });
+    });
+  }
+
   async function quickInstallMod(hit: CatalogHit) {
     if (!activeGame || hit.source !== "nexus" || hit.mod_id == null) return;
     const domain = hit.domain_name || activeGame.nexus_domain;
@@ -4545,6 +4625,49 @@ export default function App() {
     }
   }
 
+  async function saveIgnoredRequirements(next: IgnoredRequirement[]) {
+    if (!activeGame) return;
+    const gameId = activeGame.id;
+    setIgnoreSaving(true);
+    setError(null);
+    try {
+      const updated = await api.setIgnoredRequirements(gameId, next);
+      setManaged((prev) => prev.map((game) => (game.id === updated.id ? updated : game)));
+      setLibraryDetail((detail) =>
+        detail && detail.game.id === updated.id ? { ...detail, game: updated } : detail,
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIgnoreSaving(false);
+    }
+  }
+
+  function ignoreRequirement(row: IgnoredRequirement) {
+    if (!activeGame) return;
+    const current = activeGame.ignored_requirements ?? [];
+    if (current.some((item) => item.key === row.key)) return;
+    void saveIgnoredRequirements([...current, row]);
+  }
+
+  function unignoreRequirement(key: string) {
+    if (!activeGame) return;
+    void saveIgnoredRequirements(
+      (activeGame.ignored_requirements ?? []).filter((item) => item.key !== key),
+    );
+  }
+
+  function openRequirementsReview(payload?: MissingRequirements | null) {
+    setRequirementsModal(
+      payload ??
+        missingRequirements ?? {
+          nexus: [],
+          external: [],
+          dlc: [],
+        },
+    );
+  }
+
   async function commitGameVersion(next: string) {
     if (!activeGame || !gameVersionReport) return;
     const trimmed = next.trim();
@@ -4572,12 +4695,46 @@ export default function App() {
     await withBusy("Deploying mods…", async () => {
       const result = await api.deployMods(activeGame.id);
       void refreshMissingRequirements(activeGame.id);
+      void refreshWineAdvice(activeGame.id);
+      const full = result.missing_requirements;
       setNotice(
-        deployStatusNotice(result, (requirements) => {
-          setRequirementsModal(requirements);
-        }),
+        deployStatusNotice(
+          {
+            ...result,
+            missing_requirements: full
+              ? withoutIgnoredRequirements(full, activeGame.ignored_requirements ?? [])
+              : full,
+          },
+          (requirements) => {
+            setRequirementsModal(full ?? requirements);
+          },
+        ),
       );
     });
+  }
+
+  async function applyWineOverrides() {
+    if (!activeGame) return;
+    setWineApplyBusy(true);
+    setError(null);
+    try {
+      const next = await api.applyWineOverrides(activeGame.id);
+      wineAdviceReqRef.current += 1;
+      if (activeGameRef.current?.id === activeGame.id) {
+        setWineAdvice(next);
+      }
+      if (!next) {
+        setNotice({
+          kind: "ok",
+          message:
+            "Updated Steam launch options. Restart Steam if the game was already running.",
+        });
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setWineApplyBusy(false);
+    }
   }
 
   async function checkLoadLogs() {
@@ -4592,6 +4749,7 @@ export default function App() {
     if (!activeGame) return;
     await withBusy("Purging deployed files…", async () => {
       await api.purgeMods(activeGame.id);
+      void refreshWineAdvice(activeGame.id);
       setNotice({ kind: "ok", message: "Purged deployed files." });
     });
   }
@@ -4760,6 +4918,8 @@ export default function App() {
           />
         ) : null}
 
+        {tab ? (
+        <ViewSlot key={tab}>
         {tab === "setup" && (
           <section className="panel">
             <h1>Setup</h1>
@@ -5034,6 +5194,14 @@ export default function App() {
                   </div>
                 </div>
 
+                <div
+                  key={
+                    libraryDetail.tab === "collections" && gameSavedDetail
+                      ? `collections:${gameSavedDetail.entry.id}`
+                      : libraryDetail.tab
+                  }
+                  className="view-enter"
+                >
                 {libraryDetail.tab === "info" && (
                   <div className="detail-body">
                     <h2>About</h2>
@@ -5469,29 +5637,37 @@ export default function App() {
                         </p>
                       )}
                     </div>
-                    {((missingRequirements &&
-                      requirementsNeedAttention(missingRequirements)) ||
-                      stagedDisabledRequirements.length > 0 ||
+                    {settings?.platform_linux && wineAdvice && (
+                      <WineOverrideNotice
+                        advice={wineAdvice}
+                        busy={wineApplyBusy}
+                        onApply={() => void applyWineOverrides()}
+                      />
+                    )}
+                    {ignoredRequirements.length > 0 && (
+                      <button
+                        type="button"
+                        className="linkish ignored-requirements-link"
+                        onClick={() => setIgnoredRequirementsOpen(true)}
+                      >
+                        Ignored requirements ({ignoredRequirements.length})
+                      </button>
+                    )}
+                    {((visibleMissingRequirements &&
+                      requirementsNeedAttention(visibleMissingRequirements)) ||
+                      visibleDisabledRequirements.length > 0 ||
                       versionWarnings.length > 0) && (
                       <MissingRequirementsStrip
                         requirements={
-                          missingRequirements ?? {
+                          visibleMissingRequirements ?? {
                             nexus: [],
                             external: [],
                             dlc: [],
                           }
                         }
-                        disabled={stagedDisabledRequirements}
+                        disabled={visibleDisabledRequirements}
                         versions={versionWarnings}
-                        onReview={() =>
-                          setRequirementsModal(
-                            missingRequirements ?? {
-                              nexus: [],
-                              external: [],
-                              dlc: [],
-                            },
-                          )
-                        }
+                        onReview={() => openRequirementsReview()}
                       />
                     )}
                     <ul className="list mods">
@@ -5857,9 +6033,10 @@ export default function App() {
                 {libraryDetail.tab === "tools" && settings?.platform_linux && (
                   <GameToolsPanel game={libraryDetail.game} />
                 )}
+                </div>
               </>
             ) : (
-              <>
+              <div className="view-enter">
                 <div className="panel-head">
                   <h1>Library</h1>
                   <div className="panel-head-actions">
@@ -5880,15 +6057,6 @@ export default function App() {
                     <button onClick={scan}>Scan games</button>
                   </div>
                 </div>
-                <p>
-                  Supported plugins include Stardew Valley, Baldur&apos;s Gate 3,
-                  Cyberpunk 2077, CONTROL Resonant, Days Gone, S.T.A.L.K.E.R. 2,
-                  Palworld, Hogwarts Legacy, Darktide, FromSoftware and Resident Evil
-                  titles, seeded Unity/BepInEx games (Lethal Company, Valheim, Risk of
-                  Rain 2, and more), plus generic Unreal and BepInEx pipelines. Browse
-                  can merge Nexus, Thunderstore, and mod.io when each source is
-                  configured.
-                </p>
                 {unrealManage && (
                   <div className="panel unreal-manage-panel">
                     <h2>Add as Unreal Engine game</h2>
@@ -6318,7 +6486,7 @@ export default function App() {
                     )}
                   </ul>
                 )}
-              </>
+              </div>
             )}
           </section>
         )}
@@ -6355,6 +6523,12 @@ export default function App() {
                   </div>
                 </div>
 
+                <div
+                  key={`${browseDetail.kind}:${browseDetail.tab}:${
+                    browseDetail.kind === "mod" ? browseDetail.hit.id : browseDetail.hit.slug
+                  }`}
+                  className="view-enter"
+                >
                 {browseDetail.kind === "mod" ? (
                   <>
                     <div className="detail-hero">
@@ -6467,6 +6641,15 @@ export default function App() {
                           )}
                         </dl>
                         <div className="detail-mod-actions">
+                          {installedIds.has(browseDetail.hit.id) ? (
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => void uninstallCatalogMod(browseDetail.hit)}
+                            >
+                              Uninstall
+                            </button>
+                          ) : null}
                           {browseDetail.hit.source === "thunderstore" ? (
                             <>
                               <button
@@ -6878,9 +7061,10 @@ export default function App() {
                     )}
                   </>
                 )}
+                </div>
               </>
             ) : (
-              <>
+              <div className="view-enter">
                 <div className="browse-chrome">
                 <div className="panel-head">
                   <div className="detail-head-title">
@@ -7144,7 +7328,11 @@ export default function App() {
                           }}
                         >
                           <option value="">Any</option>
-                          {browseGameVersionOptions(browseMeta, browseMode).map((v) => (
+                          {browseGameVersionOptions(
+                            browseMeta,
+                            browseMode,
+                            activeGame?.nexus_domain,
+                          ).map((v) => (
                             <option key={v} value={v}>
                               {v}
                             </option>
@@ -7295,25 +7483,51 @@ export default function App() {
                                 onClick={() => openMod(m, "info")}
                                 coverActions={
                                   m.source === "thunderstore" ? (
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        openMod(m, "info");
-                                      }}
-                                    >
-                                      Install
-                                    </button>
-                                  ) : m.source === "nexus" ? (
-                                    <>
+                                    installedIds.has(m.id) ? (
                                       <button
                                         type="button"
+                                        className="danger"
                                         onClick={(e) => {
                                           e.stopPropagation();
-                                          void quickInstallMod(m);
+                                          void uninstallCatalogMod(m);
                                         }}
                                       >
-                                        {isPremium ? "Install" : "Download Assist"}
+                                        Uninstall
                                       </button>
+                                    ) : (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          openMod(m, "info");
+                                        }}
+                                      >
+                                        Install
+                                      </button>
+                                    )
+                                  ) : m.source === "nexus" ? (
+                                    <>
+                                      {installedIds.has(m.id) ? (
+                                        <button
+                                          type="button"
+                                          className="danger"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void uninstallCatalogMod(m);
+                                          }}
+                                        >
+                                          Uninstall
+                                        </button>
+                                      ) : (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void quickInstallMod(m);
+                                          }}
+                                        >
+                                          {isPremium ? "Install" : "Download Assist"}
+                                        </button>
+                                      )}
                                       <button
                                         type="button"
                                         onClick={(e) => {
@@ -7325,14 +7539,28 @@ export default function App() {
                                       </button>
                                     </>
                                   ) : (
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        openMod(m, "files");
-                                      }}
-                                    >
-                                      Files
-                                    </button>
+                                    <>
+                                      {installedIds.has(m.id) ? (
+                                        <button
+                                          type="button"
+                                          className="danger"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void uninstallCatalogMod(m);
+                                          }}
+                                        >
+                                          Uninstall
+                                        </button>
+                                      ) : null}
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          openMod(m, "files");
+                                        }}
+                                      >
+                                        Files
+                                      </button>
+                                    </>
                                   )
                                 }
                               />
@@ -7411,12 +7639,22 @@ export default function App() {
                               </div>
                               {m.source === "nexus" ? (
                                 <div className="list-row-actions">
-                                  <button
-                                    type="button"
-                                    onClick={() => void quickInstallMod(m)}
-                                  >
-                                    {isPremium ? "Install" : "Download Assist"}
-                                  </button>
+                                  {installedIds.has(m.id) ? (
+                                    <button
+                                      type="button"
+                                      className="danger"
+                                      onClick={() => void uninstallCatalogMod(m)}
+                                    >
+                                      Uninstall
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => void quickInstallMod(m)}
+                                    >
+                                      {isPremium ? "Install" : "Download Assist"}
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
                                     onClick={() => openMod(m, "files")}
@@ -7424,17 +7662,31 @@ export default function App() {
                                     Files
                                   </button>
                                 </div>
+                              ) : m.source === "thunderstore" ? (
+                                installedIds.has(m.id) ? (
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    onClick={() => void uninstallCatalogMod(m)}
+                                  >
+                                    Uninstall
+                                  </button>
+                                ) : (
+                                  <button onClick={() => openMod(m, "info")}>Install</button>
+                                )
+                              ) : installedIds.has(m.id) ? (
+                                <div className="list-row-actions">
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    onClick={() => void uninstallCatalogMod(m)}
+                                  >
+                                    Uninstall
+                                  </button>
+                                  <button onClick={() => openMod(m, "files")}>Files</button>
+                                </div>
                               ) : (
-                                <button
-                                  onClick={() =>
-                                    openMod(
-                                      m,
-                                      m.source === "thunderstore" ? "info" : "files",
-                                    )
-                                  }
-                                >
-                                  {m.source === "thunderstore" ? "Install" : "Files"}
-                                </button>
+                                <button onClick={() => openMod(m, "files")}>Files</button>
                               )}
                             </li>
                             );
@@ -7581,7 +7833,7 @@ export default function App() {
                     )}
                   </div>
                 ) : null}
-              </>
+              </div>
             )}
           </section>
         )}
@@ -7589,7 +7841,7 @@ export default function App() {
         {tab === "collections" && (
           <section className="panel">
             {savedDetail ? (
-              <>
+              <div key={savedDetail.entry.id} className="view-enter">
                 <div className="panel-head">
                   <button
                     type="button"
@@ -7720,9 +7972,9 @@ export default function App() {
                   <h2>Code</h2>
                   <textarea rows={4} readOnly value={savedDetail.entry.code} />
                 </div>
-              </>
+              </div>
             ) : (
-              <>
+              <div className="view-enter">
                 <div className="panel-head">
                   <h1>Saved Collections</h1>
                 </div>
@@ -7786,7 +8038,7 @@ export default function App() {
                     </li>
                   )}
                 </ul>
-              </>
+              </div>
             )}
           </section>
         )}
@@ -8089,6 +8341,8 @@ export default function App() {
             </p>
           </section>
         )}
+        </ViewSlot>
+        ) : null}
       </main>
       {loadDiagnosis && (
         <LoadLogDialog
@@ -8124,13 +8378,23 @@ export default function App() {
         <RequirementsDialog
           requirements={requirementsModal}
           disabled={modalDisabledRequirements}
+          ignored={ignoredRequirements}
           versions={versionWarnings}
           isPremium={isPremium}
-          busy={Boolean(busy)}
+          busy={Boolean(busy) || ignoreSaving}
           onClose={() => setRequirementsModal(null)}
           onAddSelected={(rows) => void queueSelectedRequirements(rows)}
           onEnable={(ids) => void enableStagedMods(ids)}
           onDisable={(ids) => void disableStagedMods(ids)}
+          onIgnore={ignoreRequirement}
+        />
+      )}
+      {ignoredRequirementsOpen && ignoredRequirements.length > 0 && (
+        <IgnoredRequirementsDialog
+          ignored={ignoredRequirements}
+          busy={Boolean(busy) || ignoreSaving}
+          onClose={() => setIgnoredRequirementsOpen(false)}
+          onUnignore={unignoreRequirement}
         />
       )}
       {modOptionsFor && activeGame && (

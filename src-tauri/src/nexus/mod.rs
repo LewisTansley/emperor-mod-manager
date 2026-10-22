@@ -1544,7 +1544,10 @@ impl NexusClient {
                             .filter_map(|t| {
                                 t.get("name").and_then(|v| v.as_str()).map(str::to_string)
                             })
-                            .filter(|t| looks_like_version(t))
+                            .filter(|t| {
+                                looks_like_version(t)
+                                    || crate::mods::game_version::is_line_alias(domain, t)
+                            })
                             .collect()
                     })
                     .unwrap_or_default();

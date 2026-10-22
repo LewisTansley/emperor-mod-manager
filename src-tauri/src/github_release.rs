@@ -40,6 +40,19 @@ fn download_client() -> Result<reqwest::Client> {
         .context("building download HTTP client")
 }
 
+pub async fn fetch_release_by_tag(repo: &str, tag: &str) -> Result<Option<GhRelease>> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    let client = api_client()?;
+    let resp = client.get(&url).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!("GitHub API error {} for {url}", resp.status()));
+    }
+    Ok(Some(resp.json().await?))
+}
+
 pub async fn fetch_latest_release(repo: &str) -> Result<Option<GhRelease>> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let client = api_client()?;

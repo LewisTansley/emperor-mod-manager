@@ -1167,6 +1167,43 @@ fn dinput8_override_warnings(install_path: &Path) -> Vec<String> {
     }
 }
 
+fn prepare_fromsoft_runtime<'a>(
+    plugin_id: &'static str,
+    ctx: &'a super::RuntimePrep<'_>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let outcome = crate::games::fromsoft_loaders::ensure_fromsoft_loaders(
+            ctx.paths,
+            plugin_id,
+            ctx.install_path,
+            ctx.nexus,
+            ctx.premium,
+        )
+        .await;
+        Ok(match outcome {
+            crate::games::fromsoft_loaders::EnsureLoadersOutcome::Done(warnings) => {
+                super::RuntimePrepOutcome::Done(warnings)
+            }
+            crate::games::fromsoft_loaders::EnsureLoadersOutcome::NeedsAssist {
+                warnings,
+                request,
+            } => super::RuntimePrepOutcome::NeedsAssist {
+                warnings,
+                request: super::LoaderAssistRequest {
+                    domain: request.domain,
+                    mod_id: request.mod_id,
+                    file_id: request.file_id,
+                    plugin_id: request.plugin_id,
+                    install_path: request.install_path,
+                    label: request.label,
+                },
+            },
+        })
+    })
+}
+
 fn modern_after_deploy(
     install_path: &Path,
     me3_game: &str,
@@ -1241,6 +1278,33 @@ macro_rules! fromsoft_legacy_plugin {
             ) -> Result<Vec<String>> {
                 legacy_after_deploy($id, install_path)
             }
+
+            fn prepare_runtime<'a>(
+                &'a self,
+                ctx: &'a super::RuntimePrep<'_>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a,
+                >,
+            > {
+                prepare_fromsoft_runtime($id, ctx)
+            }
+
+            fn finish_runtime_prep(&self, ctx: &super::RuntimePrep<'_>) -> Result<Vec<String>> {
+                crate::games::fromsoft_loaders::finish_legacy_after_assist(
+                    ctx.paths,
+                    $id,
+                    ctx.install_path,
+                )
+            }
+
+            fn loader_assist_ready(&self, ctx: &super::RuntimePrep<'_>) -> bool {
+                crate::games::fromsoft_loaders::legacy_loader_ready(
+                    ctx.paths,
+                    $id,
+                    ctx.install_path,
+                )
+            }
         }
     };
 }
@@ -1289,6 +1353,17 @@ macro_rules! fromsoft_modern_plugin {
                 enabled_mod_folders: &[String],
             ) -> Result<Vec<String>> {
                 modern_after_deploy(install_path, $me3_game, enabled_mod_folders)
+            }
+
+            fn prepare_runtime<'a>(
+                &'a self,
+                ctx: &'a super::RuntimePrep<'_>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a,
+                >,
+            > {
+                prepare_fromsoft_runtime($id, ctx)
             }
         }
     };
@@ -1357,6 +1432,38 @@ fromsoft_legacy_plugin!(
 mod tests {
     use super::*;
     use crate::games::{match_plugin, normalize_staging_root};
+
+    #[tokio::test]
+    async fn prepare_runtime_skips_when_legacy_loader_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("DARK SOULS REMASTERED");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("dinput8.dll"), b"x").unwrap();
+        let paths = crate::config::Paths {
+            config_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        let ctx = crate::games::RuntimePrep {
+            paths: &paths,
+            install_path: &install,
+            nexus: None,
+            premium: false,
+            content_roots: &[],
+        };
+        let outcome = DarkSoulsRemasteredPlugin
+            .prepare_runtime(&ctx)
+            .await
+            .unwrap();
+        match outcome {
+            crate::games::RuntimePrepOutcome::Done(warnings) => {
+                assert!(warnings.is_empty(), "{warnings:?}");
+            }
+            crate::games::RuntimePrepOutcome::NeedsAssist { .. } => {
+                panic!("loader already on disk should not open Download Assist");
+            }
+        }
+    }
 
     #[test]
     fn prefers_game_subdir_when_present() {

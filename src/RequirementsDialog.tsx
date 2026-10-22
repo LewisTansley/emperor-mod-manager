@@ -3,7 +3,9 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { Modal } from "./Modal";
 import type {
+  DlcRequirementNote,
   ExternalRequirementLink,
+  IgnoredRequirement,
   MissingRequirements,
   NexusRequirementDownload,
   StagedMod,
@@ -12,6 +14,7 @@ import type {
 type Props = {
   requirements: MissingRequirements;
   disabled: DisabledRequirementWarning[];
+  ignored?: IgnoredRequirement[];
   versions?: GameVersionWarning[];
   isPremium: boolean;
   busy: boolean;
@@ -19,6 +22,7 @@ type Props = {
   onAddSelected: (rows: NexusRequirementDownload[]) => void;
   onEnable: (stagedIds: string[]) => void;
   onDisable: (stagedIds: string[]) => void;
+  onIgnore?: (row: IgnoredRequirement) => void;
 };
 
 export type DisabledRequirementWarning = {
@@ -111,6 +115,55 @@ export function disabledRequirementWarnings(
 
 export function requirementKey(row: NexusRequirementDownload): string {
   return `${row.domain}:${row.mod_id}:${row.file_id}`;
+}
+
+export function nexusIgnoreKey(
+  row: Pick<NexusRequirementDownload, "domain" | "mod_id">,
+): string {
+  return `nexus:${row.domain}:${row.mod_id}`;
+}
+
+export function externalIgnoreKey(
+  row: Pick<ExternalRequirementLink, "name" | "url">,
+): string {
+  const url = row.url.trim();
+  return `external:${url || row.name.trim()}`;
+}
+
+export function dlcIgnoreKey(row: Pick<DlcRequirementNote, "name">): string {
+  return `dlc:${row.name.trim()}`;
+}
+
+export function stagedIgnoreKey(stagedId: string): string {
+  return `staged:${stagedId}`;
+}
+
+function ignoredKeys(ignored: IgnoredRequirement[]): Set<string> {
+  return new Set(ignored.map((row) => row.key));
+}
+
+/** Drops requirements the user has chosen to hide. */
+export function withoutIgnoredRequirements(
+  requirements: MissingRequirements,
+  ignored: IgnoredRequirement[],
+): MissingRequirements {
+  const keys = ignoredKeys(ignored);
+  if (keys.size === 0) return requirements;
+  return {
+    ...requirements,
+    nexus: requirements.nexus.filter((row) => !keys.has(nexusIgnoreKey(row))),
+    external: requirements.external.filter((row) => !keys.has(externalIgnoreKey(row))),
+    dlc: requirements.dlc.filter((row) => !keys.has(dlcIgnoreKey(row))),
+  };
+}
+
+export function withoutIgnoredDisabled(
+  disabled: DisabledRequirementWarning[],
+  ignored: IgnoredRequirement[],
+): DisabledRequirementWarning[] {
+  const keys = ignoredKeys(ignored);
+  if (keys.size === 0) return disabled;
+  return disabled.filter((row) => !keys.has(stagedIgnoreKey(row.stagedId)));
 }
 
 export function requirementsNeedAttention(
@@ -218,9 +271,39 @@ function DisableButton({
   );
 }
 
+function IgnoreButton({
+  entry,
+  busy,
+  onIgnore,
+}: {
+  entry: IgnoredRequirement | null;
+  busy: boolean;
+  onIgnore?: (row: IgnoredRequirement) => void;
+}) {
+  if (!entry || !onIgnore) return null;
+  return (
+    <button
+      type="button"
+      disabled={busy}
+      aria-label={`Ignore ${entry.name}`}
+      onClick={() => onIgnore(entry)}
+    >
+      Ignore
+    </button>
+  );
+}
+
+function ignoreEntry(key: string, name: string): IgnoredRequirement | null {
+  const trimmed = name.trim();
+  const identity = key.slice(key.indexOf(":") + 1).trim();
+  if (!trimmed || !identity) return null;
+  return { key, name: trimmed };
+}
+
 export function RequirementsDialog({
   requirements,
   disabled,
+  ignored = [],
   versions = [],
   isPremium,
   busy,
@@ -228,11 +311,20 @@ export function RequirementsDialog({
   onAddSelected,
   onEnable,
   onDisable,
+  onIgnore,
 }: Props) {
+  const visibleRequirements = useMemo(
+    () => withoutIgnoredRequirements(requirements, ignored),
+    [requirements, ignored],
+  );
+  const visibleDisabled = useMemo(
+    () => withoutIgnoredDisabled(disabled, ignored),
+    [disabled, ignored],
+  );
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const nexusKeys = useMemo(
-    () => requirements.nexus.map(requirementKey),
-    [requirements.nexus],
+    () => visibleRequirements.nexus.map(requirementKey),
+    [visibleRequirements.nexus],
   );
   const allSelected = nexusKeys.length > 0 && nexusKeys.every((key) => selected.has(key));
 
@@ -249,10 +341,12 @@ export function RequirementsDialog({
     setSelected(allSelected ? new Set() : new Set(nexusKeys));
   }
 
-  const chosen = requirements.nexus.filter((row) => selected.has(requirementKey(row)));
+  const chosen = visibleRequirements.nexus.filter((row) =>
+    selected.has(requirementKey(row)),
+  );
   const dependentIds = useMemo(
-    () => uniqueIds(disabled.flatMap((row) => row.requiredByIds)),
-    [disabled],
+    () => uniqueIds(visibleDisabled.flatMap((row) => row.requiredByIds)),
+    [visibleDisabled],
   );
 
   return (
@@ -267,7 +361,7 @@ export function RequirementsDialog({
       footer={
         <>
           <span className="note">
-            {requirements.nexus.length === 0
+            {visibleRequirements.nexus.length === 0
               ? "No Nexus mods to download."
               : `${chosen.length} selected`}
           </span>
@@ -287,7 +381,7 @@ export function RequirementsDialog({
       }
     >
       {requirements.error && <p className="note">{requirements.error}</p>}
-      {requirements.nexus.length > 0 && (
+      {visibleRequirements.nexus.length > 0 && (
         <>
           <div className="requirements-select-all">
             <label className="check">
@@ -301,7 +395,7 @@ export function RequirementsDialog({
             </label>
           </div>
           <ul className="list requirements-list">
-            {requirements.nexus.map((row) => {
+            {visibleRequirements.nexus.map((row) => {
               const key = requirementKey(row);
               const by = requiredBy(row.required_by_names);
               return (
@@ -322,6 +416,11 @@ export function RequirementsDialog({
                       {row.notes ? ` · ${row.notes}` : ""}
                     </small>
                   </div>
+                  <IgnoreButton
+                    entry={ignoreEntry(nexusIgnoreKey(row), row.name)}
+                    busy={busy}
+                    onIgnore={onIgnore}
+                  />
                   <DisableButton
                     ids={row.required_by}
                     busy={busy}
@@ -342,11 +441,11 @@ export function RequirementsDialog({
           </ul>
         </>
       )}
-      {requirements.external.length > 0 && (
+      {visibleRequirements.external.length > 0 && (
         <>
           <h3>Outside Nexus</h3>
           <ul className="list requirements-list">
-            {requirements.external.map((row) => {
+            {visibleRequirements.external.map((row) => {
               const by = requiredBy(row.required_by_names);
               return (
                 <li key={`${row.name}:${row.url}:${by ?? ""}`}>
@@ -357,6 +456,11 @@ export function RequirementsDialog({
                       {row.notes ? `${by ? " · " : ""}${row.notes}` : ""}
                     </small>
                   </div>
+                  <IgnoreButton
+                    entry={ignoreEntry(externalIgnoreKey(row), row.name)}
+                    busy={busy}
+                    onIgnore={onIgnore}
+                  />
                   <DisableButton
                     ids={row.required_by}
                     busy={busy}
@@ -368,11 +472,11 @@ export function RequirementsDialog({
           </ul>
         </>
       )}
-      {requirements.dlc.length > 0 && (
+      {visibleRequirements.dlc.length > 0 && (
         <>
           <h3>DLC</h3>
           <ul className="list requirements-list">
-            {requirements.dlc.map((row) => {
+            {visibleRequirements.dlc.map((row) => {
               const by = requiredBy(row.required_by_names);
               return (
                 <li key={row.name}>
@@ -383,6 +487,11 @@ export function RequirementsDialog({
                       {row.notes ? `${by ? " · " : ""}${row.notes}` : ""}
                     </small>
                   </div>
+                  <IgnoreButton
+                    entry={ignoreEntry(dlcIgnoreKey(row), row.name)}
+                    busy={busy}
+                    onIgnore={onIgnore}
+                  />
                   <DisableButton
                     ids={row.required_by}
                     busy={busy}
@@ -394,18 +503,18 @@ export function RequirementsDialog({
           </ul>
         </>
       )}
-      {disabled.length > 0 && (
+      {visibleDisabled.length > 0 && (
         <>
           <h3>Disabled</h3>
           <p className="note">
             These mods are installed but unticked. Enabled mods require them.
           </p>
-          {disabled.length > 1 && (
+          {visibleDisabled.length > 1 && (
             <div className="requirements-select-all">
               <button
                 type="button"
                 disabled={busy}
-                onClick={() => onEnable(disabled.map((row) => row.stagedId))}
+                onClick={() => onEnable(visibleDisabled.map((row) => row.stagedId))}
               >
                 Enable all
               </button>
@@ -421,7 +530,7 @@ export function RequirementsDialog({
             </div>
           )}
           <ul className="list requirements-list">
-            {disabled.map((row) => {
+            {visibleDisabled.map((row) => {
               const by = requiredBy(row.requiredByNames);
               return (
                 <li key={row.stagedId}>
@@ -436,6 +545,11 @@ export function RequirementsDialog({
                   >
                     Enable
                   </button>
+                  <IgnoreButton
+                    entry={ignoreEntry(stagedIgnoreKey(row.stagedId), row.name)}
+                    busy={busy}
+                    onIgnore={onIgnore}
+                  />
                   <DisableButton
                     ids={row.requiredByIds}
                     busy={busy}
@@ -462,13 +576,51 @@ export function RequirementsDialog({
           </ul>
         </details>
       )}
-      {requirements.nexus.length +
-        requirements.external.length +
-        requirements.dlc.length +
-        disabled.length +
+      {visibleRequirements.nexus.length +
+        visibleRequirements.external.length +
+        visibleRequirements.dlc.length +
+        visibleDisabled.length +
         versions.length ===
         0 &&
         !requirements.error && <p className="note">No missing requirements.</p>}
+    </Modal>
+  );
+}
+
+export function IgnoredRequirementsDialog({
+  ignored,
+  busy,
+  onClose,
+  onUnignore,
+}: {
+  ignored: IgnoredRequirement[];
+  busy: boolean;
+  onClose: () => void;
+  onUnignore: (key: string) => void;
+}) {
+  return (
+    <Modal
+      title="Ignored requirements"
+      subtitle="These stay out of the review until you restore them."
+      onClose={onClose}
+    >
+      <ul className="list requirements-list">
+        {ignored.map((row) => (
+          <li key={row.key}>
+            <div>
+              <strong>{row.name}</strong>
+            </div>
+            <button
+              type="button"
+              disabled={busy}
+              aria-label={`Unignore ${row.name}`}
+              onClick={() => onUnignore(row.key)}
+            >
+              Unignore
+            </button>
+          </li>
+        ))}
+      </ul>
     </Modal>
   );
 }

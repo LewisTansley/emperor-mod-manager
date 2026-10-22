@@ -11,7 +11,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::{content_folder_wrap_name, normalize_relative, GamePlugin, GamePluginInfo};
 
@@ -62,6 +62,8 @@ pub struct BepInExTitleSeed {
     pub nexus_domain: &'static str,
     pub thunderstore_community: &'static str,
     pub match_names: &'static [&'static str],
+    /// Community BepInEx pack `(namespace, name)`. `None` uses the runtime GitHub build.
+    pub pack: Option<(&'static str, &'static str)>,
 }
 
 pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
@@ -71,6 +73,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "lethalcompany",
         thunderstore_community: "lethal-company",
         match_names: &["lethal company", "lethalcompany"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "valheim",
@@ -78,6 +81,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "valheim",
         thunderstore_community: "valheim",
         match_names: &["valheim"],
+        pack: Some(("denikson", "BepInExPack_Valheim")),
     },
     BepInExTitleSeed {
         plugin_id: "riskofrain2",
@@ -85,6 +89,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "riskofrain2",
         thunderstore_community: "riskofrain2",
         match_names: &["risk of rain 2", "riskofrain2", "ror2"],
+        pack: Some(("bbepis", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "amongus",
@@ -92,6 +97,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "amongus",
         thunderstore_community: "among-us",
         match_names: &["among us", "amongus"],
+        pack: Some(("BepInEx", "BepInExPack_AmongUs")),
     },
     BepInExTitleSeed {
         plugin_id: "contentwarning",
@@ -99,6 +105,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "contentwarning",
         thunderstore_community: "content-warning",
         match_names: &["content warning", "contentwarning"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "gtfo",
@@ -106,6 +113,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "gtfo",
         thunderstore_community: "gtfo",
         match_names: &["gtfo"],
+        pack: Some(("BepInEx", "BepInExPack_GTFO")),
     },
     BepInExTitleSeed {
         plugin_id: "timberborn",
@@ -113,6 +121,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "timberborn",
         thunderstore_community: "timberborn",
         match_names: &["timberborn"],
+        pack: Some(("BepInEx", "BepInExPack_Timberborn")),
     },
     BepInExTitleSeed {
         plugin_id: "cultofthelamb",
@@ -120,6 +129,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "cultofthelamb",
         thunderstore_community: "cult-of-the-lamb",
         match_names: &["cult of the lamb", "cultofthelamb"],
+        pack: Some(("BepInEx", "BepInExPack_CultOfTheLamb")),
     },
     BepInExTitleSeed {
         plugin_id: "againstthestorm",
@@ -127,6 +137,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "againstthestorm",
         thunderstore_community: "against-the-storm",
         match_names: &["against the storm", "againstthestorm"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "rounds",
@@ -134,6 +145,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "rounds",
         thunderstore_community: "rounds",
         match_names: &["rounds"],
+        pack: Some(("BepInEx", "BepInExPack_ROUNDS")),
     },
     BepInExTitleSeed {
         plugin_id: "sonsoftheforest",
@@ -141,6 +153,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "sonsoftheforest",
         thunderstore_community: "sons-of-the-forest",
         match_names: &["sons of the forest", "sonsoftheforest"],
+        pack: Some(("BepInEx", "BepInExPack_IL2CPP")),
     },
     BepInExTitleSeed {
         plugin_id: "subnauticabelowzero",
@@ -148,6 +161,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "subnauticabelowzero",
         thunderstore_community: "subnautica-below-zero",
         match_names: &["below zero", "subnauticabelowzero"],
+        pack: Some(("Subnautica_Modding", "BepInExPack_BelowZero")),
     },
     BepInExTitleSeed {
         plugin_id: "subnautica",
@@ -155,6 +169,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "subnautica",
         thunderstore_community: "subnautica",
         match_names: &["subnautica"],
+        pack: Some(("Subnautica_Modding", "BepInExPack_Subnautica")),
     },
     BepInExTitleSeed {
         plugin_id: "schedule1",
@@ -162,6 +177,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "schedule1",
         thunderstore_community: "schedule-i",
         match_names: &["schedule 1", "schedule i", "schedule1"],
+        pack: None,
     },
     BepInExTitleSeed {
         plugin_id: "repo",
@@ -169,6 +185,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "repo",
         thunderstore_community: "repo",
         match_names: &["r.e.p.o.", "r.e.p.o", "repo"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "peak",
@@ -176,6 +193,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "peak",
         thunderstore_community: "peak",
         match_names: &["peak"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "h3vr",
@@ -188,6 +206,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
             "hot dogs horseshoes",
             "h3vr",
         ],
+        pack: Some(("BepInEx", "BepInExPack_H3VR")),
     },
     BepInExTitleSeed {
         plugin_id: "ultrakill",
@@ -195,6 +214,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "ultrakill",
         thunderstore_community: "ultrakill",
         match_names: &["ultrakill"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "atlyss",
@@ -202,6 +222,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "atlyss",
         thunderstore_community: "atlyss",
         match_names: &["atlyss"],
+        pack: Some(("BepInEx", "BepInExPack")),
     },
     BepInExTitleSeed {
         plugin_id: "dysonsphereprogram",
@@ -209,6 +230,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "dysonsphereprogram",
         thunderstore_community: "dyson-sphere-program",
         match_names: &["dyson sphere program", "dysonsphereprogram"],
+        pack: Some(("xiaoye97", "BepInEx")),
     },
     BepInExTitleSeed {
         plugin_id: "inscryption",
@@ -216,6 +238,7 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
         nexus_domain: "inscryption",
         thunderstore_community: "inscryption",
         match_names: &["inscryption"],
+        pack: Some(("BepInEx", "BepInExPack_Inscryption")),
     },
     BepInExTitleSeed {
         plugin_id: "hollowknightsilksong",
@@ -227,6 +250,15 @@ pub const BEPINEX_TITLE_SEEDS: &[BepInExTitleSeed] = &[
             "hollow knight: silksong",
             "hollowknightsilksong",
         ],
+        pack: Some(("BepInEx", "BepInExPack_Silksong")),
+    },
+    BepInExTitleSeed {
+        plugin_id: "chefrpg",
+        display_name: "Chef RPG",
+        nexus_domain: "chefrpg",
+        thunderstore_community: "",
+        match_names: &["chef rpg", "chefrpg"],
+        pack: None,
     },
 ];
 
@@ -245,6 +277,9 @@ pub fn seed_by_nexus_domain(domain: &str) -> Option<&'static BepInExTitleSeed> {
 
 pub fn thunderstore_community_for_plugin(plugin_id: &str) -> Option<&'static str> {
     if let Some(s) = seed_by_plugin_id(plugin_id) {
+        if s.thunderstore_community.is_empty() {
+            return None;
+        }
         return Some(s.thunderstore_community);
     }
     extra_thunderstore_community(plugin_id)
@@ -258,6 +293,309 @@ fn extra_thunderstore_community(plugin_id: &str) -> Option<&'static str> {
         "boneworks" => Some("boneworks"),
         _ => None,
     }
+}
+
+const BEPINEX_REPO: &str = "BepInEx/BepInEx";
+const MONO_TAG: &str = "v5.4.23.5";
+const MONO_ASSET: &str = "BepInEx_win_x64_5.4.23.5.zip";
+const MONO_CACHE: &str = "win-x64-5.4.23.5";
+const IL2CPP_TAG: &str = "v6.0.0-pre.2";
+const IL2CPP_ASSET: &str = "BepInEx-Unity.IL2CPP-win-x64-6.0.0-pre.2.zip";
+const IL2CPP_CACHE: &str = "il2cpp-win-x64-6.0.0-pre.2";
+const CHEF_RPG_APP_ID: &str = "1796790";
+
+/// Where an automatic BepInEx install comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BepInExBuild {
+    Thunderstore {
+        community: &'static str,
+        namespace: &'static str,
+        name: &'static str,
+    },
+    Github {
+        tag: &'static str,
+        asset: &'static str,
+        cache_id: &'static str,
+        label: &'static str,
+        il2cpp: bool,
+    },
+}
+
+impl BepInExBuild {
+    pub fn cache_id(self) -> String {
+        match self {
+            Self::Thunderstore {
+                namespace, name, ..
+            } => format!("ts-{namespace}-{name}"),
+            Self::Github { cache_id, .. } => cache_id.to_string(),
+        }
+    }
+
+    pub fn repo(self) -> &'static str {
+        BEPINEX_REPO
+    }
+}
+
+fn mono_github_build() -> BepInExBuild {
+    BepInExBuild::Github {
+        tag: MONO_TAG,
+        asset: MONO_ASSET,
+        cache_id: MONO_CACHE,
+        label: "BepInEx 5.4.23.5",
+        il2cpp: false,
+    }
+}
+
+fn il2cpp_github_build() -> BepInExBuild {
+    BepInExBuild::Github {
+        tag: IL2CPP_TAG,
+        asset: IL2CPP_ASSET,
+        cache_id: IL2CPP_CACHE,
+        label: "BepInEx 6.0.0-pre.2 (IL2CPP)",
+        il2cpp: true,
+    }
+}
+
+pub fn is_bepinex_auto_plugin(plugin_id: &str) -> bool {
+    plugin_id.eq_ignore_ascii_case("bepinex") || seed_by_plugin_id(plugin_id).is_some()
+}
+
+/// Loader to install when this game has no BepInEx yet.
+///
+/// Schedule I's Thunderstore community uses MelonLoader, so it is not given a
+/// BepInEx build. Chef RPG is pinned to the Mono 5.4.23.5 zip Nexus documents.
+pub fn select_bepinex_build(plugin_id: &str, runtime: UnityRuntime) -> Option<BepInExBuild> {
+    if !is_bepinex_auto_plugin(plugin_id) {
+        return None;
+    }
+    if plugin_id.eq_ignore_ascii_case("schedule1") {
+        return None;
+    }
+    if plugin_id.eq_ignore_ascii_case("chefrpg") {
+        return Some(mono_github_build());
+    }
+    if let Some(seed) = seed_by_plugin_id(plugin_id) {
+        if let Some((namespace, name)) = seed.pack {
+            return Some(BepInExBuild::Thunderstore {
+                community: seed.thunderstore_community,
+                namespace,
+                name,
+            });
+        }
+    }
+    Some(match runtime {
+        UnityRuntime::Il2Cpp => il2cpp_github_build(),
+        UnityRuntime::Mono | UnityRuntime::Unknown => mono_github_build(),
+    })
+}
+
+/// A Chef RPG character/staff download: `UnassignedStaffData.dat` and no plugin DLL.
+pub fn looks_like_chefrpg_save_pack(content_root: &Path) -> bool {
+    if !content_root.is_dir() {
+        return false;
+    }
+    let mut has_staff = false;
+    let mut has_dll = false;
+    for entry in walkdir::WalkDir::new(content_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if name.eq_ignore_ascii_case("UnassignedStaffData.dat") {
+            has_staff = true;
+        }
+        if name.to_ascii_lowercase().ends_with(".dll") {
+            has_dll = true;
+        }
+    }
+    has_staff && !has_dll
+}
+
+/// Skip the download when BepInEx is already there, nothing enabled needs it,
+/// or an enabled mod is itself the pack that deploy will install.
+/// `build` is the plugin's loader choice; a save overwrite
+/// ([`GamePlugin::allows_empty_deploy`]) does not count as needing a loader.
+pub fn should_auto_install_bepinex(
+    install_path: &Path,
+    content_roots: &[&Path],
+    build: Option<BepInExBuild>,
+    allows_empty: impl Fn(&Path) -> bool,
+) -> bool {
+    if build.is_none() {
+        return false;
+    }
+    if bepinex_present(install_path) {
+        return false;
+    }
+    let mut needs = false;
+    for root in content_roots {
+        if looks_like_bepinex_pack(root) {
+            return false;
+        }
+        if !allows_empty(root) {
+            needs = true;
+        }
+    }
+    needs
+}
+
+/// A generic BepInEx game whose executable is Chef RPG uses the Chef RPG plugin.
+pub fn specialize_bepinex_plugin_id<'a>(plugin_id: &'a str, install_path: &Path) -> &'a str {
+    if plugin_id == "bepinex" && install_path.join("Chef RPG.exe").is_file() {
+        "chefrpg"
+    } else {
+        plugin_id
+    }
+}
+
+pub fn bepinex_cache_ready(cache: &Path) -> bool {
+    looks_like_bepinex_pack(cache) || cache.join("BepInEx").join("core").is_dir()
+}
+
+/// Copy a cached pack into the game root. Files are copied, not linked.
+pub fn copy_bepinex_tree(cache: &Path, install_path: &Path) -> Result<()> {
+    let plugin = BepInExPlugin;
+    let root = super::normalize_staging_root(cache, &plugin)?;
+    let from = if plugin.deploys_to_install_root(&root) {
+        bepinex_pack_deploy_root(&root)
+    } else {
+        root
+    };
+    let mut copied = 0usize;
+    for entry in walkdir::WalkDir::new(&from)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = super::normalize_relative(entry.path().strip_prefix(&from)?);
+        let ctx = super::DeployContext {
+            project_name: None,
+            content_root: Some(&from),
+            source_dir: rel.parent(),
+        };
+        if !plugin.should_deploy_file_ctx(&rel, &ctx) {
+            continue;
+        }
+        let dest = plugin.resolve_deploy_root(install_path, &rel)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if dest.exists() {
+            std::fs::remove_file(&dest)?;
+        }
+        std::fs::copy(entry.path(), &dest)
+            .with_context(|| format!("copy {} to {}", entry.path().display(), dest.display()))?;
+        copied += 1;
+    }
+    if copied == 0 {
+        anyhow::bail!(
+            "BepInEx cache at {} had no loader files to copy",
+            cache.display()
+        );
+    }
+    Ok(())
+}
+
+fn find_named_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.file_type().is_file()
+                && e.file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(file_name)
+        })
+        .map(|e| e.path().to_path_buf())
+}
+
+fn chef_full_data(install_path: &Path) -> Option<PathBuf> {
+    let local = super::user_data::appdata_local_dir(install_path, CHEF_RPG_APP_ID)?;
+    let low = local.parent()?.join("LocalLow");
+    Some(
+        low.join("World 2 Studio Inc")
+            .join("Chef RPG")
+            .join("FullData"),
+    )
+}
+
+fn newest_gameplay_slot(install_path: &Path) -> Option<PathBuf> {
+    let full = chef_full_data(install_path)?;
+    let mut slots: Vec<PathBuf> = std::fs::read_dir(full)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("GameData.dat").is_file())
+        .collect();
+    slots.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    });
+    slots.pop()
+}
+
+fn install_one_chefrpg_save(install_path: &Path, content_root: &Path) -> Vec<String> {
+    let Some(src) = find_named_file(content_root, "UnassignedStaffData.dat") else {
+        return vec!["Chef RPG save mod is missing UnassignedStaffData.dat.".into()];
+    };
+    let Some(slot) = newest_gameplay_slot(install_path) else {
+        return vec![
+            "Chef RPG save mod was not deployed. It replaces FullData/SaveSlotN/UnassignedStaffData.dat, and no gameplay slot with GameData.dat was found."
+                .into(),
+        ];
+    };
+    let dest = slot.join("UnassignedStaffData.dat");
+    let bak = slot.join("UnassignedStaffData.dat.bak");
+    let slot_name = slot
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| slot.display().to_string());
+    let had_previous = dest.is_file();
+    if had_previous && !bak.is_file() {
+        if let Err(e) = std::fs::copy(&dest, &bak) {
+            return vec![format!(
+                "Could not back up {} before replacing it ({e}).",
+                dest.display()
+            )];
+        }
+    }
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return vec![format!("Could not create {slot_name} ({e}).")];
+        }
+    }
+    if let Err(e) = std::fs::copy(&src, &dest) {
+        return vec![format!(
+            "Could not write UnassignedStaffData.dat into {slot_name} ({e})."
+        )];
+    }
+    if had_previous {
+        vec![format!(
+            "Replaced UnassignedStaffData.dat in {slot_name}. Current staff must already be in unassigned slots. The previous file was kept as UnassignedStaffData.dat.bak."
+        )]
+    } else {
+        vec![format!(
+            "Installed UnassignedStaffData.dat into {slot_name}. Current staff must already be in unassigned slots."
+        )]
+    }
+}
+
+/// Copy Chef RPG staff overwrites into the newest gameplay save. Images and
+/// readmes are left staged; they are not game files.
+pub fn install_chefrpg_save_mods(install_path: &Path, content_roots: &[&Path]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for root in content_roots {
+        if looks_like_chefrpg_save_pack(root) {
+            warnings.extend(install_one_chefrpg_save(install_path, root));
+        }
+    }
+    warnings
 }
 
 /// True when the install looks like a Unity game (or already has BepInEx).
@@ -922,6 +1260,10 @@ macro_rules! bepinex_title_plugin {
                 resolve_bepinex_deploy(install_path, relative)
             }
 
+            fn bepinex_loader(&self, install_path: &Path) -> Option<BepInExBuild> {
+                select_bepinex_build($id, detect_unity_runtime(install_path))
+            }
+
             fn after_deploy(
                 &self,
                 install_path: &Path,
@@ -1067,6 +1409,99 @@ bepinex_title_plugin!(
     ]
 );
 
+/// Chef RPG. Plugin DLLs use the shared BepInEx layout. A staff download
+/// (`UnassignedStaffData.dat` and no DLL) is a save overwrite, not a plugin.
+pub struct ChefRpgPlugin;
+
+impl GamePlugin for ChefRpgPlugin {
+    fn info(&self) -> GamePluginInfo {
+        GamePluginInfo {
+            id: "chefrpg",
+            display_name: "Chef RPG",
+            nexus_domain: "chefrpg",
+            match_names: &["chef rpg", "chefrpg"],
+        }
+    }
+
+    fn preserve_staging_root_names(&self) -> &[&str] {
+        BepInExPlugin.preserve_staging_root_names()
+    }
+
+    fn should_wrap_as_mod_folder(&self, content_root: &Path) -> bool {
+        if looks_like_chefrpg_save_pack(content_root) {
+            return false;
+        }
+        BepInExPlugin.should_wrap_as_mod_folder(content_root)
+    }
+
+    fn wrap_mod_folder_name(&self, content_root: &Path, staged_name: &str) -> String {
+        BepInExPlugin.wrap_mod_folder_name(content_root, staged_name)
+    }
+
+    fn deploys_to_install_root(&self, content_root: &Path) -> bool {
+        if looks_like_chefrpg_save_pack(content_root) {
+            return false;
+        }
+        BepInExPlugin.deploys_to_install_root(content_root)
+    }
+
+    fn should_deploy_file_ctx(
+        &self,
+        relative: &Path,
+        ctx: &crate::games::DeployContext<'_>,
+    ) -> bool {
+        if ctx.content_root.is_some_and(looks_like_chefrpg_save_pack) {
+            return false;
+        }
+        BepInExPlugin.should_deploy_file_ctx(relative, ctx)
+    }
+
+    fn allows_empty_deploy(&self, content_root: &Path) -> bool {
+        looks_like_chefrpg_save_pack(content_root)
+    }
+
+    fn prunable_dirs(&self, install_path: &Path) -> Vec<PathBuf> {
+        BepInExPlugin.prunable_dirs(install_path)
+    }
+
+    fn preflight_warnings(&self, install_path: &Path) -> Vec<String> {
+        BepInExPlugin.preflight_warnings(install_path)
+    }
+
+    fn load_log_sources(&self, install_path: &Path) -> Vec<super::LogSource> {
+        BepInExPlugin.load_log_sources(install_path)
+    }
+
+    fn staging_deploy_warnings(&self, content_root: &Path, mod_name: &str) -> Vec<String> {
+        BepInExPlugin.staging_deploy_warnings(content_root, mod_name)
+    }
+
+    fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
+        BepInExPlugin.resolve_deploy_root(install_path, relative)
+    }
+
+    fn bepinex_loader(&self, _install_path: &Path) -> Option<BepInExBuild> {
+        Some(mono_github_build())
+    }
+
+    fn deploy_staged_extra(
+        &self,
+        install_path: &Path,
+        content_root: &Path,
+        _mod_name: &str,
+    ) -> Result<Vec<String>> {
+        Ok(install_chefrpg_save_mods(install_path, &[content_root]))
+    }
+
+    fn after_deploy(
+        &self,
+        install_path: &Path,
+        enabled_mod_folders: &[String],
+    ) -> Result<Vec<String>> {
+        BepInExPlugin.after_deploy(install_path, enabled_mod_folders)
+    }
+}
+
 /// Generic BepInEx plugin for any detected Unity install.
 pub struct BepInExPlugin;
 
@@ -1132,6 +1567,15 @@ impl GamePlugin for BepInExPlugin {
 
     fn resolve_deploy_root(&self, install_path: &Path, relative: &Path) -> Result<PathBuf> {
         resolve_bepinex_deploy(install_path, relative)
+    }
+
+    fn preferred_plugin_id(&self, install_path: &Path) -> &'static str {
+        let dressed = super::plugin_id_for_install(self.info().id, install_path);
+        specialize_bepinex_plugin_id(dressed, install_path)
+    }
+
+    fn bepinex_loader(&self, install_path: &Path) -> Option<BepInExBuild> {
+        select_bepinex_build(self.info().id, detect_unity_runtime(install_path))
     }
 
     fn after_deploy(
@@ -1584,5 +2028,236 @@ mod tests {
                 .any(|w| w.contains("doorstop_config.ini must be next to the game executable")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn selects_thunderstore_pack_or_pinned_github_build() {
+        assert!(matches!(
+            select_bepinex_build("chefrpg", UnityRuntime::Mono),
+            Some(BepInExBuild::Github { asset, .. }) if asset == "BepInEx_win_x64_5.4.23.5.zip"
+        ));
+        assert!(matches!(
+            select_bepinex_build("lethalcompany", UnityRuntime::Il2Cpp),
+            Some(BepInExBuild::Thunderstore { namespace, name, .. })
+                if namespace == "BepInEx" && name == "BepInExPack"
+        ));
+        assert!(matches!(
+            select_bepinex_build("valheim", UnityRuntime::Mono),
+            Some(BepInExBuild::Thunderstore { namespace, name, .. })
+                if namespace == "denikson" && name == "BepInExPack_Valheim"
+        ));
+        assert!(matches!(
+            select_bepinex_build("bepinex", UnityRuntime::Il2Cpp),
+            Some(BepInExBuild::Github { asset, il2cpp: true, .. })
+                if asset == "BepInEx-Unity.IL2CPP-win-x64-6.0.0-pre.2.zip"
+        ));
+        assert!(matches!(
+            select_bepinex_build("bepinex", UnityRuntime::Mono),
+            Some(BepInExBuild::Github { asset, il2cpp: false, .. })
+                if asset == "BepInEx_win_x64_5.4.23.5.zip"
+        ));
+        assert!(select_bepinex_build("schedule1", UnityRuntime::Il2Cpp).is_none());
+        assert!(select_bepinex_build("eldenring", UnityRuntime::Mono).is_none());
+
+        assert!(matches!(
+            ChefRpgPlugin.bepinex_loader(Path::new("/unused")),
+            Some(BepInExBuild::Github { asset, il2cpp: false, .. })
+                if asset == "BepInEx_win_x64_5.4.23.5.zip"
+        ));
+        let il2cpp = tempfile::tempdir().unwrap();
+        fs::write(il2cpp.path().join("GameAssembly.dll"), b"x").unwrap();
+        assert!(matches!(
+            BepInExPlugin.bepinex_loader(il2cpp.path()),
+            Some(BepInExBuild::Github { asset, il2cpp: true, .. })
+                if asset == "BepInEx-Unity.IL2CPP-win-x64-6.0.0-pre.2.zip"
+        ));
+        assert!(matches!(
+            LethalCompanyPlugin.bepinex_loader(il2cpp.path()),
+            Some(BepInExBuild::Thunderstore { namespace, name, .. })
+                if namespace == "BepInEx" && name == "BepInExPack"
+        ));
+        let mono = tempfile::tempdir().unwrap();
+        fs::create_dir_all(mono.path().join("Game_Data").join("Managed")).unwrap();
+        assert!(matches!(
+            BepInExPlugin.bepinex_loader(mono.path()),
+            Some(BepInExBuild::Github { asset, il2cpp: false, .. })
+                if asset == "BepInEx_win_x64_5.4.23.5.zip"
+        ));
+        assert!(Schedule1Plugin.bepinex_loader(il2cpp.path()).is_none());
+    }
+
+    #[test]
+    fn skips_auto_install_when_loader_or_pack_is_already_present() {
+        let install = tempfile::tempdir().unwrap();
+        let dll = tempfile::tempdir().unwrap();
+        fs::write(dll.path().join("CoolMod.dll"), b"x").unwrap();
+        let roots = [dll.path()];
+        let chef = ChefRpgPlugin;
+        let wants = |plugin: &dyn GamePlugin, install: &Path, roots: &[&Path]| {
+            should_auto_install_bepinex(install, roots, plugin.bepinex_loader(install), |root| {
+                plugin.allows_empty_deploy(root)
+            })
+        };
+        assert!(wants(&chef, install.path(), &roots));
+
+        fs::write(install.path().join("winhttp.dll"), b"x").unwrap();
+        assert!(!wants(&chef, install.path(), &roots));
+
+        let fresh = tempfile::tempdir().unwrap();
+        let pack = tempfile::tempdir().unwrap();
+        fs::create_dir_all(pack.path().join("BepInEx").join("core")).unwrap();
+        fs::write(pack.path().join("winhttp.dll"), b"x").unwrap();
+        assert!(!wants(&chef, fresh.path(), &[pack.path()]));
+
+        let save_only = tempfile::tempdir().unwrap();
+        fs::write(save_only.path().join("UnassignedStaffData.dat"), b"staff").unwrap();
+        assert!(!wants(&chef, fresh.path(), &[save_only.path()]));
+        assert!(!wants(&Schedule1Plugin, fresh.path(), &roots));
+    }
+
+    #[tokio::test]
+    async fn prepare_runtime_skips_download_when_bepinex_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("game");
+        fs::create_dir_all(install.join("BepInEx").join("core")).unwrap();
+        fs::write(install.join("winhttp.dll"), b"x").unwrap();
+        let dll = tempfile::tempdir().unwrap();
+        fs::write(dll.path().join("CoolMod.dll"), b"x").unwrap();
+        let roots = [dll.path()];
+        let paths = crate::config::Paths {
+            config_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        let ctx = crate::games::RuntimePrep {
+            paths: &paths,
+            install_path: &install,
+            nexus: None,
+            premium: false,
+            content_roots: &roots,
+        };
+        let outcome = BepInExPlugin.prepare_runtime(&ctx).await.unwrap();
+        match outcome {
+            crate::games::RuntimePrepOutcome::Done(warnings) => {
+                assert!(warnings.is_empty(), "{warnings:?}");
+            }
+            crate::games::RuntimePrepOutcome::NeedsAssist { .. } => {
+                panic!("BepInEx install does not use Download Assist");
+            }
+        }
+    }
+
+    #[test]
+    fn save_pack_lands_in_the_gameplay_slot_not_plugins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("steamapps").join("common").join("Chef RPG");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("Chef RPG.exe"), b"x").unwrap();
+        let slot1 = tmp
+            .path()
+            .join("steamapps")
+            .join("compatdata")
+            .join("1796790")
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser")
+            .join("AppData")
+            .join("LocalLow")
+            .join("World 2 Studio Inc")
+            .join("Chef RPG")
+            .join("FullData")
+            .join("SaveSlot1");
+        let slot0 = slot1.parent().unwrap().join("SaveSlot0");
+        fs::create_dir_all(&slot1).unwrap();
+        fs::create_dir_all(&slot0).unwrap();
+        fs::write(slot1.join("GameData.dat"), b"game").unwrap();
+        fs::write(slot1.join("UnassignedStaffData.dat"), b"old").unwrap();
+        fs::write(slot0.join("SoundSettingsData.dat"), b"settings").unwrap();
+
+        let staged = tempfile::tempdir().unwrap();
+        fs::write(staged.path().join("UnassignedStaffData.dat"), b"new").unwrap();
+        fs::write(staged.path().join("Read This.txt"), b"readme").unwrap();
+        fs::write(staged.path().join("portrait.jpg"), b"jpg").unwrap();
+
+        let plugin = ChefRpgPlugin;
+        assert!(looks_like_chefrpg_save_pack(staged.path()));
+        assert!(plugin.allows_empty_deploy(staged.path()));
+        assert!(!plugin.should_deploy_file_ctx(
+            Path::new("UnassignedStaffData.dat"),
+            &super::super::DeployContext {
+                project_name: None,
+                content_root: Some(staged.path()),
+                source_dir: None,
+            }
+        ));
+        assert_eq!(specialize_bepinex_plugin_id("bepinex", &install), "chefrpg");
+        assert_eq!(BepInExPlugin.preferred_plugin_id(&install), "chefrpg");
+
+        let dll = tempfile::tempdir().unwrap();
+        fs::write(dll.path().join("StaffMod.dll"), b"dll").unwrap();
+        assert!(plugin.should_wrap_as_mod_folder(dll.path()));
+        assert!(plugin.should_deploy_file_ctx(
+            Path::new("StaffMod.dll"),
+            &super::super::DeployContext {
+                project_name: None,
+                content_root: Some(dll.path()),
+                source_dir: None,
+            }
+        ));
+        let dll_dest = plugin
+            .resolve_deploy_root(&install, Path::new("StaffMod.dll"))
+            .unwrap();
+        assert_eq!(
+            dll_dest,
+            install.join("BepInEx").join("plugins").join("StaffMod.dll")
+        );
+
+        let warnings = plugin
+            .deploy_staged_extra(&install, staged.path(), "Dream Team")
+            .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("SaveSlot1")),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            fs::read(slot1.join("UnassignedStaffData.dat")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            fs::read(slot1.join("UnassignedStaffData.dat.bak")).unwrap(),
+            b"old"
+        );
+        assert!(!install.join("BepInEx").join("plugins").exists());
+        assert!(!slot0.join("UnassignedStaffData.dat").exists());
+    }
+
+    #[test]
+    fn copy_bepinex_tree_flattens_pack_and_skips_metadata() {
+        let cache = tempfile::tempdir().unwrap();
+        let inner = cache.path().join("BepInExPack");
+        fs::create_dir_all(inner.join("BepInEx").join("core")).unwrap();
+        fs::write(
+            inner.join("BepInEx").join("core").join("BepInEx.dll"),
+            b"core",
+        )
+        .unwrap();
+        fs::write(inner.join("winhttp.dll"), b"door").unwrap();
+        fs::write(inner.join("doorstop_config.ini"), b"enabled = true\n").unwrap();
+        fs::write(cache.path().join("manifest.json"), b"{}").unwrap();
+        fs::write(cache.path().join("icon.png"), b"png").unwrap();
+
+        let install = tempfile::tempdir().unwrap();
+        copy_bepinex_tree(cache.path(), install.path()).unwrap();
+        assert!(install
+            .path()
+            .join("BepInEx")
+            .join("core")
+            .join("BepInEx.dll")
+            .is_file());
+        assert!(install.path().join("winhttp.dll").is_file());
+        assert!(!install.path().join("winhttp.dll").is_symlink());
+        assert!(!install.path().join("manifest.json").exists());
+        assert!(!install.path().join("BepInExPack").exists());
     }
 }

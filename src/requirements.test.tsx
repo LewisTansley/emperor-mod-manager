@@ -4,11 +4,19 @@ import { describe, expect, it } from "vitest";
 
 import {
   disabledRequirementWarnings,
+  dlcIgnoreKey,
+  externalIgnoreKey,
+  IgnoredRequirementsDialog,
   MissingRequirementsStrip,
+  nexusIgnoreKey,
   RequirementsDialog,
+  stagedIgnoreKey,
+  withoutIgnoredDisabled,
+  withoutIgnoredRequirements,
 } from "./RequirementsDialog";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { MissingRequirements, NexusRequirementDownload } from "./types";
+import { useState } from "react";
+import type { IgnoredRequirement, MissingRequirements, NexusRequirementDownload } from "./types";
 
 const sample: MissingRequirements = {
   nexus: [
@@ -100,6 +108,72 @@ describe("MissingRequirementsStrip", () => {
     );
     expect(html).toContain("1 game version warning");
     expect(html).toContain("SkyUI");
+  });
+
+  it("does not count ignored rows as missing", () => {
+    const visible = withoutIgnoredRequirements(sample, [
+      { key: nexusIgnoreKey(sample.nexus[0]), name: "Address Library" },
+      { key: externalIgnoreKey(sample.external[0]), name: "SKSE" },
+      { key: dlcIgnoreKey(sample.dlc[0]), name: "Far Harbor" },
+    ]);
+    const html = renderToStaticMarkup(
+      <MissingRequirementsStrip requirements={visible} onReview={() => {}} />,
+    );
+    expect(html).not.toContain("missing requirement");
+    expect(html).not.toContain("Address Library");
+    expect(html).not.toContain("SKSE");
+    expect(html).not.toContain("Far Harbor");
+  });
+});
+
+describe("withoutIgnoredRequirements", () => {
+  const ignored: IgnoredRequirement[] = [
+    { key: nexusIgnoreKey(sample.nexus[0]), name: "Address Library" },
+    { key: externalIgnoreKey(sample.external[0]), name: "SKSE" },
+    { key: dlcIgnoreKey(sample.dlc[0]), name: "Far Harbor" },
+    { key: stagedIgnoreKey("skyui"), name: "SkyUI" },
+  ];
+
+  it("drops each ignored requirement kind and keeps the rest of the payload", () => {
+    expect(externalIgnoreKey({ name: "SKSE", url: "  " })).toBe("external:SKSE");
+    const visible = withoutIgnoredRequirements(
+      {
+        ...sample,
+        error: "partial",
+        nexus: [
+          ...sample.nexus,
+          {
+            ...sample.nexus[0],
+            mod_id: 99,
+            name: "Still missing",
+          },
+        ],
+      },
+      ignored,
+    );
+    expect(visible.nexus.map((row) => row.name)).toEqual(["Still missing"]);
+    expect(visible.external).toEqual([]);
+    expect(visible.dlc).toEqual([]);
+    expect(visible.error).toBe("partial");
+    expect(
+      withoutIgnoredDisabled(
+        [
+          {
+            stagedId: "skyui",
+            name: "SkyUI",
+            requiredByNames: ["My Mod"],
+            requiredByIds: ["parent"],
+          },
+          {
+            stagedId: "local",
+            name: "Local Dep",
+            requiredByNames: ["My Mod"],
+            requiredByIds: ["parent"],
+          },
+        ],
+        ignored,
+      ).map((row) => row.stagedId),
+    ).toEqual(["local"]);
   });
 });
 
@@ -361,6 +435,110 @@ describe("RequirementsDialog", () => {
     });
     expect(turnedOff[0]).toEqual(["1_2"]);
     expect(turnedOff[turnedOff.length - 1]).toEqual(["parent", "other"]);
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("keeps ignored requirements out of the review", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const initial: IgnoredRequirement[] = [
+      { key: externalIgnoreKey(sample.external[0]), name: "SKSE" },
+      { key: dlcIgnoreKey(sample.dlc[0]), name: "Far Harbor" },
+      { key: stagedIgnoreKey("skyui"), name: "SkyUI" },
+    ];
+    function Harness() {
+      const [ignored, setIgnored] = useState(initial);
+      return (
+        <RequirementsDialog
+          requirements={sample}
+          disabled={[
+            {
+              stagedId: "skyui",
+              name: "SkyUI",
+              requiredByNames: ["My Mod"],
+              requiredByIds: ["parent"],
+            },
+          ]}
+          ignored={ignored}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={() => {}}
+          onIgnore={(row) => setIgnored((prev) => [...prev, row])}
+        />
+      );
+    }
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    expect(document.querySelector('input[aria-label="Download Address Library"]')).not.toBeNull();
+    expect(document.body.textContent).not.toContain("Outside Nexus");
+    expect(document.body.textContent).not.toContain("DLC");
+    expect(document.body.textContent).not.toContain("Disabled");
+    expect(document.body.textContent).not.toContain("Far Harbor");
+    expect(document.body.textContent).not.toContain("SkyUI");
+    expect(document.querySelector('button[aria-label="Unignore SKSE"]')).toBeNull();
+    expect(document.querySelector('button[aria-label^="Unignore "]')).toBeNull();
+    const ignore = document.querySelector(
+      'button[aria-label="Ignore Address Library"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      ignore.click();
+    });
+    expect(document.querySelector('input[aria-label="Download Address Library"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Address Library");
+    expect(document.querySelector('button[aria-label^="Unignore "]')).toBeNull();
+    expect(document.body.textContent).toContain("No missing requirements");
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+});
+
+describe("IgnoredRequirementsDialog", () => {
+  it("lists ignored requirements and restores one", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const initial: IgnoredRequirement[] = [
+      { key: nexusIgnoreKey(sample.nexus[0]), name: "Address Library" },
+      { key: externalIgnoreKey(sample.external[0]), name: "SKSE" },
+    ];
+    function Harness() {
+      const [ignored, setIgnored] = useState(initial);
+      return (
+        <IgnoredRequirementsDialog
+          ignored={ignored}
+          busy={false}
+          onClose={() => {}}
+          onUnignore={(key) => setIgnored((prev) => prev.filter((row) => row.key !== key))}
+        />
+      );
+    }
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    expect(document.body.textContent).toContain("Ignored requirements");
+    expect(document.body.textContent).toContain(
+      "These stay out of the review until you restore them.",
+    );
+    expect(document.querySelector('button[aria-label="Unignore Address Library"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="Unignore SKSE"]')).not.toBeNull();
+    const restore = document.querySelector(
+      'button[aria-label="Unignore Address Library"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      restore.click();
+    });
+    expect(document.querySelector('button[aria-label="Unignore Address Library"]')).toBeNull();
+    expect(document.querySelector('button[aria-label="Unignore SKSE"]')).not.toBeNull();
     await act(async () => {
       root.unmount();
     });

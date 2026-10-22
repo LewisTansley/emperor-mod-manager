@@ -1,13 +1,18 @@
 //! Per-game deploy plugins.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Paths;
 use crate::mods::options::ModOptionSet;
+use crate::nexus::NexusClient;
 
 mod baldursgate3;
+mod bepinex_install;
 mod bladeandsorcery;
 mod controlresonant;
 mod creation_engine;
@@ -40,6 +45,7 @@ mod unity_bepinex;
 mod unreal_engine;
 mod user_data;
 mod warhammer40kdarktide;
+mod wine_overrides;
 mod witcher3;
 
 pub use baldursgate3::BaldursGate3Plugin;
@@ -53,10 +59,7 @@ pub use daysgone::DaysGonePlugin;
 pub(crate) use dressmaker::plugin_id_for_install;
 pub use dressmaker::DressmakerPlugin;
 pub use exe_version::detect_install_version;
-pub use fromsoft_loaders::{
-    ensure_fromsoft_loaders, finish_legacy_after_assist, install_legacy_from_archive,
-    is_fromsoft_plugin, legacy_loader_ready, EnsureLoadersOutcome, LegacyAssistRequest,
-};
+pub use fromsoft_loaders::install_legacy_from_archive;
 pub use fromsoftware::{
     DarkSouls2Plugin, DarkSouls3Plugin, DarkSoulsPlugin, DarkSoulsRemasteredPlugin, EldenRingPlugin,
 };
@@ -83,8 +86,8 @@ pub use stardewvalley::StardewValleyPlugin;
 pub use theforest::TheForestPlugin;
 pub use unity_bepinex::{
     bepinex_pack_deploy_root, looks_like_unity_install, thunderstore_community_for_plugin,
-    AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin, BepInExPlugin, ContentWarningPlugin,
-    CultOfTheLambPlugin, DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin,
+    AgainstTheStormPlugin, AmongUsPlugin, AtlyssPlugin, BepInExBuild, BepInExPlugin, ChefRpgPlugin,
+    ContentWarningPlugin, CultOfTheLambPlugin, DysonSphereProgramPlugin, GtfoPlugin, H3vrPlugin,
     HollowKnightSilksongPlugin, InscryptionPlugin, LethalCompanyPlugin, PeakPlugin, RepoPlugin,
     RiskOfRain2Plugin, RoundsPlugin, Schedule1Plugin, SonsOfTheForestPlugin,
     SubnauticaBelowZeroPlugin, SubnauticaPlugin, TimberbornPlugin, UltrakillPlugin, ValheimPlugin,
@@ -95,7 +98,39 @@ pub use unreal_engine::{
     Stalker2HeartOfChornobylPlugin, Subnautica2Plugin, UeLayoutInfo, UnrealEnginePlugin,
 };
 pub use warhammer40kdarktide::Warhammer40kDarktidePlugin;
+pub use wine_overrides::{advise_wine_overrides, StagedProxySource, WineOverrideAdvice};
 pub use witcher3::Witcher3Plugin;
+
+/// What `deploy_mods` knows about the install while a plugin prepares it.
+pub struct RuntimePrep<'a> {
+    pub paths: &'a Paths,
+    pub install_path: &'a Path,
+    pub nexus: Option<&'a NexusClient>,
+    pub premium: bool,
+    /// Normalized content roots of enabled staged mods.
+    pub content_roots: &'a [&'a Path],
+}
+
+/// Nexus download the command should open in Download Assist, then poll.
+#[derive(Debug, Clone)]
+pub struct LoaderAssistRequest {
+    pub domain: String,
+    pub mod_id: u64,
+    pub file_id: u64,
+    pub plugin_id: String,
+    pub install_path: PathBuf,
+    pub label: String,
+}
+
+/// Result of [`GamePlugin::prepare_runtime`].
+#[derive(Debug)]
+pub enum RuntimePrepOutcome {
+    Done(Vec<String>),
+    NeedsAssist {
+        warnings: Vec<String>,
+        request: LoaderAssistRequest,
+    },
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct GamePluginInfo {
@@ -189,6 +224,12 @@ pub trait GamePlugin: Send + Sync {
         Vec::new()
     }
 
+    /// When true, deploying zero files from this pack is expected (a save overwrite
+    /// that is applied beside the install, not linked into it).
+    fn allows_empty_deploy(&self, _content_root: &Path) -> bool {
+        false
+    }
+
     /// Options the mod declares for itself (Arsenal / HD2MM `manifest.json`).
     /// `None` means the mod is deployed whole, which is the norm.
     fn mod_options(&self, _content_root: &Path) -> Option<ModOptionSet> {
@@ -197,6 +238,61 @@ pub trait GamePlugin: Send + Sync {
 
     /// Optional install prep before purge/link (rename paks, etc.). Returns warnings.
     fn prepare_deploy(&self, _install_path: &Path) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Plugin id to persist when the install is a more specific game than the
+    /// saved type. The default is this plugin's own id.
+    fn preferred_plugin_id(&self, _install_path: &Path) -> &'static str {
+        self.info().id
+    }
+
+    /// Loader archive this plugin wants installed when the game does not have
+    /// one yet. `None` means this plugin does not auto-install BepInEx.
+    fn bepinex_loader(&self, _install_path: &Path) -> Option<BepInExBuild> {
+        None
+    }
+
+    /// Download or cache anything the game needs before files are linked.
+    /// The default installs BepInEx when [`Self::bepinex_loader`] returns a build.
+    fn prepare_runtime<'a>(
+        &'a self,
+        ctx: &'a RuntimePrep<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<RuntimePrepOutcome>> + Send + 'a>> {
+        let build = self.bepinex_loader(ctx.install_path);
+        let install = unity_bepinex::should_auto_install_bepinex(
+            ctx.install_path,
+            ctx.content_roots,
+            build,
+            |root| self.allows_empty_deploy(root),
+        );
+        Box::pin(async move {
+            let Some(build) = build.filter(|_| install) else {
+                return Ok(RuntimePrepOutcome::Done(Vec::new()));
+            };
+            let warnings =
+                bepinex_install::ensure_bepinex(ctx.paths, ctx.install_path, build).await;
+            Ok(RuntimePrepOutcome::Done(warnings))
+        })
+    }
+
+    /// Copy a loader into the game after Download Assist finishes.
+    fn finish_runtime_prep(&self, _ctx: &RuntimePrep<'_>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether the Assist download requested by `prepare_runtime` is on disk.
+    fn loader_assist_ready(&self, _ctx: &RuntimePrep<'_>) -> bool {
+        false
+    }
+
+    /// Place staged files that must not be linked into the game (save overwrites).
+    fn deploy_staged_extra(
+        &self,
+        _install_path: &Path,
+        _content_root: &Path,
+        _mod_name: &str,
+    ) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
@@ -342,6 +438,7 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &KingdomComeDeliverance2Plugin,
         &KingdomComeDeliverancePlugin,
         &DressmakerPlugin,
+        &ChefRpgPlugin,
         &BepInExPlugin,
         &EldenRingPlugin,
         &DarkSouls3Plugin,

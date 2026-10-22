@@ -89,9 +89,13 @@ pub struct StagedMod {
     /// Catalog poster. `None` has not been looked up. `Some("")` has no image.
     #[serde(default)]
     pub picture_url: Option<String>,
-    /// Version-like Nexus tags. `None` has not been looked up.
+    /// Version-line Nexus tags, including edition labels such as `AE`.
+    /// `None` has not been looked up.
     #[serde(default)]
     pub supported_game_versions: Option<Vec<String>>,
+    /// `0` is the old dotted-only tag cache and is fetched again.
+    #[serde(default)]
+    pub version_support_generation: u32,
 }
 
 fn default_true() -> bool {
@@ -125,6 +129,7 @@ impl Default for StagedMod {
             file_name: None,
             picture_url: None,
             supported_game_versions: None,
+            version_support_generation: 0,
         }
     }
 }
@@ -1099,6 +1104,7 @@ pub fn cache_supported_game_versions(
         for staged in &mut order.mods {
             if let Some(versions) = updates.get(&staged.id) {
                 staged.supported_game_versions = Some(versions.clone());
+                staged.version_support_generation = game_version::VERSION_SUPPORT_GENERATION;
             }
         }
         Ok(())
@@ -1598,13 +1604,18 @@ fn stage_mod_inner(
             option_selection: provenance.option_selection,
             file_name: stored_file_name,
             picture_url: resolve_picture_url(None, &removed),
-            supported_game_versions: removed.iter().find_map(|old| {
-                if old.nexus_mod_id == mod_id {
-                    old.supported_game_versions.clone()
-                } else {
-                    None
-                }
-            }),
+            supported_game_versions: removed
+                .iter()
+                .find_map(|old| {
+                    (old.nexus_mod_id == mod_id).then(|| old.supported_game_versions.clone())
+                })
+                .flatten(),
+            version_support_generation: removed
+                .iter()
+                .find_map(|old| {
+                    (old.nexus_mod_id == mod_id).then_some(old.version_support_generation)
+                })
+                .unwrap_or(0),
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -1729,6 +1740,7 @@ pub fn stage_thunderstore_mod(
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
+            version_support_generation: 0,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -1799,6 +1811,7 @@ pub fn stage_modio_mod(
             file_name,
             picture_url: resolve_picture_url(picture_url, &removed),
             supported_game_versions: None,
+            version_support_generation: 0,
         };
         finish_replacement(paths, game_id, order, &removed, staged)
     });
@@ -2237,6 +2250,7 @@ pub fn deploy(
         }
         let root = normalize_staging_root(&staging, plugin)?;
         warnings.extend(plugin.staging_deploy_warnings(&root, &staged.name));
+        warnings.extend(plugin.deploy_staged_extra(install_path, &root, &staged.name)?);
         let filter = plugin
             .mod_options(&root)
             .map(|set| IncludeFilter::build(&set, staged.option_selection.as_ref()))
@@ -2257,7 +2271,7 @@ pub fn deploy(
             filter.as_ref(),
             &mut deployed,
         )?;
-        if stats.linked == 0 {
+        if stats.linked == 0 && !plugin.allows_empty_deploy(&root) {
             let msg = if filter.is_some() {
                 format!(
                     "No files deployed from {}; check its options, every one may be turned off.",
@@ -2368,7 +2382,9 @@ fn deploy_tree(
             source_dir: source_rel.parent(),
         };
         if entry.file_type().is_file() && !plugin.should_deploy_file_ctx(&rel, &ctx) {
-            stats.skipped += 1;
+            if !plugin.allows_empty_deploy(content_root) {
+                stats.skipped += 1;
+            }
             continue;
         }
         let deploy_rel: PathBuf = if wrap {

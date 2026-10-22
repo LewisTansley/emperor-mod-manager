@@ -670,6 +670,7 @@ mod tests {
             modio_game_id: None,
             tool_overrides: None,
             game_version: None,
+            ignored_requirements: Vec::new(),
         };
         let order = LoadOrder {
             mods: vec![
@@ -737,6 +738,7 @@ mod tests {
             modio_game_id: Some(42),
             tool_overrides: None,
             game_version: None,
+            ignored_requirements: Vec::new(),
         };
         let hint = sample_manifest().game;
         assert!(catalogs_overlap(&hint, &game).is_ok());
@@ -757,6 +759,7 @@ mod tests {
             modio_game_id: None,
             tool_overrides: None,
             game_version: None,
+            ignored_requirements: Vec::new(),
         };
         let hint = ShareGameHint {
             id: None,

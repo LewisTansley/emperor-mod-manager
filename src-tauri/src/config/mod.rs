@@ -162,6 +162,16 @@ pub struct ManagedGame {
     /// User-set game version. Empty means use the version read from the executable.
     #[serde(default)]
     pub game_version: Option<String>,
+    /// Requirements hidden from the review until the user unignores them.
+    #[serde(default)]
+    pub ignored_requirements: Vec<IgnoredRequirement>,
+}
+
+/// A requirement the user chose to hide for one managed game.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IgnoredRequirement {
+    pub key: String,
+    pub name: String,
 }
 
 pub struct Paths {
@@ -275,6 +285,11 @@ impl Paths {
 
     pub fn me3_install_dir(&self) -> PathBuf {
         self.tools_dir().join("me3")
+    }
+
+    /// Cached BepInEx pack for one loader build (`mono-5.4.23.5`, a Thunderstore id, …).
+    pub fn bepinex_cache_dir(&self, cache_id: &str) -> PathBuf {
+        self.tools_dir().join("bepinex").join(cache_id)
     }
 }
 

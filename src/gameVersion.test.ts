@@ -35,6 +35,19 @@ describe("browseGameVersionOptions", () => {
     ).toEqual(["1.6.1170"]);
   });
 
+  it("drops mod versions that are not a line for the active game", () => {
+    expect(
+      browseGameVersionOptions(
+        meta({
+          mod_tags: ["Gameplay", "1.0", "1.6.1170", "AE", "2.1"],
+          game_versions: ["1.5.97", "1.0"],
+        }),
+        "mods",
+        "skyrimspecialedition",
+      ),
+    ).toEqual(["1.6.1170", "AE"]);
+  });
+
   it("keeps the collection list on the collections page", () => {
     expect(
       browseGameVersionOptions(

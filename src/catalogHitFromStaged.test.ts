@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { catalogHitFromStaged, installedCatalogIds } from "./App";
+import {
+  catalogHitFromStaged,
+  installedCatalogIds,
+  stagedModsForCatalogId,
+} from "./App";
 import type { ManagedGame, StagedMod } from "./types";
 
 function game(partial: Partial<ManagedGame> = {}): ManagedGame {
@@ -168,5 +172,47 @@ describe("installedCatalogIds", () => {
       "thunderstore:valheim:denikson:BepInExPack_Valheim",
       "modio:306:12345",
     ]);
+  });
+});
+
+describe("stagedModsForCatalogId", () => {
+  const rows = [
+    staged({
+      id: "n1",
+      name: "SkyUI",
+      source: "nexus",
+      domain: "skyrimspecialedition",
+      nexus_mod_id: 12604,
+    }),
+    staged({
+      id: "n1b",
+      name: "SkyUI extra",
+      source: "nexus",
+      domain: "skyrimspecialedition",
+      nexus_mod_id: 12604,
+      nexus_file_id: 100,
+    }),
+    staged({
+      id: "n2",
+      name: "Other",
+      source: "nexus",
+      domain: "skyrimspecialedition",
+      nexus_mod_id: 1,
+    }),
+    staged({ id: "loose", name: "Loose files", source: "nexus", nexus_mod_id: 0 }),
+  ];
+
+  it("returns every staged row for the catalog id", () => {
+    expect(
+      stagedModsForCatalogId(rows, game(), "nexus:skyrimspecialedition:12604").map(
+        (mod) => mod.id,
+      ),
+    ).toEqual(["n1", "n1b"]);
+  });
+
+  it("skips mods with a different catalog id", () => {
+    expect(stagedModsForCatalogId(rows, game(), "nexus:skyrimspecialedition:999")).toEqual(
+      [],
+    );
   });
 });
