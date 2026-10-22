@@ -338,9 +338,9 @@ const AUTOCLICK_JS: &str = r#"
     while (node && guard < 40) {
       guard += 1;
       var tag = (node.tagName || '').toUpperCase();
+      if (tag === 'BODY' || tag === 'HTML') return false;
       if (tag === 'HEADER' || tag === 'NAV') return true;
-      var cls = classString(node);
-      if (cls.indexOf('rj-profile-tray') !== -1 || cls.indexOf('new-head') !== -1) return true;
+      if (classString(node).indexOf('rj-profile-tray') !== -1) return true;
       node = nextNodeUp(node);
     }
     return false;
@@ -1950,6 +1950,8 @@ mod tests {
         assert!(AUTOCLICK_JS.contains("findHistoryRowDownload"));
         assert!(AUTOCLICK_JS.contains("clickHistoryRow"));
         assert!(AUTOCLICK_JS.contains("isHistoryUrl"));
+        assert!(AUTOCLICK_JS.contains("tag === 'BODY'"));
+        assert!(!AUTOCLICK_JS.contains("new-head"));
         assert!(!AUTOCLICK_JS.contains("innerHeight"));
         assert!(!AUTOCLICK_JS.contains("innerWidth"));
         assert!(!AUTOCLICK_JS.contains("clickVortex"));
