@@ -11,8 +11,10 @@ import {
   nexusIgnoreKey,
   RequirementsDialog,
   stagedIgnoreKey,
+  versionIgnoreKey,
   withoutIgnoredDisabled,
   withoutIgnoredRequirements,
+  withoutIgnoredVersions,
 } from "./RequirementsDialog";
 import { renderToStaticMarkup } from "react-dom/server";
 import { useState } from "react";
@@ -173,6 +175,28 @@ describe("withoutIgnoredRequirements", () => {
         ],
         ignored,
       ).map((row) => row.stagedId),
+    ).toEqual(["local"]);
+    const versions = [
+      {
+        stagedId: "skyui",
+        name: "SkyUI",
+        message: "Built for 1.5.97. This install is 1.6.1170.",
+      },
+      {
+        stagedId: "local",
+        name: "Local Dep",
+        message: "Built for 1.5.97. This install is 1.6.1170.",
+      },
+    ];
+    expect(withoutIgnoredVersions(versions, ignored).map((row) => row.stagedId)).toEqual([
+      "skyui",
+      "local",
+    ]);
+    expect(
+      withoutIgnoredVersions(versions, [
+        ...ignored,
+        { key: versionIgnoreKey("skyui"), name: "SkyUI" },
+      ]).map((row) => row.stagedId),
     ).toEqual(["local"]);
   });
 });
@@ -372,6 +396,7 @@ describe("RequirementsDialog", () => {
           onAddSelected={() => {}}
           onEnable={() => {}}
           onDisable={() => {}}
+          onIgnore={() => {}}
         />,
       );
     });
@@ -381,6 +406,80 @@ describe("RequirementsDialog", () => {
     expect(document.body.textContent).toContain("Game version");
     expect(document.body.textContent).toContain("Does not officially support 1.6.1170");
     expect(document.body.textContent).not.toContain("No missing requirements");
+    expect(section.querySelector('button[aria-label="Ignore SkyUI"]')).not.toBeNull();
+    expect(
+      [...section.querySelectorAll("button")].some((el) => el.textContent === "Disable"),
+    ).toBe(true);
+    await act(async () => {
+      root.unmount();
+    });
+    host.remove();
+  });
+
+  it("disables and ignores game version warnings", async () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root: Root = createRoot(host);
+    const turnedOff: string[][] = [];
+    const versions = [
+      {
+        stagedId: "skyui",
+        name: "SkyUI",
+        message: "Built for 1.5.97. This install is 1.6.1170.",
+      },
+      {
+        stagedId: "local",
+        name: "Local Dep",
+        message: "Built for 1.5.97. This install is 1.6.1170.",
+      },
+    ];
+    function Harness() {
+      const [ignored, setIgnored] = useState<IgnoredRequirement[]>([]);
+      return (
+        <RequirementsDialog
+          requirements={{ nexus: [], external: [], dlc: [], error: null }}
+          disabled={[]}
+          ignored={ignored}
+          versions={versions}
+          isPremium
+          busy={false}
+          onClose={() => {}}
+          onAddSelected={() => {}}
+          onEnable={() => {}}
+          onDisable={(ids) => {
+            turnedOff.push(ids);
+          }}
+          onIgnore={(row) => setIgnored((prev) => [...prev, row])}
+        />
+      );
+    }
+    await act(async () => {
+      root.render(<Harness />);
+    });
+    const section = () =>
+      document.querySelector("details.requirements-versions") as HTMLDetailsElement;
+    const disableOne = [...section().querySelectorAll("button")].find(
+      (el) => el.textContent === "Disable",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      disableOne.click();
+    });
+    const disableAll = [...section().querySelectorAll("button")].find(
+      (el) => el.textContent === "Disable all",
+    ) as HTMLButtonElement;
+    await act(async () => {
+      disableAll.click();
+    });
+    expect(turnedOff).toEqual([["skyui"], ["skyui", "local"]]);
+    const ignore = section().querySelector(
+      'button[aria-label="Ignore SkyUI"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      ignore.click();
+    });
+    expect(section().textContent).not.toContain("SkyUI");
+    expect(section().textContent).toContain("Local Dep");
+    expect(document.querySelector('button[aria-label="Unignore SkyUI"]')).toBeNull();
     await act(async () => {
       root.unmount();
     });

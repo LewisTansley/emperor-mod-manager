@@ -9,8 +9,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use gtk::glib::translate::ToGlibPtr;
+use gtk::glib::{ControlFlow, SourceId};
 use gtk::prelude::*;
 use gtk::OverlaySignals;
 
@@ -22,10 +24,15 @@ thread_local! {
     /// Overlay child currently being positioned. Read from `get-child-position`,
     /// which can run while `HOST` is already borrowed.
     static ASSIST: RefCell<Option<gtk::Widget>> = RefCell::new(None);
+    /// Overlay's own `GdkWindow`. Never punch this — it is the main UI.
+    /// Read while `HOST` is borrowed.
+    static OVERLAY_WINDOW: RefCell<Option<gtk::gdk::Window>> = const { RefCell::new(None) };
     /// Whether the current assist view should receive pointer events.
     /// Read from `size-allocate`, which can run while `HOST` is borrowed.
     static ASSIST_ACCEPTS_INPUT: Cell<bool> = const { Cell::new(false) };
     static INPUT_REFRESH_QUEUED: Cell<bool> = const { Cell::new(false) };
+    static PAINT_HOOKED: Cell<bool> = const { Cell::new(false) };
+    static HIDDEN_INPUT_TIMER: RefCell<Option<SourceId>> = const { RefCell::new(None) };
 }
 
 struct AssistOverlayHost {
@@ -91,11 +98,118 @@ fn set_window_input(window: &gtk::gdk::Window, accept: bool) {
     }
 }
 
-fn set_widget_input(widget: &gtk::Widget, accept: bool) {
-    let Some(window) = widget.window() else {
+fn remember_overlay_window(overlay: &gtk::Overlay) {
+    if let Some(window) = overlay.window() {
+        OVERLAY_WINDOW.with(|slot| *slot.borrow_mut() = Some(window));
+    }
+}
+
+fn same_gdk_window(a: &gtk::gdk::Window, b: &gtk::gdk::Window) -> bool {
+    a.as_ptr() == b.as_ptr()
+}
+
+/// Overlay wrapper above the assist view. The overlay's own window is the main
+/// UI and must stay hit-testable.
+fn wrapper_window(widget: &gtk::Widget) -> Option<gtk::gdk::Window> {
+    let parent = widget.parent_window()?;
+    let overlay = OVERLAY_WINDOW.with(|slot| slot.borrow().clone());
+    if overlay
+        .as_ref()
+        .is_some_and(|window| same_gdk_window(window, &parent))
+    {
+        return None;
+    }
+    if widget
+        .window()
+        .is_some_and(|window| same_gdk_window(&window, &parent))
+    {
+        return None;
+    }
+    Some(parent)
+}
+
+/// Punch the overlay wrapper and every WebKit window under it.
+///
+/// GTK only marks the wrapper, and it raises that window on each size
+/// allocate. WebKit also creates child windows after the first punch.
+fn punch_assist_tree(widget: &gtk::Widget, accept: bool) {
+    if let Some(wrapper) = wrapper_window(widget) {
+        set_window_input(&wrapper, accept);
+        if accept {
+            wrapper.raise();
+        } else {
+            wrapper.lower();
+        }
+        return;
+    }
+    if let Some(window) = widget.window() {
+        set_window_input(&window, accept);
+        if accept {
+            window.raise();
+        } else {
+            window.lower();
+        }
+    }
+}
+
+fn assist_widget() -> Option<gtk::Widget> {
+    ASSIST.with(|slot| slot.borrow().clone())
+}
+
+fn assist_accepts_input() -> bool {
+    ASSIST_ACCEPTS_INPUT.with(|flag| flag.get())
+}
+
+/// Re-apply click-through while the assist view is hidden.
+///
+/// A single idle misses compositing windows WebKit creates later, and GTK
+/// raises the wrapper again on the next resize or focus.
+fn repunch_hidden_assist() {
+    if assist_accepts_input() {
+        return;
+    }
+    let Some(widget) = assist_widget() else {
         return;
     };
-    set_window_input(&window, accept);
+    punch_assist_tree(&widget, false);
+}
+
+fn stop_hidden_input_timer() {
+    if let Some(id) = HIDDEN_INPUT_TIMER.with(|slot| slot.borrow_mut().take()) {
+        id.remove();
+    }
+}
+
+fn ensure_hidden_input_timer() {
+    HIDDEN_INPUT_TIMER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+        let id = gtk::glib::timeout_add_local(Duration::from_millis(100), || {
+            if assist_accepts_input() || assist_widget().is_none() {
+                // `Break` removes the source. Drop the id without `remove()`.
+                HIDDEN_INPUT_TIMER.with(|slot| {
+                    slot.borrow_mut().take();
+                });
+                return ControlFlow::Break;
+            }
+            repunch_hidden_assist();
+            ControlFlow::Continue
+        });
+        *slot = Some(id);
+    });
+}
+
+fn ensure_paint_hook(widget: &gtk::Widget) {
+    if PAINT_HOOKED.with(|flag| flag.get()) {
+        return;
+    }
+    let Some(clock) = widget.frame_clock() else {
+        return;
+    };
+    PAINT_HOOKED.with(|flag| flag.set(true));
+    clock.connect_after_paint(|_| repunch_hidden_assist());
 }
 
 fn schedule_input_refresh() {
@@ -112,23 +226,22 @@ fn schedule_input_refresh() {
     }
     gtk::glib::idle_add_local_once(|| {
         INPUT_REFRESH_QUEUED.with(|flag| flag.set(false));
-        let Some(widget) = ASSIST.with(|slot| slot.borrow().clone()) else {
+        let Some(widget) = assist_widget() else {
             return;
         };
-        let accept = ASSIST_ACCEPTS_INPUT.with(|flag| flag.get());
-        set_widget_input(&widget, accept);
+        punch_assist_tree(&widget, assist_accepts_input());
     });
 }
 
 fn watch_assist_input(widget: &gtk::Widget) {
     widget.connect_size_allocate(|widget, _| {
-        let current = ASSIST.with(|slot| slot.borrow().clone());
+        ensure_paint_hook(widget);
+        let current = assist_widget();
         if current.as_ref() != Some(widget) {
-            set_widget_input(widget, false);
+            punch_assist_tree(widget, false);
             return;
         }
-        let accept = ASSIST_ACCEPTS_INPUT.with(|flag| flag.get());
-        set_widget_input(widget, accept);
+        punch_assist_tree(widget, assist_accepts_input());
         schedule_input_refresh();
     });
 }
@@ -171,6 +284,7 @@ fn ensure_host(window: &tauri::Window) -> Result<(), String> {
     overlay.add(&vbox);
     gtk_window.add(&overlay);
     overlay.show_all();
+    remember_overlay_window(&overlay);
 
     let position_overlay = overlay.clone();
     let position_main = main_webview.clone();
@@ -230,8 +344,10 @@ fn find_assist_in_vbox(vbox: &gtk::Box, main_webview: &gtk::Widget) -> Option<gt
 }
 
 fn apply_host_geometry(host: &AssistOverlayHost) -> gtk::Overlay {
+    remember_overlay_window(&host.overlay);
     GEOM.with(|geom| *geom.borrow_mut() = host.bounds);
     let shown = host.visible && host.assist.is_some();
+    let was_accepting = assist_accepts_input();
     ASSIST_ACCEPTS_INPUT.with(|flag| flag.set(shown));
     if let Some(assist) = &host.assist {
         let (w, h) = pixel_size(host.bounds);
@@ -240,13 +356,21 @@ fn apply_host_geometry(host: &AssistOverlayHost) -> gtk::Overlay {
         host.overlay.set_overlay_pass_through(assist, !shown);
         // Stay mapped at the host size. Unmapping or a 1×1 size blanks the next show.
         assist.show();
+        ensure_paint_hook(assist);
         if shown {
             enable_assist_input(assist);
+            // Clear the empty input region and put the panel above the main UI.
+            punch_assist_tree(assist, true);
+            stop_hidden_input_timer();
         } else {
             assist.set_can_focus(false);
             assist.set_sensitive(false);
+            if was_accepting {
+                host.main_webview.grab_focus();
+            }
+            punch_assist_tree(assist, false);
+            ensure_hidden_input_timer();
         }
-        set_widget_input(assist, shown);
         schedule_input_refresh();
         log::debug!(
             "assist overlay bounds requested={}x{}@{},{} shown={}",
@@ -256,6 +380,8 @@ fn apply_host_geometry(host: &AssistOverlayHost) -> gtk::Overlay {
             host.bounds.y,
             shown
         );
+    } else {
+        stop_hidden_input_timer();
     }
     host.overlay.clone()
 }
@@ -306,7 +432,7 @@ pub fn attach_assist(
                 }
                 disable_accelerated_compositing(&assist);
                 if let Some(old) = host.assist.take() {
-                    set_widget_input(&old, false);
+                    punch_assist_tree(&old, false);
                     if old.parent().is_some() {
                         host.overlay.remove(&old);
                     }
@@ -329,7 +455,8 @@ pub fn attach_assist(
                 if !assist.is_realized() {
                     assist.realize();
                 }
-                set_widget_input(&assist, host.visible);
+                ensure_paint_hook(&assist);
+                punch_assist_tree(&assist, host.visible);
                 schedule_input_refresh();
                 drop(slot);
                 queue_overlay_resize(overlay);
@@ -376,9 +503,14 @@ pub fn hide_and_clear(window: &tauri::Window) -> Result<(), String> {
         let overlay = HOST.with(|slot| {
             slot.borrow_mut().as_mut().map(|host| {
                 host.visible = false;
+                let was_accepting = assist_accepts_input();
                 ASSIST_ACCEPTS_INPUT.with(|flag| flag.set(false));
+                stop_hidden_input_timer();
+                if was_accepting {
+                    host.main_webview.grab_focus();
+                }
                 if let Some(assist) = host.assist.clone() {
-                    set_widget_input(&assist, false);
+                    punch_assist_tree(&assist, false);
                     host.overlay.set_overlay_pass_through(&assist, true);
                     if assist.parent().is_some() {
                         host.overlay.remove(&assist);

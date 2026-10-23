@@ -1921,6 +1921,29 @@ fn tag_value(value: &str, op: &str) -> Value {
     json!({ "value": value, "op": op })
 }
 
+fn name_search_clause(query: &str) -> Value {
+    json!({
+        "op": "OR",
+        "filter": [
+            { "name": [{ "value": query, "op": "WILDCARD" }] },
+            { "nameStemmed": [{ "value": query, "op": "MATCHES" }] }
+        ]
+    })
+}
+
+/// AND `clause` into a nested filter without replacing clauses already there.
+fn and_clause(filter: &mut Value, clause: Value) {
+    if let Some(clauses) = filter.get_mut("filter").and_then(|v| v.as_array_mut()) {
+        clauses.push(clause);
+        if filter.get("op").is_none() {
+            filter["op"] = json!("AND");
+        }
+        return;
+    }
+    filter["op"] = json!("AND");
+    filter["filter"] = json!([clause]);
+}
+
 fn apply_tag_filters(filter: &mut Value, include: &[String], exclude: &[String]) {
     let includes: Vec<&String> = include.iter().filter(|t| !t.is_empty()).collect();
     let excludes: Vec<&String> = exclude.iter().filter(|t| !t.is_empty()).collect();
@@ -1958,10 +1981,6 @@ fn build_mods_filter(
         "gameDomainName": [{ "value": domain, "op": "EQUALS" }],
     });
     apply_adult_content_filter(&mut filter, adult_content, true);
-    if !query.trim().is_empty() {
-        // WILDCARD already applies leading/trailing wildcards; do not wrap with '*'.
-        filter["name"] = json!([{ "value": query.trim(), "op": "WILDCARD" }]);
-    }
     if let Some(cat) = opts.category.as_ref().filter(|s| !s.is_empty()) {
         filter["categoryName"] = json!([{ "value": cat, "op": "EQUALS" }]);
     }
@@ -1978,6 +1997,12 @@ fn build_mods_filter(
         }
     }
     apply_tag_filters(&mut filter, &include, &opts.tags_exclude);
+    // `name` matches punctuation, so "SMAPI" misses "SMAPI - Stardew Modding API".
+    // `nameStemmed` matches tokens. Nest the OR under the tag AND.
+    let query = query.trim();
+    if !query.is_empty() {
+        and_clause(&mut filter, name_search_clause(query));
+    }
     filter
 }
 
@@ -2386,14 +2411,45 @@ mod tests {
     #[test]
     fn mods_filter_query_uses_bare_wildcard_value() {
         let filter = build_mods_filter("skyrim", "SKSE", true, &base_opts());
+        assert_eq!(filter["op"], json!("AND"));
         assert_eq!(
-            filter["name"],
-            json!([{ "value": "SKSE", "op": "WILDCARD" }])
+            filter["filter"],
+            json!([{
+                "op": "OR",
+                "filter": [
+                    { "name": [{ "value": "SKSE", "op": "WILDCARD" }] },
+                    { "nameStemmed": [{ "value": "SKSE", "op": "MATCHES" }] }
+                ]
+            }])
         );
-        let value = filter["name"][0]["value"].as_str().unwrap();
+        let value = filter["filter"][0]["filter"][0]["name"][0]["value"]
+            .as_str()
+            .unwrap();
         assert!(
             !value.contains('*'),
             "WILDCARD must not wrap query with '*'"
+        );
+    }
+
+    #[test]
+    fn mods_filter_query_nests_inside_tag_and() {
+        let mut opts = base_opts();
+        opts.tags_include = vec!["A".into(), "B".into()];
+        let filter = build_mods_filter("skyrim", "SMAPI", true, &opts);
+        assert_eq!(filter["op"], json!("AND"));
+        assert_eq!(
+            filter["filter"],
+            json!([
+                { "tag": [{ "value": "A", "op": "EQUALS" }] },
+                { "tag": [{ "value": "B", "op": "EQUALS" }] },
+                {
+                    "op": "OR",
+                    "filter": [
+                        { "name": [{ "value": "SMAPI", "op": "WILDCARD" }] },
+                        { "nameStemmed": [{ "value": "SMAPI", "op": "MATCHES" }] }
+                    ]
+                }
+            ])
         );
     }
 

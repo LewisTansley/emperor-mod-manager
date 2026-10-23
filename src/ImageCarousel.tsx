@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { motion, useReducedMotion } from "motion/react";
+import { MOTION_EASE, MOTION_FAST } from "./motion";
 
 export type GallerySlide = {
   url: string;
@@ -15,10 +17,22 @@ function readRatio(img: HTMLImageElement): number | null {
 export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
   const [index, setIndex] = useState(0);
   const [ratio, setRatio] = useState<number | null>(null);
+  const [leaving, setLeaving] = useState<GallerySlide | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
+  const reduced = useReducedMotion() === true;
   const slideKey = slides.map((slide) => slide.url).join("\n");
   const current = slides.length === 0 ? 0 : Math.min(index, slides.length - 1);
   const slide = slides[current];
+  const [trackedUrl, setTrackedUrl] = useState(slide?.url ?? "");
+  if ((slide?.url ?? "") !== trackedUrl) {
+    const previousUrl = trackedUrl;
+    setTrackedUrl(slide?.url ?? "");
+    if (previousUrl && !reduced) {
+      setLeaving(slides.find((item) => item.url === previousUrl) ?? { url: previousUrl });
+    } else {
+      setLeaving(null);
+    }
+  }
 
   useEffect(() => {
     setIndex(0);
@@ -68,11 +82,15 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
             : undefined
         }
       >
-        <img
+        <motion.img
           key={slide.url}
           ref={imgRef}
+          className="detail-carousel-slide"
           src={slide.url}
           alt={slide.caption?.trim() || "Mod image"}
+          initial={reduced || !leaving ? false : { opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: reduced ? 0 : MOTION_FAST, ease: MOTION_EASE }}
           onLoad={(event) => {
             const img = event.currentTarget;
             if (img.getAttribute("src") !== slide.url) return;
@@ -80,6 +98,18 @@ export function ImageCarousel({ slides }: { slides: GallerySlide[] }) {
             if (next != null) setRatio(next);
           }}
         />
+        {leaving && leaving.url !== slide.url ? (
+          <motion.img
+            key={`leaving:${leaving.url}`}
+            className="detail-carousel-slide detail-carousel-slide-leaving"
+            src={leaving.url}
+            alt=""
+            initial={{ opacity: 1 }}
+            animate={{ opacity: 0 }}
+            transition={{ duration: MOTION_FAST, ease: MOTION_EASE }}
+            onAnimationComplete={() => setLeaving(null)}
+          />
+        ) : null}
         {multiple ? (
           <>
             <button

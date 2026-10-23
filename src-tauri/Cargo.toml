@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.5.4"
+version = "0.6.0"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"

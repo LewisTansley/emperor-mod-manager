@@ -48,10 +48,17 @@ pub fn merge_launch_options(existing: &str, block: &LaunchEnvBlock) -> String {
     if base.is_empty() {
         return emperor;
     }
+    // The tools block is an environment prefix. Keep whatever command the
+    // existing options already name, so a SMAPI exe before %command% is not
+    // joined onto a second %command%.
+    let prefix = emperor
+        .strip_suffix("%command%")
+        .unwrap_or(emperor.as_str())
+        .trim();
     if base.contains("%command%") {
-        format!("{emperor} {base}")
+        format!("{prefix} {base}")
     } else {
-        format!("{emperor} {base} %command%")
+        format!("{prefix} {base} %command%")
     }
 }
 
@@ -395,6 +402,35 @@ mod tests {
         assert!(updated.contains(r#"WINEDLLOVERRIDES=\"dinput8=n,b\""#));
         let opts = extract_launch_options_for_app(&updated, "1").unwrap();
         assert_eq!(opts, written);
+    }
+
+    #[test]
+    fn merge_keeps_a_single_command_when_the_game_exe_is_replaced() {
+        let existing = r#"EMM_TOOLS_BEGIN ENABLE_AUTOHDR=1 EMM_TOOLS_END "/game/Stardew Valley/StardewModdingAPI.exe" %command%"#;
+        let block = LaunchEnvBlock {
+            lsfg_vk: None,
+            autohdr_vk: true,
+        };
+        let merged = merge_launch_options(existing, &block);
+        assert_eq!(merged, existing);
+        assert_eq!(merged.matches("%command%").count(), 1);
+
+        let with_tools = merge_launch_options(
+            r#""/game/Stardew Valley/StardewModdingAPI.exe" %command%"#,
+            &block,
+        );
+        assert_eq!(
+            with_tools,
+            r#"EMM_TOOLS_BEGIN ENABLE_AUTOHDR=1 EMM_TOOLS_END "/game/Stardew Valley/StardewModdingAPI.exe" %command%"#
+        );
+        assert_eq!(with_tools.matches("%command%").count(), 1);
+
+        let prefixed = merge_launch_options("PROTON_ENABLE_WAYLAND=1", &block);
+        assert_eq!(
+            prefixed,
+            "EMM_TOOLS_BEGIN ENABLE_AUTOHDR=1 EMM_TOOLS_END PROTON_ENABLE_WAYLAND=1 %command%"
+        );
+        assert_eq!(prefixed.matches("%command%").count(), 1);
     }
 
     #[test]

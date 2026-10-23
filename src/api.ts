@@ -61,6 +61,7 @@ export const api = {
   checkAppUpdate: () => invoke<AppUpdateStatus>("check_app_update"),
   installAppUpdate: () => invoke<AppInstallResult>("install_app_update"),
   getSettings: () => invoke<Settings>("get_settings"),
+  completeInitialSetup: () => invoke<void>("complete_initial_setup"),
   setApiKey: (key: string) => invoke<NexusUser>("set_api_key", { key }),
   validateUser: () => invoke<NexusUser>("validate_user"),
   clearApiKey: () => invoke<void>("clear_api_key"),

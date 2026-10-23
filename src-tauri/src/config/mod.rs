@@ -61,6 +61,13 @@ pub struct AppConfig {
     /// Vulkan tool integration (lsfg-vk, AutoHDR-VK).
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// `None` until the first settings read decides it. Existing installs with an
+    /// API key become complete; a saved `false` stays incomplete after a key is added.
+    #[serde(default)]
+    pub initial_setup_complete: Option<bool>,
+    /// Nexus website session captured by the sign-in window (Stay signed in).
+    #[serde(default)]
+    pub nexus_website_signed_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +125,16 @@ pub fn clamp_recent_downloads_limit(limit: u32) -> u32 {
     limit.clamp(MIN_RECENT_DOWNLOADS_LIMIT, MAX_RECENT_DOWNLOADS_LIMIT)
 }
 
+/// Resolves a missing first-run flag. `None` means the field was never saved:
+/// existing installs with an API key are complete, and everyone else stays in setup.
+/// A saved `false` is left false even when an API key exists later.
+pub fn resolve_initial_setup(complete: Option<bool>, has_api_key: bool) -> bool {
+    match complete {
+        Some(value) => value,
+        None => has_api_key,
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -131,6 +148,8 @@ impl Default for AppConfig {
             recent_downloads_limit: default_recent_downloads_limit(),
             legacy_games_merged: false,
             tools: ToolsConfig::default(),
+            initial_setup_complete: None,
+            nexus_website_signed_in: false,
         }
     }
 }
@@ -291,6 +310,26 @@ impl Paths {
     pub fn bepinex_cache_dir(&self, cache_id: &str) -> PathBuf {
         self.tools_dir().join("bepinex").join(cache_id)
     }
+
+    /// Cached SMAPI installer for one GitHub release tag.
+    pub fn smapi_cache_dir(&self, tag: &str) -> PathBuf {
+        let safe: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe = if safe.is_empty() {
+            "unknown".to_string()
+        } else {
+            safe
+        };
+        self.tools_dir().join("smapi").join(safe)
+    }
 }
 
 pub fn load_config(paths: &Paths) -> Result<AppConfig> {
@@ -319,4 +358,28 @@ pub fn save_config(paths: &Paths, cfg: &AppConfig) -> Result<()> {
 pub fn ensure_game_dirs(paths: &Paths, game_id: &str) -> Result<()> {
     fs::create_dir_all(paths.mods_dir(game_id))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_setup_flag_follows_api_key() {
+        assert!(resolve_initial_setup(None, true));
+        assert!(!resolve_initial_setup(None, false));
+    }
+
+    #[test]
+    fn saved_incomplete_setup_stays_incomplete_when_api_key_exists() {
+        assert!(!resolve_initial_setup(Some(false), true));
+        assert!(resolve_initial_setup(Some(true), false));
+    }
+
+    #[test]
+    fn old_config_omits_setup_flag() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.initial_setup_complete, None);
+        assert!(!cfg.nexus_website_signed_in);
+    }
 }

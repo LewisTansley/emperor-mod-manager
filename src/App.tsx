@@ -11,7 +11,9 @@ import {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { AccountConnections } from "./AccountConnections";
 import { api } from "./api";
+import { setupCanFinish } from "./setupGate";
 import {
   createQueueEntry,
   DownloadsWorkspace,
@@ -27,7 +29,16 @@ import {
   type CatalogSourceFilter,
 } from "./catalogSources";
 import { ImageCarousel } from "./ImageCarousel";
-import { ViewSlot } from "./motion";
+import {
+  FadeIn,
+  MotionCard,
+  NavTab,
+  PopIn,
+  Reveal,
+  Segment,
+  SegmentTab,
+  ViewSwitch,
+} from "./motion";
 import { RichText } from "./RichText";
 import { browseGameVersionOptions } from "./gameVersion";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
@@ -43,6 +54,7 @@ import {
   requirementsNeedAttention,
   withoutIgnoredDisabled,
   withoutIgnoredRequirements,
+  withoutIgnoredVersions,
 } from "./RequirementsDialog";
 import {
   StatusBanner,
@@ -88,6 +100,7 @@ import type {
   ShareImportResult,
   ShareModEntry,
   AppInfo,
+  AppInstallVia,
   AppUpdateStatus,
 } from "./types";
 import "./App.css";
@@ -782,6 +795,7 @@ function MediaCard(props: {
   hoverLabel?: string | null;
   unsupported?: boolean;
   onClick?: () => void;
+  enterIndex?: number;
 }) {
   const {
     title,
@@ -798,6 +812,7 @@ function MediaCard(props: {
     hoverLabel,
     unsupported,
     onClick,
+    enterIndex,
   } = props;
   const classes = [
     "media-card",
@@ -807,8 +822,9 @@ function MediaCard(props: {
     .filter(Boolean)
     .join(" ");
   return (
-    <article
+    <MotionCard
       className={classes}
+      enterIndex={enterIndex}
       onClick={onClick}
       onKeyDown={
         onClick
@@ -875,7 +891,7 @@ function MediaCard(props: {
           {actions}
         </div>
       ) : null}
-    </article>
+    </MotionCard>
   );
 }
 
@@ -944,6 +960,21 @@ function measureHostBounds(host: HTMLElement): {
   const height = Math.max(0, Math.floor(bottom - top));
   if (width < 8 || height < 8) return null;
   return { x: Math.round(left), y: Math.round(top), width, height };
+}
+
+function installViaLabel(via: AppInstallVia): string {
+  switch (via) {
+    case "pacman":
+      return "pacman";
+    case "deb":
+      return "apt";
+    case "appimage":
+      return "AppImage replacement";
+    case "portable":
+      return "a direct binary replacement";
+    case "nsis":
+      return "the Windows installer";
+  }
 }
 
 export default function App() {
@@ -1100,6 +1131,7 @@ export default function App() {
   const [nexusLoginOpen, setNexusLoginOpen] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
+  const setupCompleteRef = useRef(false);
 
   function rememberBrowseScroll() {
     if (!browseResultsVisibleRef.current) return;
@@ -1114,6 +1146,7 @@ export default function App() {
   }
 
   function setTab(next: Tab) {
+    if (!setupCompleteRef.current && next !== "setup") return;
     if (next !== tabRef.current) rememberBrowseScroll();
     setTabState(next);
   }
@@ -1318,6 +1351,7 @@ export default function App() {
 
   const refreshSettings = useCallback(async () => {
     const s = await api.getSettings();
+    setupCompleteRef.current = s.initial_setup_complete === true;
     setSettings(s);
     setActiveId(s.last_active_game_id);
     applyTheme(s.theme ?? "system");
@@ -1353,11 +1387,7 @@ export default function App() {
       );
       if (!quiet) {
         if (status.update_available) {
-          setAppUpdateMessage(
-            `Update available: v${status.latest_version}${
-              status.asset_name ? ` (${status.asset_name})` : ""
-            }`,
-          );
+          setAppUpdateMessage(`Update available: v${status.latest_version}`);
         } else if (status.latest_version) {
           setAppUpdateMessage("You’re up to date.");
         } else {
@@ -1376,7 +1406,7 @@ export default function App() {
 
   const installAppUpdate = useCallback(async () => {
     setInstallingAppUpdate(true);
-    setAppUpdateMessage(null);
+    setAppUpdateMessage("Downloading…");
     setError(null);
     try {
       const result = await api.installAppUpdate();
@@ -1385,6 +1415,7 @@ export default function App() {
         setNotice({ kind: "ok", message: result.message });
       }
     } catch (e) {
+      setAppUpdateMessage(null);
       setError(String(e));
     } finally {
       setInstallingAppUpdate(false);
@@ -1550,7 +1581,7 @@ export default function App() {
       try {
         const s = await refreshSettings();
         if (!cancelled && tabRef.current == null) {
-          setTab(s.has_api_key ? "library" : "setup");
+          setTab(s.initial_setup_complete ? "library" : "setup");
           choseTab = true;
         }
         await refreshManaged();
@@ -1576,10 +1607,28 @@ export default function App() {
   }, [refreshManaged, refreshOrphanScan, refreshSettings, scan]);
 
   useEffect(() => {
+    if (!settings) return;
+    if (!settings.initial_setup_complete) {
+      if (tab !== "setup") setTab("setup");
+      return;
+    }
+    if (tab === "setup") setTab("library");
+  }, [settings, tab]);
+
+  useEffect(() => {
     if (tab !== "settings") return;
     void loadAppInfo();
     void checkForAppUpdate(true);
   }, [tab, loadAppInfo, checkForAppUpdate]);
+
+  useEffect(() => {
+    const unlisten = listen<string>("app-update-progress", (event) => {
+      setAppUpdateMessage(event.payload);
+    });
+    return () => {
+      unlisten.then((drop) => drop());
+    };
+  }, []);
 
   useEffect(() => {
     if (themePref !== "system") {
@@ -1726,18 +1775,23 @@ export default function App() {
     () => disabledRequirementWarnings(mods, missingRequirements),
     [mods, missingRequirements],
   );
+  const ignoredRequirements = activeGame?.ignored_requirements ?? EMPTY_IGNORED;
   const showGameVersionWarnings = settings?.game_version_warnings !== false;
   const versionWarnings = useMemo(() => {
     if (!showGameVersionWarnings) return [];
+    const enabled = new Set(mods.filter((mod) => mod.enabled).map((mod) => mod.id));
     const names = new Map(mods.map((mod) => [mod.id, mod.name]));
-    return (gameVersionReport?.mods ?? [])
-      .filter((row) => row.status === "mismatch")
-      .map((row) => ({
-        stagedId: row.staged_id,
-        name: names.get(row.staged_id) ?? "Mod",
-        message: row.message,
-      }));
-  }, [mods, gameVersionReport, showGameVersionWarnings]);
+    return withoutIgnoredVersions(
+      (gameVersionReport?.mods ?? [])
+        .filter((row) => row.status === "mismatch" && enabled.has(row.staged_id))
+        .map((row) => ({
+          stagedId: row.staged_id,
+          name: names.get(row.staged_id) ?? "Mod",
+          message: row.message,
+        })),
+      ignoredRequirements,
+    );
+  }, [mods, gameVersionReport, showGameVersionWarnings, ignoredRequirements]);
   const modalDisabledRequirements = useMemo(
     () =>
       requirementsModal
@@ -1745,7 +1799,6 @@ export default function App() {
         : [],
     [mods, requirementsModal],
   );
-  const ignoredRequirements = activeGame?.ignored_requirements ?? EMPTY_IGNORED;
   const visibleMissingRequirements = useMemo(
     () =>
       missingRequirements
@@ -2045,6 +2098,7 @@ export default function App() {
       nexusLoginOpenRef.current = false;
       setNexusLoginOpen(false);
       api.closeDownloadAssist().catch(() => {});
+      void refreshSettings();
       setNotice({
         kind: "ok",
         message: "Nexus website session saved.",
@@ -2053,7 +2107,7 @@ export default function App() {
     return () => {
       unlisten.then((drop) => drop());
     };
-  }, []);
+  }, [refreshSettings]);
 
   const setAssistQueueState = useCallback((next: AssistQueueState | null) => {
     assistQueueRef.current = next;
@@ -2811,7 +2865,31 @@ export default function App() {
       await api.setApiKey(apiKeyInput);
       setApiKeyInput("");
       await refreshSettings();
+      setNotice({ kind: "ok", message: "Nexus API key saved." });
+    });
+  }
+
+  async function finishSetup() {
+    if (
+      !setupCanFinish(
+        Boolean(settings?.has_api_key),
+        Boolean(settings?.nexus_website_signed_in),
+      )
+    ) {
+      return;
+    }
+    await withBusy("Finishing setup…", async () => {
+      await api.completeInitialSetup();
+      const next = await refreshSettings();
+      setupCompleteRef.current = next.initial_setup_complete === true;
       setTab("library");
+    });
+  }
+
+  async function clearNexusWebsiteSession() {
+    await withBusy("Clearing Nexus website session…", async () => {
+      await api.clearAssistSession();
+      await refreshSettings();
     });
   }
 
@@ -4819,6 +4897,50 @@ export default function App() {
     void refreshDownloads();
   }
 
+  const navItems: [Tab, string][] = !settings
+    ? []
+    : settings.initial_setup_complete
+      ? [
+          ["library", "Library"],
+          ["collections", "Collections"],
+          ["browse", "Browse"],
+          ["downloads", "Downloads"],
+          ...(settings.platform_linux ? [["tools", "Tools"] as [Tab, string]] : []),
+          ["settings", "Settings"],
+        ]
+      : [["setup", "Setup"]];
+  const nexusSignInBlocked = Boolean(assistQueue && !assistQueue.cancelled);
+  const canFinishSetup = setupCanFinish(
+    Boolean(settings?.has_api_key),
+    Boolean(settings?.nexus_website_signed_in),
+  );
+  const accountConnections = (
+    <AccountConnections
+      settings={settings}
+      apiKeyInput={apiKeyInput}
+      onApiKeyInput={setApiKeyInput}
+      onSaveApiKey={() => void saveApiKey()}
+      onClearApiKey={() =>
+        void withBusy("Clearing key…", async () => {
+          await api.clearApiKey();
+          await refreshSettings();
+        })
+      }
+      modioKeyInput={modioKeyInput}
+      onModioKeyInput={setModioKeyInput}
+      onSaveModioApiKey={() => void saveModioApiKey()}
+      onClearModioApiKey={() =>
+        void withBusy("Clearing mod.io key…", async () => {
+          await api.clearModioApiKey();
+          await refreshSettings();
+        })
+      }
+      signInDisabled={nexusSignInBlocked}
+      onSignIn={() => setNexusLoginOpen(true)}
+      onClearWebsiteSession={() => void clearNexusWebsiteSession()}
+    />
+  );
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -4830,20 +4952,11 @@ export default function App() {
           </div>
         </div>
         <nav>
-          {(
-            [
-              ["setup", "Setup"],
-              ["library", "Library"],
-              ["collections", "Collections"],
-              ["browse", "Browse"],
-              ["downloads", "Downloads"],
-              ...(settings?.platform_linux ? ([["tools", "Tools"]] as const) : []),
-              ["settings", "Settings"],
-            ] as const
-          ).map(([id, label]) => (
-            <button
+          {navItems.map(([id, label]) => (
+            <NavTab
               key={id}
-              className={tab === id ? "nav active" : "nav"}
+              layoutId="sidebar-nav"
+              active={tab === id}
               onClick={() => {
                 setTab(id);
                 if (id === "downloads") refreshDownloads();
@@ -4855,7 +4968,7 @@ export default function App() {
               }}
             >
               {label}
-            </button>
+            </NavTab>
           ))}
         </nav>
         {activeGame ? (
@@ -4894,148 +5007,79 @@ export default function App() {
       </aside>
 
       <main className="main" ref={mainScrollRef}>
-        {error ? (
-          <StatusBanner
-            kind="error"
-            message={error}
-            action={errorAction}
-            onDismiss={() => setError(null)}
-          />
-        ) : assistLoginBanner ? (
-          <StatusBanner
-            kind="warn"
-            message="Nexus website sign-in is required for Download Assist. Open Downloads to sign in (use Stay signed in), then the queue continues."
-            action={{ label: "Open Downloads", run: () => openDownloadsTab() }}
-            onDismiss={() => setAssistLoginBanner(false)}
-          />
-        ) : notice ? (
-          <StatusBanner
-            kind={notice.kind === "ok" ? "info" : "warn"}
-            message={notice.message}
-            details={notice.details}
-            action={notice.action}
-            onDismiss={() => setNotice(null)}
-          />
-        ) : null}
+        <Reveal show={Boolean(error || assistLoginBanner || notice)}>
+          {error ? (
+            <StatusBanner
+              kind="error"
+              message={error}
+              action={errorAction}
+              onDismiss={() => setError(null)}
+            />
+          ) : assistLoginBanner ? (
+            <StatusBanner
+              kind="warn"
+              message="Nexus website sign-in is required for Download Assist. Open Downloads to sign in (use Stay signed in), then the queue continues."
+              action={{ label: "Open Downloads", run: () => openDownloadsTab() }}
+              onDismiss={() => setAssistLoginBanner(false)}
+            />
+          ) : notice ? (
+            <StatusBanner
+              kind={notice.kind === "ok" ? "info" : "warn"}
+              message={notice.message}
+              details={notice.details}
+              action={notice.action}
+              onDismiss={() => setNotice(null)}
+            />
+          ) : null}
+        </Reveal>
 
         {tab ? (
-        <ViewSlot key={tab}>
+        <ViewSwitch viewKey={tab} className="view-slot">
         {tab === "setup" && (
           <section className="panel">
             <h1>Setup</h1>
             <p>
-              Paste your Nexus Mods personal API key from{" "}
-              <a
-                href="https://www.nexusmods.com/users/myaccount?tab=api"
-                target="_blank"
-                rel="noreferrer"
-              >
-                Account → API Access
-              </a>
-              . The API key authenticates browsing and Premium downloads. Free
-              accounts also need the Nexus website sign-in below (use Stay signed
-              in). That session is saved in the app separately from the API key.
+              A Nexus API key and a Nexus website sign-in are both required before
+              the rest of the app opens. Use Stay signed in. The website session
+              is saved separately from the API key. Premium and free accounts
+              both need the sign-in. mod.io is optional.
             </p>
-            {settings?.user && (
-              <div className="status-card">
-                Signed in as <strong>{settings.user.name}</strong>
-                {settings.user.is_premium ? (
-                  <span className="pill ok">Premium</span>
-                ) : (
-                  <span className="pill warn">Free — Download Assist</span>
-                )}
-              </div>
-            )}
-            <div className="row">
-              <input
-                type="password"
-                placeholder="Nexus API key"
-                value={apiKeyInput}
-                onChange={(e) => setApiKeyInput(e.target.value)}
-              />
-              <button onClick={saveApiKey} disabled={!apiKeyInput.trim()}>
-                Save & validate
-              </button>
+            <div className="status-card">
+              <span className={settings?.has_api_key ? "pill ok" : "pill warn"}>
+                {settings?.has_api_key ? "Nexus API key saved" : "Nexus API key required"}
+              </span>
+              <span
+                className={settings?.nexus_website_signed_in ? "pill ok" : "pill warn"}
+              >
+                {settings?.nexus_website_signed_in
+                  ? "Website sign-in saved"
+                  : "Website sign-in required"}
+              </span>
             </div>
-            {settings?.has_api_key && (
-              <button
-                className="danger"
-                onClick={() =>
-                  withBusy("Clearing key…", async () => {
-                    await api.clearApiKey();
-                    await refreshSettings();
-                  })
-                }
-              >
-                Clear Nexus API key
-              </button>
-            )}
-            <h2 style={{ marginTop: "1.5rem" }}>Nexus website sign-in</h2>
-            <p>
-              Free accounts need a one-time website sign-in. Use Stay signed in.
-              The session is stored separately from the API key.
-            </p>
+            {accountConnections}
             <div className="actions">
               <button
                 type="button"
-                disabled={Boolean(assistQueue && !assistQueue.cancelled)}
+                disabled={!canFinishSetup}
                 title={
-                  assistQueue && !assistQueue.cancelled
-                    ? "Finish or cancel the Download Assist queue before signing in."
-                    : undefined
+                  canFinishSetup
+                    ? undefined
+                    : "Save a Nexus API key and finish website sign-in first."
                 }
-                onClick={() => setNexusLoginOpen(true)}
+                onClick={() => void finishSetup()}
               >
-                Log in to Nexus
+                Finish setup
               </button>
             </div>
-            <h2 style={{ marginTop: "1.5rem" }}>mod.io</h2>
-            <p>
-              Optional read-only API key from{" "}
-              <a
-                href="https://mod.io/me/access"
-                target="_blank"
-                rel="noreferrer"
-              >
-                mod.io → Access
-              </a>
-              . Used to browse and download mods for games with a mod.io game ID.
-              OAuth, uploads, and ratings are not supported.
-            </p>
-            {settings?.has_modio_api_key && (
-              <div className="status-card">
-                <span className="pill ok">mod.io API key saved</span>
-              </div>
-            )}
-            <div className="row">
-              <input
-                type="password"
-                placeholder="mod.io API key"
-                value={modioKeyInput}
-                onChange={(e) => setModioKeyInput(e.target.value)}
-              />
-              <button onClick={saveModioApiKey} disabled={!modioKeyInput.trim()}>
-                Save & validate
-              </button>
-            </div>
-            {settings?.has_modio_api_key && (
-              <button
-                className="danger"
-                onClick={() =>
-                  withBusy("Clearing mod.io key…", async () => {
-                    await api.clearModioApiKey();
-                    await refreshSettings();
-                  })
-                }
-              >
-                Clear mod.io API key
-              </button>
-            )}
           </section>
         )}
 
         {tab === "library" && (
           <section className="panel">
+            <ViewSwitch
+              viewKey={libraryDetail ? `game:${libraryDetail.game.id}` : "library-home"}
+              initial={false}
+            >
             {libraryDetail ? (
               <>
                 <div className="panel-head">
@@ -5046,36 +5090,38 @@ export default function App() {
                     <h1>{libraryDetail.game.title}</h1>
                   </div>
                   <div className="panel-head-actions">
-                    <div className="segment">
-                      <button
-                        className={libraryDetail.tab === "info" ? "active" : ""}
+                    <Segment>
+                      <SegmentTab
+                        layoutId="library-game-tabs"
+                        active={libraryDetail.tab === "info"}
                         onClick={() => setGameDetailTab("info")}
                       >
                         Info
-                      </button>
-                      <button
-                        className={libraryDetail.tab === "mods" ? "active" : ""}
+                      </SegmentTab>
+                      <SegmentTab
+                        layoutId="library-game-tabs"
+                        active={libraryDetail.tab === "mods"}
                         onClick={() => setGameDetailTab("mods")}
                       >
                         Mods
-                      </button>
-                      <button
-                        className={
-                          libraryDetail.tab === "collections" ? "active" : ""
-                        }
+                      </SegmentTab>
+                      <SegmentTab
+                        layoutId="library-game-tabs"
+                        active={libraryDetail.tab === "collections"}
                         onClick={() => setGameDetailTab("collections")}
                       >
                         Collections
-                      </button>
+                      </SegmentTab>
                       {settings?.platform_linux && (
-                        <button
-                          className={libraryDetail.tab === "tools" ? "active" : ""}
+                        <SegmentTab
+                          layoutId="library-game-tabs"
+                          active={libraryDetail.tab === "tools"}
                           onClick={() => setGameDetailTab("tools")}
                         >
                           Tools
-                        </button>
+                        </SegmentTab>
                       )}
-                    </div>
+                    </Segment>
                     <button
                       className="danger"
                       onClick={() =>
@@ -5194,13 +5240,13 @@ export default function App() {
                   </div>
                 </div>
 
-                <div
-                  key={
+                <ViewSwitch
+                  viewKey={
                     libraryDetail.tab === "collections" && gameSavedDetail
                       ? `collections:${gameSavedDetail.entry.id}`
                       : libraryDetail.tab
                   }
-                  className="view-enter"
+                  initial={false}
                 >
                 {libraryDetail.tab === "info" && (
                   <div className="detail-body">
@@ -5319,8 +5365,10 @@ export default function App() {
                 )}
                 {libraryDetail.tab === "mods" && (
                   <div className="detail-body">
-                    {(shareExportOpen || shareImportOpen || lastShareCode) && (
-                      <div className="profile-import share-panel">
+                    <Reveal
+                      show={Boolean(shareExportOpen || shareImportOpen || lastShareCode)}
+                      className="profile-import share-panel"
+                    >
                         {shareExportOpen && (
                           <>
                             <h2>Share loadout</h2>
@@ -5431,8 +5479,7 @@ export default function App() {
                             </div>
                           </>
                         )}
-                      </div>
-                    )}
+                    </Reveal>
                     {installedCollections.length > 0 && (
                       <div className="installed-collections">
                         <h2>Installed collections</h2>
@@ -5559,7 +5606,7 @@ export default function App() {
                             ))}
                           </select>
                         </label>
-                        <div className="segment source-filter">
+                        <Segment className="source-filter">
                           {(
                             [
                               ["all", "All"] as const,
@@ -5568,16 +5615,16 @@ export default function App() {
                               ["modio", "mod.io"] as const,
                             ] as const
                           ).map(([id, label]) => (
-                            <button
+                            <SegmentTab
                               key={id}
-                              type="button"
-                              className={modsSourceFilter === id ? "active" : ""}
+                              layoutId="mods-source"
+                              active={modsSourceFilter === id}
                               onClick={() => setModsSourceFilter(id)}
                             >
                               {label}
-                            </button>
+                            </SegmentTab>
                           ))}
-                        </div>
+                        </Segment>
                         {modsFiltersActive && (
                           <button
                             type="button"
@@ -5637,13 +5684,15 @@ export default function App() {
                         </p>
                       )}
                     </div>
-                    {settings?.platform_linux && wineAdvice && (
-                      <WineOverrideNotice
-                        advice={wineAdvice}
-                        busy={wineApplyBusy}
-                        onApply={() => void applyWineOverrides()}
-                      />
-                    )}
+                    <Reveal show={Boolean(settings?.platform_linux && wineAdvice)}>
+                      {settings?.platform_linux && wineAdvice ? (
+                        <WineOverrideNotice
+                          advice={wineAdvice}
+                          busy={wineApplyBusy}
+                          onApply={() => void applyWineOverrides()}
+                        />
+                      ) : null}
+                    </Reveal>
                     {ignoredRequirements.length > 0 && (
                       <button
                         type="button"
@@ -5653,23 +5702,32 @@ export default function App() {
                         Ignored requirements ({ignoredRequirements.length})
                       </button>
                     )}
-                    {((visibleMissingRequirements &&
-                      requirementsNeedAttention(visibleMissingRequirements)) ||
+                    <Reveal
+                      show={Boolean(
+                        (visibleMissingRequirements &&
+                          requirementsNeedAttention(visibleMissingRequirements)) ||
+                          visibleDisabledRequirements.length > 0 ||
+                          versionWarnings.length > 0,
+                      )}
+                    >
+                      {(visibleMissingRequirements &&
+                        requirementsNeedAttention(visibleMissingRequirements)) ||
                       visibleDisabledRequirements.length > 0 ||
-                      versionWarnings.length > 0) && (
-                      <MissingRequirementsStrip
-                        requirements={
-                          visibleMissingRequirements ?? {
-                            nexus: [],
-                            external: [],
-                            dlc: [],
+                      versionWarnings.length > 0 ? (
+                        <MissingRequirementsStrip
+                          requirements={
+                            visibleMissingRequirements ?? {
+                              nexus: [],
+                              external: [],
+                              dlc: [],
+                            }
                           }
-                        }
-                        disabled={visibleDisabledRequirements}
-                        versions={versionWarnings}
-                        onReview={() => openRequirementsReview()}
-                      />
-                    )}
+                          disabled={visibleDisabledRequirements}
+                          versions={versionWarnings}
+                          onReview={() => openRequirementsReview()}
+                        />
+                      ) : null}
+                    </Reveal>
                     <ul className="list mods">
                       {visibleMods.map((m) => {
                         const idx = modIndexById.get(m.id) ?? -1;
@@ -6033,32 +6091,35 @@ export default function App() {
                 {libraryDetail.tab === "tools" && settings?.platform_linux && (
                   <GameToolsPanel game={libraryDetail.game} />
                 )}
-                </div>
+                </ViewSwitch>
               </>
             ) : (
-              <div className="view-enter">
+              <div>
                 <div className="panel-head">
                   <h1>Library</h1>
                   <div className="panel-head-actions">
-                    <div className="segment">
-                      <button
-                        className={libraryView === "list" ? "active" : ""}
+                    <Segment>
+                      <SegmentTab
+                        layoutId="library-view"
+                        active={libraryView === "list"}
                         onClick={() => setLibraryView("list")}
                       >
                         List
-                      </button>
-                      <button
-                        className={libraryView === "grid" ? "active" : ""}
+                      </SegmentTab>
+                      <SegmentTab
+                        layoutId="library-view"
+                        active={libraryView === "grid"}
                         onClick={() => setLibraryView("grid")}
                       >
                         Grid
-                      </button>
-                    </div>
+                      </SegmentTab>
+                    </Segment>
                     <button onClick={scan}>Scan games</button>
                   </div>
                 </div>
-                {unrealManage && (
-                  <div className="panel unreal-manage-panel">
+                <Reveal show={unrealManage != null} className="panel unreal-manage-panel">
+                  {unrealManage ? (
+                    <>
                     <h2>Add as Unreal Engine game</h2>
                     <p>
                       <strong>{unrealManage.title}</strong> looks like an Unreal
@@ -6130,10 +6191,12 @@ export default function App() {
                         Cancel
                       </button>
                     </div>
-                  </div>
-                )}
-                {bepinexManage && (
-                  <div className="panel unreal-manage-panel">
+                    </>
+                  ) : null}
+                </Reveal>
+                <Reveal show={bepinexManage != null} className="panel unreal-manage-panel">
+                  {bepinexManage ? (
+                    <>
                     <h2>Add as Unity / BepInEx game</h2>
                     <p>
                       <strong>{bepinexManage.title}</strong> looks like a Unity
@@ -6196,8 +6259,9 @@ export default function App() {
                         Cancel
                       </button>
                     </div>
-                  </div>
-                )}
+                    </>
+                  ) : null}
+                </Reveal>
                 {relinkPrompt && (
                   <div className="panel relink-panel">
                     <h3>Relink {relinkPrompt.game.title}</h3>
@@ -6225,8 +6289,8 @@ export default function App() {
                   <>
                     <h2>Managed</h2>
                     {libraryView === "grid" ? (
-                      <div className="media-grid">
-                        {managed.map((g) => {
+                      <FadeIn className="media-grid">
+                        {managed.map((g, index) => {
                           const health = gameHealthById.get(g.id);
                           const badge = managedHealthBadge(health);
                           const actions =
@@ -6263,6 +6327,7 @@ export default function App() {
                           return (
                             <MediaCard
                               key={g.id}
+                              enterIndex={index}
                               title={g.title}
                               imageSrc={mediaSrc(g.cover_path)}
                               badge={badge}
@@ -6276,7 +6341,7 @@ export default function App() {
                             />
                           );
                         })}
-                      </div>
+                      </FadeIn>
                     ) : (
                       <ul className="list">
                         {managed.map((g) => {
@@ -6350,14 +6415,15 @@ export default function App() {
                   <p className="note">Looking up Nexus / Thunderstore / mod.io…</p>
                 )}
                 {libraryView === "grid" ? (
-                  <div className="media-grid">
-                    {unmanaged.map((g) => {
+                  <FadeIn className="media-grid">
+                    {unmanaged.map((g, index) => {
                       const suggestion = catalogSuggestions[g.id];
                       const hints = catalogHintTags(suggestion);
                       if (g.supported) {
                         return (
                           <MediaCard
                             key={g.id}
+                            enterIndex={index}
                             title={g.title}
                             imageSrc={mediaSrc(g.cover_path)}
                             coverTags={hints}
@@ -6371,6 +6437,7 @@ export default function App() {
                         return (
                           <MediaCard
                             key={g.id}
+                            enterIndex={index}
                             title={g.title}
                             imageSrc={mediaSrc(g.cover_path)}
                             coverTags={hints}
@@ -6386,6 +6453,7 @@ export default function App() {
                         return (
                           <MediaCard
                             key={g.id}
+                            enterIndex={index}
                             title={g.title}
                             imageSrc={mediaSrc(g.cover_path)}
                             coverTags={hints}
@@ -6401,6 +6469,7 @@ export default function App() {
                       return (
                         <MediaCard
                           key={g.id}
+                          enterIndex={index}
                           title={g.title}
                           imageSrc={mediaSrc(g.cover_path)}
                           coverTags={hints}
@@ -6415,7 +6484,7 @@ export default function App() {
                         while the app was open.
                       </p>
                     )}
-                  </div>
+                  </FadeIn>
                 ) : (
                   <ul className="list">
                     {unmanaged.map((g) => {
@@ -6488,11 +6557,22 @@ export default function App() {
                 )}
               </div>
             )}
+            </ViewSwitch>
           </section>
         )}
 
         {tab === "browse" && (
-          <section className={browseDetail ? "panel" : "panel browse-workspace"}>
+          <ViewSwitch
+            viewKey={
+              browseDetail
+                ? browseDetail.kind === "mod"
+                  ? `mod:${browseDetail.hit.id}`
+                  : `collection:${browseDetail.hit.slug}`
+                : "browse-results"
+            }
+            className={browseDetail ? "panel" : "panel browse-workspace"}
+            initial={false}
+          >
             {browseDetail ? (
               <>
                 <div className="panel-head">
@@ -6502,32 +6582,34 @@ export default function App() {
                     </button>
                     <h1>{browseDetail.hit.name}</h1>
                   </div>
-                  <div className="segment">
-                    <button
-                      className={browseDetail.tab === "info" ? "active" : ""}
+                  <Segment>
+                    <SegmentTab
+                      layoutId="browse-detail-tabs"
+                      active={browseDetail.tab === "info"}
                       onClick={() => setDetailTab("info")}
                     >
                       Info
-                    </button>
+                    </SegmentTab>
                     {!(
                       browseDetail.kind === "mod" &&
                       browseDetail.hit.source === "thunderstore"
                     ) && (
-                      <button
-                        className={browseDetail.tab === "files" ? "active" : ""}
+                      <SegmentTab
+                        layoutId="browse-detail-tabs"
+                        active={browseDetail.tab === "files"}
                         onClick={() => setDetailTab("files")}
                       >
                         Files
-                      </button>
+                      </SegmentTab>
                     )}
-                  </div>
+                  </Segment>
                 </div>
 
-                <div
-                  key={`${browseDetail.kind}:${browseDetail.tab}:${
+                <ViewSwitch
+                  viewKey={`${browseDetail.kind}:${browseDetail.tab}:${
                     browseDetail.kind === "mod" ? browseDetail.hit.id : browseDetail.hit.slug
                   }`}
-                  className="view-enter"
+                  initial={false}
                 >
                 {browseDetail.kind === "mod" ? (
                   <>
@@ -7061,7 +7143,7 @@ export default function App() {
                     )}
                   </>
                 )}
-                </div>
+                </ViewSwitch>
               </>
             ) : (
               <div className="view-enter">
@@ -7074,9 +7156,10 @@ export default function App() {
                     <h1>Browse Mods</h1>
                   </div>
                   <div className="panel-head-actions">
-                    <div className="segment">
-                      <button
-                        className={browseMode === "mods" ? "active" : ""}
+                    <Segment>
+                      <SegmentTab
+                        layoutId="browse-mode"
+                        active={browseMode === "mods"}
                         onClick={() => {
                           setBrowseMode("mods");
                           setBrowseSort("endorsements");
@@ -7096,9 +7179,10 @@ export default function App() {
                         }}
                       >
                         Mods
-                      </button>
-                      <button
-                        className={browseMode === "collections" ? "active" : ""}
+                      </SegmentTab>
+                      <SegmentTab
+                        layoutId="browse-mode"
+                        active={browseMode === "collections"}
                         onClick={() => {
                           setBrowseMode("collections");
                           setBrowseSort("endorsements");
@@ -7119,8 +7203,8 @@ export default function App() {
                         }}
                       >
                         Collections
-                      </button>
-                    </div>
+                      </SegmentTab>
+                    </Segment>
                     {(browseMode === "mods"
                       ? [
                           Boolean(activeGame?.nexus_domain),
@@ -7132,7 +7216,7 @@ export default function App() {
                           Boolean(activeGame?.thunderstore_community),
                         ]
                     ).filter(Boolean).length > 1 && (
-                        <div className="segment source-filter">
+                        <Segment className="source-filter">
                           {(
                             [
                               ["all", "All"] as const,
@@ -7147,16 +7231,16 @@ export default function App() {
                                 : []),
                             ]
                           ).map(([id, label]) => (
-                            <button
+                            <SegmentTab
                               key={id}
-                              type="button"
-                              className={sourceFilter === id ? "active" : ""}
+                              layoutId="browse-source"
+                              active={sourceFilter === id}
                               onClick={() => setSourceFilter(id)}
                             >
                               {label}
-                            </button>
+                            </SegmentTab>
                           ))}
-                        </div>
+                        </Segment>
                       )}
                     {browseMode === "collections" && activeGame && (
                         <button
@@ -7181,37 +7265,39 @@ export default function App() {
                       </label>
                     )}
                     {browseView === "list" && (
-                      <div className="segment">
-                        <button
-                          type="button"
-                          className={browseListDensity === "compact" ? "active" : ""}
+                      <Segment>
+                        <SegmentTab
+                          layoutId="browse-density"
+                          active={browseListDensity === "compact"}
                           onClick={() => setBrowseListDensity("compact")}
                         >
                           Compact
-                        </button>
-                        <button
-                          type="button"
-                          className={browseListDensity === "posters" ? "active" : ""}
+                        </SegmentTab>
+                        <SegmentTab
+                          layoutId="browse-density"
+                          active={browseListDensity === "posters"}
                           onClick={() => setBrowseListDensity("posters")}
                         >
                           Posters
-                        </button>
-                      </div>
+                        </SegmentTab>
+                      </Segment>
                     )}
-                    <div className="segment">
-                      <button
-                        className={browseView === "list" ? "active" : ""}
+                    <Segment>
+                      <SegmentTab
+                        layoutId="browse-view"
+                        active={browseView === "list"}
                         onClick={() => setBrowseView("list")}
                       >
                         List
-                      </button>
-                      <button
-                        className={browseView === "grid" ? "active" : ""}
+                      </SegmentTab>
+                      <SegmentTab
+                        layoutId="browse-view"
+                        active={browseView === "grid"}
                         onClick={() => setBrowseView("grid")}
                       >
                         Grid
-                      </button>
-                    </div>
+                      </SegmentTab>
+                    </Segment>
                   </div>
                 </div>
                 {!activeGame ? (
@@ -7231,8 +7317,10 @@ export default function App() {
                       />
                       <button onClick={search}>Search</button>
                     </div>
-                    {profileImportOpen && browseMode === "collections" && (
-                      <div className="profile-import">
+                    <Reveal
+                      show={profileImportOpen && browseMode === "collections"}
+                      className="profile-import"
+                    >
                         <label>
                           Share or profile code
                           <textarea
@@ -7265,8 +7353,7 @@ export default function App() {
                             Cancel
                           </button>
                         </div>
-                      </div>
-                    )}
+                    </Reveal>
                     <div className="filters">
                       <label>
                         Sort
@@ -7359,13 +7446,13 @@ export default function App() {
                                 : `${activeTagCount} tags`}
                           </span>
                         </button>
-                        {tagsOpen && (
-                          <div
-                            className="tag-picker-popup"
-                            role="listbox"
-                            aria-multiselectable="true"
-                            aria-labelledby="browse-tags-label"
-                          >
+                        <PopIn
+                          show={tagsOpen}
+                          className="tag-picker-popup"
+                          role="listbox"
+                          aria-multiselectable={true}
+                          aria-labelledby="browse-tags-label"
+                        >
                             <input
                               ref={tagSearchRef}
                               type="text"
@@ -7417,8 +7504,7 @@ export default function App() {
                                 })
                               )}
                             </div>
-                          </div>
-                        )}
+                        </PopIn>
                       </div>
                       <button
                         type="button"
@@ -7447,7 +7533,8 @@ export default function App() {
                   <div className="browse-results" ref={browseResultsRef}>
                     {browseMode === "mods" ? (
                       browseView === "grid" ? (
-                        <div
+                        <FadeIn
+                          key={modHits[0]?.id ?? `mods:${searchQuery}`}
                           className="media-grid browse-grid"
                           style={
                             {
@@ -7455,7 +7542,7 @@ export default function App() {
                             } as CSSProperties
                           }
                         >
-                          {modHits.map((m) => {
+                          {modHits.map((m, index) => {
                             const sourceLabel =
                               m.source === "thunderstore"
                                 ? "Thunderstore"
@@ -7468,6 +7555,7 @@ export default function App() {
                             return (
                               <MediaCard
                                 key={m.id}
+                                enterIndex={index}
                                 title={m.name}
                                 imageSrc={mediaSrc(null, m.picture_url)}
                                 badge={m.author ?? "Mod"}
@@ -7569,7 +7657,7 @@ export default function App() {
                           {modHits.length === 0 && (
                             <p className="note">{browseResultsNote("mods")}</p>
                           )}
-                        </div>
+                        </FadeIn>
                       ) : (
                         <ul className="list">
                           {modHits.map((m) => {
@@ -7697,7 +7785,12 @@ export default function App() {
                         </ul>
                       )
                     ) : browseView === "grid" ? (
-                      <div
+                      <FadeIn
+                        key={
+                          collectionHits[0]
+                            ? collectionHitKey(collectionHits[0])
+                            : `collections:${searchQuery}`
+                        }
                         className="media-grid browse-grid"
                         style={
                           {
@@ -7705,7 +7798,7 @@ export default function App() {
                           } as CSSProperties
                         }
                       >
-                        {collectionHits.map((c) => {
+                        {collectionHits.map((c, index) => {
                           const meta = [
                             collectionHitSource(c) === "thunderstore"
                               ? "Thunderstore"
@@ -7722,6 +7815,7 @@ export default function App() {
                           return (
                             <MediaCard
                               key={collectionHitKey(c)}
+                              enterIndex={index}
                               title={c.name}
                               imageSrc={mediaSrc(null, c.tile_image_url)}
                               badge={
@@ -7754,7 +7848,7 @@ export default function App() {
                         {collectionHits.length === 0 && (
                           <p className="note">{browseResultsNote("collections")}</p>
                         )}
-                      </div>
+                      </FadeIn>
                     ) : (
                       <ul className="list">
                         {collectionHits.map((c) => {
@@ -7835,13 +7929,17 @@ export default function App() {
                 ) : null}
               </div>
             )}
-          </section>
+          </ViewSwitch>
         )}
 
         {tab === "collections" && (
           <section className="panel">
+            <ViewSwitch
+              viewKey={savedDetail ? `saved:${savedDetail.entry.id}` : "saved-list"}
+              initial={false}
+            >
             {savedDetail ? (
-              <div key={savedDetail.entry.id} className="view-enter">
+              <div>
                 <div className="panel-head">
                   <button
                     type="button"
@@ -7974,7 +8072,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="view-enter">
+              <div>
                 <div className="panel-head">
                   <h1>Saved Collections</h1>
                 </div>
@@ -8040,6 +8138,7 @@ export default function App() {
                 </ul>
               </div>
             )}
+            </ViewSwitch>
           </section>
         )}
 
@@ -8078,6 +8177,10 @@ export default function App() {
           <section className="panel">
             <h1>Settings</h1>
             <div className="setting-block">
+              <span>Accounts</span>
+              {accountConnections}
+            </div>
+            <div className="setting-block">
               <span>App updates</span>
               <p className="note">
                 Current version:{" "}
@@ -8085,12 +8188,16 @@ export default function App() {
                 {appUpdate?.latest_version
                   ? ` · Latest on GitHub: v${appUpdate.latest_version}`
                   : ""}
+                {appUpdate?.install_via
+                  ? ` · Updates with ${installViaLabel(appUpdate.install_via)}`
+                  : ""}
               </p>
               {appUpdateMessage && <p className="note">{appUpdateMessage}</p>}
               {appUpdate?.update_available && !appUpdate.asset_name && (
                 <p className="note">
-                  A newer release exists, but no installable package was found for this
-                  platform. Use the release page to download manually.
+                  {appUpdate.install_via
+                    ? "A newer release exists, but the matching package is not on the GitHub release yet."
+                    : "A newer release exists, but this copy was not installed in a way the app can replace. Use the release page to update it."}
                 </p>
               )}
               <div className="actions">
@@ -8108,8 +8215,8 @@ export default function App() {
                     onClick={() => void installAppUpdate()}
                   >
                     {installingAppUpdate
-                      ? "Downloading…"
-                      : `Download & Install v${appUpdate.latest_version}`}
+                      ? "Updating…"
+                      : `Update to v${appUpdate.latest_version}`}
                   </button>
                 )}
                 {appUpdate?.release_url && (
@@ -8125,40 +8232,38 @@ export default function App() {
             </div>
             <div className="setting-block">
               <span>Theme</span>
-              <div className="segment">
+              <Segment>
                 {(["light", "dark", "system"] as const).map((t) => (
-                  <button
+                  <SegmentTab
                     key={t}
-                    className={themePref === t ? "active" : ""}
+                    layoutId="settings-theme"
+                    active={themePref === t}
                     onClick={() => setTheme(t)}
                   >
                     {t === "light" ? "Light" : t === "dark" ? "Dark" : "System"}
-                  </button>
+                  </SegmentTab>
                 ))}
-              </div>
+              </Segment>
             </div>
             <div className="setting-block">
               <span>After Install</span>
-              <div className="segment">
+              <Segment>
                 {(
                   [
                     ["stay", "Stay here"],
                     ["downloads", "Go to Downloads"],
                   ] as const
                 ).map(([value, label]) => (
-                  <button
+                  <SegmentTab
                     key={value}
-                    className={
-                      (settings?.install_click_behavior ?? "downloads") === value
-                        ? "active"
-                        : ""
-                    }
+                    layoutId="settings-after-install"
+                    active={(settings?.install_click_behavior ?? "downloads") === value}
                     onClick={() => setInstallClickBehavior(value)}
                   >
                     {label}
-                  </button>
+                  </SegmentTab>
                 ))}
-              </div>
+              </Segment>
             </div>
             <div className="setting-block">
               <span>Recent downloads</span>
@@ -8231,30 +8336,6 @@ export default function App() {
               Autoclick free download button in Download Assist (Nexus Fast
               Download–style; waits for countdown)
             </label>
-            <div className="actions">
-              <button
-                type="button"
-                disabled={Boolean(assistQueue && !assistQueue.cancelled)}
-                title={
-                  assistQueue && !assistQueue.cancelled
-                    ? "Finish or cancel the Download Assist queue before signing in."
-                    : undefined
-                }
-                onClick={() => setNexusLoginOpen(true)}
-              >
-                Log in to Nexus
-              </button>
-              <button
-                type="button"
-                onClick={() =>
-                  withBusy("Clearing Nexus website session…", async () => {
-                    await api.clearAssistSession();
-                  })
-                }
-              >
-                Clear Nexus website session
-              </button>
-            </div>
             <div className="setting-block">
               <span>Mod recovery</span>
               <p className="note">
@@ -8333,7 +8414,7 @@ export default function App() {
             <p className="note">
               Free accounts: Install opens the Downloads workspace with an embedded
               Nexus Assist panel. Sign in once with Stay signed in, using Log in to
-              Nexus above or that panel. The website session is saved separately
+              Nexus in Accounts or that panel. The website session is saved separately
               from your API key. Autoclick can press Slow download
               for you. Premium: one-click Install and Collections. Register{" "}
               <code>nxm://</code> via the desktop entry for browser “Download with
@@ -8341,7 +8422,7 @@ export default function App() {
             </p>
           </section>
         )}
-        </ViewSlot>
+        </ViewSwitch>
         ) : null}
       </main>
       {loadDiagnosis && (

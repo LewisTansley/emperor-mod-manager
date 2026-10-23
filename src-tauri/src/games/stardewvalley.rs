@@ -103,6 +103,26 @@ impl GamePlugin for StardewValleyPlugin {
 
         Ok(install_path.join("Mods").join(&normalized))
     }
+
+    fn prepare_runtime<'a>(
+        &'a self,
+        ctx: &'a super::RuntimePrep<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<super::RuntimePrepOutcome>> + Send + 'a>,
+    > {
+        let install = super::smapi_install::should_auto_install_smapi(
+            ctx.install_path,
+            ctx.content_roots,
+            |root| self.allows_empty_deploy(root),
+        );
+        Box::pin(async move {
+            if !install {
+                return Ok(super::RuntimePrepOutcome::Done(Vec::new()));
+            }
+            let warnings = super::smapi_install::ensure_smapi(ctx.paths, ctx.install_path).await;
+            Ok(super::RuntimePrepOutcome::Done(warnings))
+        })
+    }
 }
 
 /// True when the game install already has SMAPI.

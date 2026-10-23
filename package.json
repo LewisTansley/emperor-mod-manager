@@ -1,7 +1,7 @@
 {
   "name": "emperor-mod-manager",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.6.0",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "scripts": {
@@ -23,6 +23,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-opener": "^2",
     "dompurify": "^3.4.13",
+    "motion": "^14.6.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

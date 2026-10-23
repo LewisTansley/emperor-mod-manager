@@ -8,12 +8,15 @@ export type AppInfo = {
   linux_only: boolean;
 };
 
+export type AppInstallVia = "pacman" | "deb" | "appimage" | "portable" | "nsis";
+
 export type AppUpdateStatus = {
   current_version: string;
   latest_version: string | null;
   update_available: boolean;
   asset_name: string | null;
   release_url: string | null;
+  install_via: AppInstallVia | null;
 };
 
 export type AppInstallResult = {
@@ -779,6 +782,8 @@ export type Settings = {
   recent_downloads_limit?: number;
   has_api_key: boolean;
   has_modio_api_key?: boolean;
+  initial_setup_complete: boolean;
+  nexus_website_signed_in: boolean;
   user: NexusUser | null;
   config_dir: string;
   data_dir: string;

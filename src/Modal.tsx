@@ -1,5 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { MOTION_EASE, MOTION_FAST } from "./motion";
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -19,10 +21,20 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
   const opener = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const reduced = useReducedMotion() === true;
+  const reducedRef = useRef(reduced);
+  reducedRef.current = reduced;
+  const [open, setOpen] = useState(true);
+  const requestCloseRef = useRef(() => {});
 
   function requestClose() {
-    onCloseRef.current();
+    if (reducedRef.current) {
+      onCloseRef.current();
+      return;
+    }
+    setOpen(false);
   }
+  requestCloseRef.current = requestClose;
 
   useEffect(() => {
     opener.current = document.activeElement as HTMLElement | null;
@@ -35,7 +47,7 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        requestClose();
+        requestCloseRef.current();
         return;
       }
       if (e.key !== "Tab" || !dialogRef.current) return;
@@ -65,32 +77,47 @@ export function Modal({ title, subtitle, className, onClose, children, footer }:
     };
   }, []);
 
+  const pop = { duration: reduced ? 0 : MOTION_FAST, ease: MOTION_EASE };
+
   return createPortal(
-    <div
-      className="modal-backdrop"
-      onMouseDown={(e) => e.target === e.currentTarget && requestClose()}
-    >
-      <div
-        className={className ? `modal ${className}` : "modal"}
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        tabIndex={-1}
-        ref={dialogRef}
-      >
-        <div className="modal-head">
-          <div>
-            <h2>{title}</h2>
-            {subtitle ? <small>{subtitle}</small> : null}
-          </div>
-          <button type="button" className="linkish" onClick={requestClose} aria-label="Close">
-            Close
-          </button>
-        </div>
-        <div className="modal-body">{children}</div>
-        {footer ? <div className="modal-foot">{footer}</div> : null}
-      </div>
-    </div>,
+    <AnimatePresence onExitComplete={() => onCloseRef.current()}>
+      {open ? (
+        <motion.div
+          key="modal"
+          className="modal-backdrop"
+          initial={reduced ? false : { opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={reduced ? { opacity: 1 } : { opacity: 0 }}
+          transition={pop}
+          onMouseDown={(e) => e.target === e.currentTarget && requestClose()}
+        >
+          <motion.div
+            className={className ? `modal ${className}` : "modal"}
+            role="dialog"
+            aria-modal="true"
+            aria-label={title}
+            tabIndex={-1}
+            ref={dialogRef}
+            initial={reduced ? false : { opacity: 0, scale: 0.98 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={reduced ? { opacity: 1, scale: 1 } : { opacity: 0, scale: 0.98 }}
+            transition={pop}
+          >
+            <div className="modal-head">
+              <div>
+                <h2>{title}</h2>
+                {subtitle ? <small>{subtitle}</small> : null}
+              </div>
+              <button type="button" className="linkish" onClick={requestClose} aria-label="Close">
+                Close
+              </button>
+            </div>
+            <div className="modal-body">{children}</div>
+            {footer ? <div className="modal-foot">{footer}</div> : null}
+          </motion.div>
+        </motion.div>
+      ) : null}
+    </AnimatePresence>,
     document.body,
   );
 }

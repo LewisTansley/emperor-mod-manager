@@ -1468,7 +1468,6 @@ pub fn unmanage_game(state: State<'_, AppState>, id: String) -> Result<(), Strin
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let cfg = state.config.lock().map_err(|e| e.to_string())?;
     let has_key = state.api_key.lock().map_err(|e| e.to_string())?.is_some();
     let has_modio_api_key = state
         .modio_api_key
@@ -1476,6 +1475,12 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         .map_err(|e| e.to_string())?
         .is_some();
     let user = state.user.lock().map_err(|e| e.to_string())?.clone();
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    let initial_setup_complete = config::resolve_initial_setup(cfg.initial_setup_complete, has_key);
+    if cfg.initial_setup_complete.is_none() {
+        cfg.initial_setup_complete = Some(initial_setup_complete);
+        config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    }
     Ok(serde_json::json!({
         "adult_content": cfg.adult_content,
         "game_version_warnings": cfg.game_version_warnings,
@@ -1486,12 +1491,25 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "recent_downloads_limit": config::clamp_recent_downloads_limit(cfg.recent_downloads_limit),
         "has_api_key": has_key,
         "has_modio_api_key": has_modio_api_key,
+        "initial_setup_complete": initial_setup_complete,
+        "nexus_website_signed_in": cfg.nexus_website_signed_in,
         "user": user,
         "config_dir": state.paths.config_dir,
         "data_dir": state.paths.data_dir,
         "cache_dir": state.paths.cache_dir,
         "platform_linux": cfg!(target_os = "linux"),
     }))
+}
+
+#[tauri::command]
+pub fn complete_initial_setup(state: State<'_, AppState>) -> Result<(), String> {
+    let has_key = state.api_key.lock().map_err(|e| e.to_string())?.is_some();
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    if !has_key || !cfg.nexus_website_signed_in {
+        return Err("Save a Nexus API key and finish website sign-in before leaving setup.".into());
+    }
+    cfg.initial_setup_complete = Some(true);
+    config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

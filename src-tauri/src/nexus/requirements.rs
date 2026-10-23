@@ -218,6 +218,64 @@ fn nexus_page_url(domain: &str, mod_id: u64, given: &str) -> String {
     format!("https://www.nexusmods.com/{domain}/mods/{mod_id}")
 }
 
+/// `https://www.nexusmods.com/{domain}/mods/{id}`, plus a trailing slash, query, or hash.
+/// The id in an off-site requirement row is not the mod id; this path is.
+fn parse_nexus_mod_url(raw: &str) -> Option<(String, u64)> {
+    let raw = raw.trim().trim_start_matches('\u{feff}');
+    let parsed = url::Url::parse(raw).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "nexusmods.com" && !host.ends_with(".nexusmods.com") {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?;
+    let domain = segments.next()?;
+    if domain.is_empty() || !domain.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if segments.next()? != "mods" {
+        return None;
+    }
+    let id_seg = segments.next()?;
+    if segments.any(|segment| !segment.is_empty()) {
+        return None;
+    }
+    let mod_id = id_seg.parse().ok()?;
+    if mod_id == 0 {
+        return None;
+    }
+    Some((domain.to_ascii_lowercase(), mod_id))
+}
+
+fn domain_to_game_id(domains: &HashMap<u64, String>) -> HashMap<String, u64> {
+    domains
+        .iter()
+        .map(|(id, domain)| (domain.to_lowercase(), *id))
+        .collect()
+}
+
+/// Turn an off-site row whose URL is a Nexus mod page into a normal requirement.
+/// Already-locatable Nexus rows are left alone. Unknown domains stay links.
+fn promote_nexus_links(page: &mut RequirementPage, domains: &HashMap<u64, String>) {
+    let by_domain = domain_to_game_id(domains);
+    for node in &mut page.nodes {
+        if !node.external && locatable_mod(node.game_id, node.mod_id) {
+            continue;
+        }
+        let Some((domain, mod_id)) = parse_nexus_mod_url(&node.url) else {
+            continue;
+        };
+        let Some(&game_id) = by_domain.get(&domain) else {
+            continue;
+        };
+        node.external = false;
+        node.game_id = game_id;
+        node.mod_id = mod_id;
+    }
+}
+
 fn push_unique(list: &mut Vec<String>, value: &str) {
     if value.is_empty() || list.iter().any(|s| s == value) {
         return;
@@ -682,7 +740,8 @@ pub async fn collect_missing(
             break;
         }
         match client.mod_requirements(game_id, mod_id).await {
-            Ok(page) => {
+            Ok(mut page) => {
+                promote_nexus_links(&mut page, domains);
                 for node in &page.nodes {
                     if !node.external && locatable_mod(node.game_id, node.mod_id) {
                         queue.push_back((node.game_id, node.mod_id));
@@ -1162,5 +1221,139 @@ mod tests {
         assert!(!locatable_mod(0, 9863));
         assert!(!locatable_mod(1704, 0));
         assert!(locatable_mod(1704, 9863));
+    }
+
+    #[test]
+    fn parses_nexus_mod_page_urls() {
+        assert_eq!(
+            parse_nexus_mod_url("https://www.nexusmods.com/stardewvalley/mods/999"),
+            Some(("stardewvalley".into(), 999))
+        );
+        assert_eq!(
+            parse_nexus_mod_url("https://nexusmods.com/stardewvalley/mods/1726/"),
+            Some(("stardewvalley".into(), 1726))
+        );
+        assert_eq!(
+            parse_nexus_mod_url("http://www.nexusmods.com/stardewvalley/mods/2400?tab=description"),
+            Some(("stardewvalley".into(), 2400))
+        );
+        assert_eq!(
+            parse_nexus_mod_url("https://www.nexusmods.com/stardewvalley/mods/2400#files"),
+            Some(("stardewvalley".into(), 2400))
+        );
+        assert_eq!(parse_nexus_mod_url("https://skse.silverlock.org/"), None);
+        assert_eq!(
+            parse_nexus_mod_url("https://www.nexusmods.com/stardewvalley"),
+            None
+        );
+        assert_eq!(
+            parse_nexus_mod_url("https://www.nexusmods.com/stardewvalley/mods/0"),
+            None
+        );
+        assert_eq!(
+            parse_nexus_mod_url("https://staticdelivery.nexusmods.com/mods/1303/images/1.jpg"),
+            None
+        );
+    }
+
+    #[test]
+    fn offsite_nexus_urls_become_downloads_and_ignore_bogus_ids() {
+        let mut page = RequirementPage {
+            nodes: vec![
+                node(
+                    true,
+                    0,
+                    0,
+                    "Portraiture",
+                    "https://www.nexusmods.com/stardewvalley/mods/999",
+                ),
+                node(
+                    true,
+                    99,
+                    123_456,
+                    "PyTK",
+                    "https://nexusmods.com/stardewvalley/mods/1726/",
+                ),
+                node(
+                    true,
+                    0,
+                    1,
+                    "SMAPI",
+                    "http://www.nexusmods.com/stardewvalley/mods/2400?tab=files",
+                ),
+                node(true, 1, 0, "SKSE", "https://skse.silverlock.org/"),
+            ],
+            total_count: 4,
+            dlc: vec![],
+        };
+        let mut domains = HashMap::new();
+        domains.insert(1303, "stardewvalley".into());
+        promote_nexus_links(&mut page, &domains);
+        assert_eq!(page.nodes[1].mod_id, 1726);
+        assert_ne!(page.nodes[1].mod_id, 123_456);
+        assert!(!page.nodes[2].external);
+        assert_eq!(page.nodes[2].mod_id, 2400);
+
+        let mut pages = HashMap::new();
+        pages.insert((1303, 4745), page);
+        pages.insert((1303, 999), RequirementPage::default());
+        pages.insert((1303, 1726), RequirementPage::default());
+        pages.insert((1303, 2400), RequirementPage::default());
+        let mut files = HashMap::new();
+        files.insert(("stardewvalley".into(), 999), vec![file(1, "MAIN", true)]);
+        files.insert(("stardewvalley".into(), 1726), vec![file(2, "MAIN", true)]);
+        files.insert(("stardewvalley".into(), 2400), vec![file(3, "MAIN", true)]);
+        let missing = assemble_missing(
+            &[root("1", "DCBurger", 1303, 4745)],
+            &pages,
+            &files,
+            &domains,
+            &HashMap::new(),
+        );
+        let ids: Vec<u64> = missing.nexus.iter().map(|row| row.mod_id).collect();
+        assert_eq!(ids, vec![999, 1726, 2400]);
+        assert_eq!(missing.external.len(), 1);
+        assert_eq!(missing.external[0].name, "SKSE");
+        assert_eq!(missing.external[0].url, "https://skse.silverlock.org/");
+    }
+
+    #[test]
+    fn locatable_nexus_requirement_keeps_its_mod_id() {
+        let mut page = RequirementPage {
+            nodes: vec![node(
+                false,
+                1303,
+                42,
+                "Real",
+                "https://www.nexusmods.com/stardewvalley/mods/999",
+            )],
+            total_count: 1,
+            dlc: vec![],
+        };
+        let mut domains = HashMap::new();
+        domains.insert(1303, "stardewvalley".into());
+        promote_nexus_links(&mut page, &domains);
+        assert!(!page.nodes[0].external);
+        assert_eq!(page.nodes[0].mod_id, 42);
+    }
+
+    #[test]
+    fn nexus_url_for_an_unknown_game_stays_a_link() {
+        let mut page = RequirementPage {
+            nodes: vec![node(
+                true,
+                0,
+                0,
+                "SkyUI",
+                "https://www.nexusmods.com/skyrim/mods/20",
+            )],
+            total_count: 1,
+            dlc: vec![],
+        };
+        let mut domains = HashMap::new();
+        domains.insert(1303, "stardewvalley".into());
+        promote_nexus_links(&mut page, &domains);
+        assert!(page.nodes[0].external);
+        assert_eq!(page.nodes[0].mod_id, 0);
     }
 }

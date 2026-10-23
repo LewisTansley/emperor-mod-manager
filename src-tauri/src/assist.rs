@@ -953,9 +953,7 @@ fn clear_pending_assist_url(app: &tauri::AppHandle) {
 fn store_pending_assist_url(state: &AppState, url: &url::Url) {
     match state.assist_pending_url.lock() {
         Ok(mut pending) => {
-            state
-                .assist_hide_until_loaded
-                .store(true, Ordering::SeqCst);
+            state.assist_hide_until_loaded.store(true, Ordering::SeqCst);
             *pending = Some(url.to_string());
         }
         Err(_) => release_assist_load_hold(state),
@@ -1136,6 +1134,9 @@ fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
         });
         if !still {
             return;
+        }
+        if let Err(e) = set_nexus_website_signed_in(&state, true) {
+            log::warn!("nexus website sign-in flag: {e}");
         }
         let _ = app.emit("nexus-login-complete", ());
         let _ = close_assist_intentionally(&app, &state);
@@ -1697,9 +1698,7 @@ pub async fn open_download_assist_inner(
         target_os = "openbsd"
     ))]
     {
-        state
-            .assist_hide_until_loaded
-            .store(true, Ordering::SeqCst);
+        state.assist_hide_until_loaded.store(true, Ordering::SeqCst);
         if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, false) {
             release_assist_load_hold(state);
             return Err(e);
@@ -1880,9 +1879,7 @@ pub async fn open_nexus_website_login(
         target_os = "openbsd"
     ))]
     {
-        state
-            .assist_hide_until_loaded
-            .store(true, Ordering::SeqCst);
+        state.assist_hide_until_loaded.store(true, Ordering::SeqCst);
         if let Err(e) = crate::linux_embed::attach_assist(&window, bounds, false) {
             release_assist_load_hold(&state);
             let _ = take_assist_context(&state);
@@ -1922,7 +1919,16 @@ pub fn clear_assist_session(
         fs::remove_dir_all(&dir).map_err(|e| format!("clear assist session: {e}"))?;
     }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(())
+    set_nexus_website_signed_in(&state, false)
+}
+
+fn set_nexus_website_signed_in(state: &AppState, signed_in: bool) -> Result<(), String> {
+    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+    if cfg.nexus_website_signed_in == signed_in {
+        return Ok(());
+    }
+    cfg.nexus_website_signed_in = signed_in;
+    crate::config::save_config(&state.paths, &cfg).map_err(|e| e.to_string())
 }
 
 /// Used by the app-level `nxm` URI scheme protocol.

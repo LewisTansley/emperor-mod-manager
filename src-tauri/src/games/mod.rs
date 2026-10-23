@@ -37,6 +37,7 @@ mod sevendaystodie;
 mod sims3;
 mod sims4;
 mod sims_framework;
+mod smapi_install;
 mod snowrunner;
 mod spaceengineers;
 mod stardewvalley;

@@ -138,6 +138,10 @@ export function stagedIgnoreKey(stagedId: string): string {
   return `staged:${stagedId}`;
 }
 
+export function versionIgnoreKey(stagedId: string): string {
+  return `version:${stagedId}`;
+}
+
 function ignoredKeys(ignored: IgnoredRequirement[]): Set<string> {
   return new Set(ignored.map((row) => row.key));
 }
@@ -164,6 +168,15 @@ export function withoutIgnoredDisabled(
   const keys = ignoredKeys(ignored);
   if (keys.size === 0) return disabled;
   return disabled.filter((row) => !keys.has(stagedIgnoreKey(row.stagedId)));
+}
+
+export function withoutIgnoredVersions(
+  versions: GameVersionWarning[],
+  ignored: IgnoredRequirement[],
+): GameVersionWarning[] {
+  const keys = ignoredKeys(ignored);
+  if (keys.size === 0) return versions;
+  return versions.filter((row) => !keys.has(versionIgnoreKey(row.stagedId)));
 }
 
 export function requirementsNeedAttention(
@@ -320,6 +333,10 @@ export function RequirementsDialog({
   const visibleDisabled = useMemo(
     () => withoutIgnoredDisabled(disabled, ignored),
     [disabled, ignored],
+  );
+  const visibleVersions = useMemo(
+    () => withoutIgnoredVersions(versions, ignored),
+    [versions, ignored],
   );
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const nexusKeys = useMemo(
@@ -561,16 +578,37 @@ export function RequirementsDialog({
           </ul>
         </>
       )}
-      {versions.length > 0 && (
+      {visibleVersions.length > 0 && (
         <details className="requirements-versions" open>
-          <summary>Game version ({versions.length})</summary>
+          <summary>Game version ({visibleVersions.length})</summary>
+          {visibleVersions.length > 1 && (
+            <div className="requirements-select-all">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onDisable(visibleVersions.map((row) => row.stagedId))}
+              >
+                Disable all
+              </button>
+            </div>
+          )}
           <ul className="list requirements-list">
-            {versions.map((row) => (
+            {visibleVersions.map((row) => (
               <li key={row.stagedId}>
                 <div>
                   <strong>{row.name}</strong>
                   <small>{row.message}</small>
                 </div>
+                <IgnoreButton
+                  entry={ignoreEntry(versionIgnoreKey(row.stagedId), row.name)}
+                  busy={busy}
+                  onIgnore={onIgnore}
+                />
+                <DisableButton
+                  ids={[row.stagedId]}
+                  busy={busy}
+                  onDisable={onDisable}
+                />
               </li>
             ))}
           </ul>
@@ -580,7 +618,7 @@ export function RequirementsDialog({
         visibleRequirements.external.length +
         visibleRequirements.dlc.length +
         visibleDisabled.length +
-        versions.length ===
+        visibleVersions.length ===
         0 &&
         !requirements.error && <p className="note">No missing requirements.</p>}
     </Modal>

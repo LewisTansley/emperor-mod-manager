@@ -49,11 +49,11 @@ curl -fsSL -o PKGBUILD https://github.com/LewisTansley/emperor-mod-manager/relea
 makepkg -si
 ```
 
-Pin a version with `EMM_VERSION=0.4.0` before the installer, update by re-running it, and uninstall with `sudo pacman -R emperor-mod-manager-bin`. The in-app updater only replaces an AppImage, so a pacman install should be updated through pacman.
+Pin a version with `EMM_VERSION=0.4.0` before the installer, and uninstall with `sudo pacman -R emperor-mod-manager-bin`. After the first install, Settings → Check for updates builds the new release with `makepkg` and installs it with pacman. That still needs `base-devel`, and asks for your password once. You can also update by re-running this installer.
 
 ### Other Linux distros
 
-Grab the `.deb` or `.AppImage` from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest). Each release also ships `emperor-mod-manager-<version>-x86_64.tar.gz` (binary, desktop entry, icons) with a `SHA256SUMS` file if you package it yourself.
+Grab the `.deb` or `.AppImage` from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest). Each release also ships `emperor-mod-manager-<version>-x86_64.tar.gz` (binary, desktop entry, icons) with a `SHA256SUMS` file if you package it yourself. Settings updates a `.deb` with apt, replaces an AppImage in place, or replaces a user-writable copy of the binary from that tarball.
 
 ### Windows
 

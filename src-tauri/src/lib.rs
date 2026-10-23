@@ -78,6 +78,7 @@ pub fn run() {
             commands::get_game_health,
             commands::relink_managed_game,
             commands::get_settings,
+            commands::complete_initial_setup,
             commands::set_adult_content,
             commands::set_game_version_warnings,
             commands::set_theme,

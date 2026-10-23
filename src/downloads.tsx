@@ -301,7 +301,11 @@ export function DownloadsWorkspace(props: DownloadsWorkspaceProps) {
                       >
                         <div
                           className="downloads-progress-bar"
-                          style={pct != null ? { width: `${pct}%` } : undefined}
+                          style={
+                            pct != null
+                              ? { transform: `scaleX(${Math.min(100, Math.max(0, pct)) / 100})` }
+                              : undefined
+                          }
                         />
                       </div>
                     </div>
