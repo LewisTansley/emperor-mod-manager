@@ -11,9 +11,10 @@ pub(crate) mod steam_launch;
 #[cfg(target_os = "linux")]
 mod sync;
 
-pub use autohdr_vk::{AutoHdrVkConfig, AutoHdrVkConfigDto, AutoHdrVkGlobal, AutoHdrVkProfile};
-pub use lsfg_vk::{LsfgVkConfig, LsfgVkConfigDto, LsfgVkGlobal, LsfgVkProfile};
-pub use manifest::{ToolInstallRecord, ToolsManifest};
+pub use autohdr_vk::{AutoHdrVkConfig, AutoHdrVkConfigDto};
+pub use lsfg_vk::{LsfgVkConfig, LsfgVkConfigDto};
+#[cfg(target_os = "linux")]
+use manifest::ToolsManifest;
 
 use serde::Serialize;
 use tauri::State;
@@ -146,6 +147,7 @@ pub fn get_tools_status(state: State<'_, AppState>) -> Result<ToolsStatusRespons
 pub async fn check_tool_updates(state: State<'_, AppState>) -> Result<ToolUpdatesResponse, String> {
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = state;
         return Err("Tools are only supported on Linux".to_string());
     }
     #[cfg(target_os = "linux")]

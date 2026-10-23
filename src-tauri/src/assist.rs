@@ -1040,6 +1040,7 @@ fn apply_assist_bounds(
         target_os = "openbsd"
     )))]
     {
+        let _ = app;
         webview
             .set_bounds(Rect {
                 position: LogicalPosition::new(bounds.x, bounds.y).into(),

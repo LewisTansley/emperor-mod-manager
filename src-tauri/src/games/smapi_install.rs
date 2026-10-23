@@ -17,6 +17,7 @@ use crate::github_release::{self, GhAsset, GhRelease};
 use crate::tools::install as tool_install;
 
 const SMAPI_REPO: &str = "Pathoschild/SMAPI";
+#[cfg(target_os = "linux")]
 const STARDEW_STEAM_APP_ID: &str = "413150";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,35 +346,46 @@ pub fn smapi_launch_options(existing: &str, exe: &Path) -> String {
 }
 
 fn ensure_windows_launch(install_path: &Path) -> Vec<String> {
-    use crate::tools::steam_launch::{read_launch_options, write_launch_options};
-
-    let exe = install_path.join("StardewModdingAPI.exe");
-    let app_id =
-        crate::tools::executables::steam_app_id_from_install(&install_path.to_string_lossy())
-            .unwrap_or_else(|| STARDEW_STEAM_APP_ID.to_string());
-    let existing = match read_launch_options(&app_id) {
-        Ok(value) => value.unwrap_or_default(),
-        Err(e) => {
-            let manual = smapi_launch_options("", &exe);
-            return vec![format!(
-                "Could not read Steam launch options ({e:#}). Set {manual} manually."
-            )];
-        }
-    };
-    if existing
-        .to_ascii_lowercase()
-        .contains("stardewmoddingapi.exe")
+    #[cfg(not(target_os = "linux"))]
     {
-        return Vec::new();
+        let exe = install_path.join("StardewModdingAPI.exe");
+        let manual = smapi_launch_options("", &exe);
+        vec![format!(
+            "Set Steam launch options to {manual} so the game starts with SMAPI."
+        )]
     }
-    let updated = smapi_launch_options(&existing, &exe);
-    match write_launch_options(&app_id, &updated) {
-        Ok(()) => vec![format!(
-            "Updated Steam launch options to {updated} so the game starts with SMAPI."
-        )],
-        Err(e) => vec![format!(
-            "Steam launch options need {updated}. Could not write them automatically ({e:#})."
-        )],
+    #[cfg(target_os = "linux")]
+    {
+        use crate::tools::steam_launch::{read_launch_options, write_launch_options};
+
+        let exe = install_path.join("StardewModdingAPI.exe");
+        let app_id =
+            crate::tools::executables::steam_app_id_from_install(&install_path.to_string_lossy())
+                .unwrap_or_else(|| STARDEW_STEAM_APP_ID.to_string());
+        let existing = match read_launch_options(&app_id) {
+            Ok(value) => value.unwrap_or_default(),
+            Err(e) => {
+                let manual = smapi_launch_options("", &exe);
+                return vec![format!(
+                    "Could not read Steam launch options ({e:#}). Set {manual} manually."
+                )];
+            }
+        };
+        if existing
+            .to_ascii_lowercase()
+            .contains("stardewmoddingapi.exe")
+        {
+            return Vec::new();
+        }
+        let updated = smapi_launch_options(&existing, &exe);
+        match write_launch_options(&app_id, &updated) {
+            Ok(()) => vec![format!(
+                "Updated Steam launch options to {updated} so the game starts with SMAPI."
+            )],
+            Err(e) => vec![format!(
+                "Steam launch options need {updated}. Could not write them automatically ({e:#})."
+            )],
+        }
     }
 }
 

@@ -99,7 +99,9 @@ pub use unreal_engine::{
     Stalker2HeartOfChornobylPlugin, Subnautica2Plugin, UeLayoutInfo, UnrealEnginePlugin,
 };
 pub use warhammer40kdarktide::Warhammer40kDarktidePlugin;
-pub use wine_overrides::{advise_wine_overrides, StagedProxySource, WineOverrideAdvice};
+pub use wine_overrides::WineOverrideAdvice;
+#[cfg(target_os = "linux")]
+pub use wine_overrides::{advise_wine_overrides, StagedProxySource};
 pub use witcher3::Witcher3Plugin;
 
 /// What `deploy_mods` knows about the install while a plugin prepares it.

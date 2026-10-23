@@ -5418,19 +5418,29 @@ pub fn apply_wine_overrides(
     state: State<'_, AppState>,
     game_id: String,
 ) -> Result<Option<games::WineOverrideAdvice>, String> {
-    let prepared = prepare_wine_overrides(&state, &game_id)?;
-    let Some(advice) = prepared.advice else {
-        return Ok(None);
-    };
-    if !advice.can_apply {
-        return Err("No Steam app id for this install. Copy the launch options instead.".into());
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, game_id);
+        Ok(None)
     }
-    let app_id = prepared.app_id.ok_or_else(|| {
-        "No Steam app id for this install. Copy the launch options instead.".to_string()
-    })?;
-    crate::tools::steam_launch::write_launch_options(&app_id, &advice.launch_options)
-        .map_err(|e| e.to_string())?;
-    Ok(prepare_wine_overrides(&state, &game_id)?.advice)
+    #[cfg(target_os = "linux")]
+    {
+        let prepared = prepare_wine_overrides(&state, &game_id)?;
+        let Some(advice) = prepared.advice else {
+            return Ok(None);
+        };
+        if !advice.can_apply {
+            return Err(
+                "No Steam app id for this install. Copy the launch options instead.".into(),
+            );
+        }
+        let app_id = prepared.app_id.ok_or_else(|| {
+            "No Steam app id for this install. Copy the launch options instead.".to_string()
+        })?;
+        crate::tools::steam_launch::write_launch_options(&app_id, &advice.launch_options)
+            .map_err(|e| e.to_string())?;
+        Ok(prepare_wine_overrides(&state, &game_id)?.advice)
+    }
 }
 
 enum PosterLookup {
