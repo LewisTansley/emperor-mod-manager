@@ -1103,6 +1103,68 @@ fn nexus_website_login_succeeded(url: &str, cookie_names: &[String]) -> bool {
         && has_nexus_session_cookie(cookie_names)
 }
 
+fn nexus_cookie_probe_urls() -> Vec<url::Url> {
+    ["https://www.nexusmods.com/", "https://users.nexusmods.com/"]
+        .into_iter()
+        .filter_map(|raw| url::Url::parse(raw).ok())
+        .collect()
+}
+
+/// Cookie names from www + users Nexus hosts (session may land on either).
+fn nexus_session_cookie_names(webview: &Webview) -> Vec<String> {
+    let mut names = Vec::new();
+    for cookie_url in nexus_cookie_probe_urls() {
+        match webview.cookies_for_url(cookie_url.clone()) {
+            Ok(cookies) => {
+                for cookie in cookies {
+                    let name = cookie.name().to_string();
+                    if !names
+                        .iter()
+                        .any(|n: &String| n.eq_ignore_ascii_case(&name))
+                    {
+                        names.push(name);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "nexus login: cookies_for_url({}) failed: {e}",
+                    cookie_url.as_str()
+                );
+            }
+        }
+    }
+    names
+}
+
+fn try_complete_nexus_website_login(
+    app: &tauri::AppHandle,
+    webview: &Webview,
+    generation: u64,
+    done: &AtomicBool,
+) -> bool {
+    let Ok(current) = webview.url() else {
+        return false;
+    };
+    let href = current.as_str().to_string();
+    let names = nexus_session_cookie_names(webview);
+    if nexus_website_login_succeeded(&href, &names) {
+        if !done.swap(true, Ordering::SeqCst) {
+            schedule_nexus_login_close(app.clone(), generation);
+        }
+        return true;
+    }
+    if href.to_ascii_lowercase().contains("nexusmods.com")
+        && !is_nexus_login_url(&href)
+        && !has_nexus_session_cookie(&names)
+    {
+        log::warn!(
+            "nexus login: on post-login page without nexusmods_session yet ({href})"
+        );
+    }
+    false
+}
+
 fn nexus_sign_in_url() -> Result<url::Url, String> {
     "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F"
         .parse()
@@ -1144,16 +1206,15 @@ fn schedule_nexus_login_close(app: tauri::AppHandle, generation: u64) {
     });
 }
 
-fn poll_nexus_login_cookie(app: tauri::AppHandle, generation: u64, done: Arc<AtomicBool>) {
+/// Poll for the session cookie for the whole WebsiteLogin lifetime (not a short burst).
+fn watch_nexus_login_cookie(app: tauri::AppHandle, generation: u64, done: Arc<AtomicBool>) {
     tauri::async_runtime::spawn(async move {
-        let Ok(cookie_url) = url::Url::parse("https://www.nexusmods.com/") else {
-            return;
-        };
-        for _ in 0..12 {
+        let mut missing_session_logs = 0u32;
+        loop {
             if done.load(Ordering::SeqCst) {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             if done.load(Ordering::SeqCst) {
                 return;
             }
@@ -1166,24 +1227,32 @@ fn poll_nexus_login_cookie(app: tauri::AppHandle, generation: u64, done: Arc<Ato
             if !still {
                 return;
             }
+            // Webview may not be attached yet right after open; keep waiting.
             let Some(webview) = app.get_webview(ASSIST_LABEL) else {
-                return;
+                continue;
             };
             let Ok(current) = webview.url() else {
                 continue;
             };
-            let Ok(cookies) = webview.cookies_for_url(cookie_url.clone()) else {
-                continue;
-            };
-            let names = cookies
-                .iter()
-                .map(|cookie| cookie.name().to_string())
-                .collect::<Vec<_>>();
-            if nexus_website_login_succeeded(current.as_str(), &names)
-                && !done.swap(true, Ordering::SeqCst)
-            {
-                schedule_nexus_login_close(app, generation);
+            let href = current.as_str().to_string();
+            let names = nexus_session_cookie_names(&webview);
+            if nexus_website_login_succeeded(&href, &names) {
+                if !done.swap(true, Ordering::SeqCst) {
+                    schedule_nexus_login_close(app, generation);
+                }
                 return;
+            }
+            // Rate-limit noisy warns: once every ~15s while stuck on a post-login page.
+            if href.to_ascii_lowercase().contains("nexusmods.com")
+                && !is_nexus_login_url(&href)
+                && !has_nexus_session_cookie(&names)
+            {
+                missing_session_logs = missing_session_logs.saturating_add(1);
+                if missing_session_logs == 1 || missing_session_logs % 30 == 0 {
+                    log::warn!(
+                        "nexus login: waiting for nexusmods_session on {href} (cookies={names:?})"
+                    );
+                }
             }
         }
     });
@@ -1816,6 +1885,8 @@ pub async fn open_nexus_website_login(
 
     let handle_load = app.clone();
     let done = Arc::new(AtomicBool::new(false));
+    // One watcher for the whole WebsiteLogin lifetime; page-load only does an immediate check.
+    watch_nexus_login_cookie(app.clone(), generation, done.clone());
     builder = builder.on_page_load(move |webview, payload| {
         if payload.event() != PageLoadEvent::Finished {
             return;
@@ -1825,25 +1896,7 @@ pub async fn open_nexus_website_login(
         if is_nexus_login_url(&href) || !href.to_ascii_lowercase().contains("nexusmods.com") {
             return;
         }
-        let Ok(cookie_url) = url::Url::parse("https://www.nexusmods.com/") else {
-            return;
-        };
-        let names = webview
-            .cookies_for_url(cookie_url)
-            .map(|cookies| {
-                cookies
-                    .iter()
-                    .map(|cookie| cookie.name().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if nexus_website_login_succeeded(&href, &names) {
-            if !done.swap(true, Ordering::SeqCst) {
-                schedule_nexus_login_close(handle_load.clone(), generation);
-            }
-            return;
-        }
-        poll_nexus_login_cookie(handle_load.clone(), generation, done.clone());
+        let _ = try_complete_nexus_website_login(&handle_load, &webview, generation, &done);
     });
 
     #[cfg(any(
@@ -1921,6 +1974,52 @@ pub fn clear_assist_session(
     }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     set_nexus_website_signed_in(&state, false)
+}
+
+/// Manual confirm after the user finishes Nexus sign-in in the assist webview.
+/// Reuses the same URL + `nexusmods_session` check as auto-detect.
+#[tauri::command]
+pub fn confirm_nexus_website_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let ctx = peek_assist_context(&state).ok_or_else(|| {
+        "Nexus login window is not open. Open Log in to Nexus and sign in first.".to_string()
+    })?;
+    if !matches!(ctx.purpose, AssistPurpose::WebsiteLogin) {
+        return Err("Nexus login window is not open. Open Log in to Nexus and sign in first.".into());
+    }
+    let webview = app
+        .get_webview(ASSIST_LABEL)
+        .ok_or_else(|| "Nexus login window is not open.".to_string())?;
+    let current = webview
+        .url()
+        .map_err(|e| format!("Could not read Nexus login page: {e}"))?;
+    let href = current.as_str();
+    let names = nexus_session_cookie_names(&webview);
+    if !nexus_website_login_succeeded(href, &names) {
+        if is_nexus_login_url(href) {
+            return Err(
+                "Still on the Nexus sign-in page. Finish signing in (use Stay signed in), then try again."
+                    .into(),
+            );
+        }
+        if !has_nexus_session_cookie(&names) {
+            return Err(
+                "Nexus session cookie not found yet. Finish signing in with Stay signed in, wait for the site to load, then try again."
+                    .into(),
+            );
+        }
+        return Err(
+            "Nexus login is not complete yet. Finish signing in, then try again.".into(),
+        );
+    }
+    if let Err(e) = set_nexus_website_signed_in(&state, true) {
+        log::warn!("nexus website sign-in flag: {e}");
+        return Err(e);
+    }
+    let _ = app.emit("nexus-login-complete", ());
+    close_assist_intentionally(&app, &state)
 }
 
 fn set_nexus_website_signed_in(state: &AppState, signed_in: bool) -> Result<(), String> {
@@ -2091,6 +2190,42 @@ mod tests {
         assert!(!nexus_website_login_succeeded(
             "https://accounts.google.com/",
             &session
+        ));
+    }
+
+    #[test]
+    fn website_login_accepts_www_with_session_cookie_case_insensitive() {
+        let session = vec!["NexusMods_Session".to_string()];
+        assert!(nexus_website_login_succeeded(
+            "https://www.nexusmods.com/games",
+            &session
+        ));
+        assert!(has_nexus_session_cookie(&session));
+        assert!(!has_nexus_session_cookie(&[
+            "nexusmods_session_refresh".to_string()
+        ]));
+    }
+
+    #[test]
+    fn website_login_rejects_auth_paths_even_with_cookie() {
+        let session = vec!["nexusmods_session".to_string()];
+        assert!(is_nexus_login_url(
+            "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F"
+        ));
+        assert!(is_nexus_login_url(
+            "https://www.nexusmods.com/login"
+        ));
+        assert!(!nexus_website_login_succeeded(
+            "https://users.nexusmods.com/auth/sign_in?redirect_url=https%3A%2F%2Fwww.nexusmods.com%2F",
+            &session
+        ));
+    }
+
+    #[test]
+    fn website_login_rejects_missing_session_on_home() {
+        assert!(!nexus_website_login_succeeded(
+            "https://www.nexusmods.com/",
+            &["other_cookie".to_string()]
         ));
     }
 }

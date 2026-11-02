@@ -1170,6 +1170,7 @@ export default function App() {
   const nexusLoginOpenRef = useRef(false);
   const nexusLoginGenRef = useRef(0);
   const [nexusLoginOpen, setNexusLoginOpen] = useState(false);
+  const [nexusLoginConfirming, setNexusLoginConfirming] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
   const setupCompleteRef = useRef(false);
@@ -2279,10 +2280,26 @@ export default function App() {
   }, []);
 
   const closeNexusLogin = useCallback(() => {
+    // Invalidate any in-flight open before tearing down the native webview.
+    nexusLoginGenRef.current += 1;
     nexusLoginOpenRef.current = false;
+    setNexusLoginConfirming(false);
     setNexusLoginOpen(false);
     api.closeDownloadAssist().catch(() => {});
   }, []);
+
+  const confirmNexusLogin = useCallback(async () => {
+    if (!nexusLoginOpenRef.current || nexusLoginConfirming) return;
+    setNexusLoginConfirming(true);
+    try {
+      await api.confirmNexusWebsiteLogin();
+      // Backend emits nexus-login-complete; listener closes the modal.
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setNexusLoginConfirming(false);
+    }
+  }, [nexusLoginConfirming]);
 
   useEffect(() => {
     if (!nexusLoginOpen) return;
@@ -2307,7 +2324,11 @@ export default function App() {
       if (!stillOpen()) return;
       try {
         await api.openNexusWebsiteLogin();
-        if (!stillOpen()) return;
+        // Open can finish after the user dismissed the modal; destroy the orphan.
+        if (!stillOpen()) {
+          await api.closeDownloadAssist().catch(() => {});
+          return;
+        }
         await syncNexusLoginHost();
       } catch (e) {
         if (stillOpen()) {
@@ -2334,13 +2355,19 @@ export default function App() {
       window.visualViewport?.removeEventListener("resize", syncSoon);
       window.visualViewport?.removeEventListener("scroll", syncSoon);
       observer?.disconnect();
+      // Backstop: if this session was cancelled, ensure the native webview is gone.
+      if (!nexusLoginOpenRef.current) {
+        api.closeDownloadAssist().catch(() => {});
+      }
     };
   }, [nexusLoginOpen, syncNexusLoginHost]);
 
   useEffect(() => {
     const unlisten = listen("nexus-login-complete", () => {
       if (!nexusLoginOpenRef.current) return;
+      nexusLoginGenRef.current += 1;
       nexusLoginOpenRef.current = false;
+      setNexusLoginConfirming(false);
       setNexusLoginOpen(false);
       api.closeDownloadAssist().catch(() => {});
       void refreshSettings();
@@ -8795,6 +8822,25 @@ export default function App() {
           title="Log in to Nexus"
           subtitle="Use Stay signed in. This window closes after Nexus accepts the login."
           onClose={closeNexusLogin}
+          footer={
+            <div className="modal-foot-actions">
+              <button
+                type="button"
+                className="linkish"
+                onClick={closeNexusLogin}
+                disabled={nexusLoginConfirming}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmNexusLogin()}
+                disabled={nexusLoginConfirming}
+              >
+                {nexusLoginConfirming ? "Checking…" : "I've signed in"}
+              </button>
+            </div>
+          }
         >
           <div ref={nexusLoginHostRef} className="nexus-login-host">
             <p className="note">Opening Nexus…</p>

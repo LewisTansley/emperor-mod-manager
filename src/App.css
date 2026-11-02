@@ -865,7 +865,7 @@ ul.list.browse-virtual {
 
 .nexus-login-host {
   flex: 1;
-  min-height: min(40rem, calc(100vh - 6rem));
+  min-height: 0;
   border: 1px dashed var(--line);
   border-radius: 0.55rem;
   background: var(--panel);
