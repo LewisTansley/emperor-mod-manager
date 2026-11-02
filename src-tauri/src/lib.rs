@@ -126,6 +126,7 @@ pub fn run() {
             commands::delete_saved_collection,
             commands::handle_nxm,
             commands::import_mod_archive,
+            commands::import_mod_folder,
             commands::import_assist_download,
             commands::scan_mod_orphans,
             commands::clear_download_cache,

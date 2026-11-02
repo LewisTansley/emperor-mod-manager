@@ -5,13 +5,15 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import appLogo from "./assets/app-logo.png";
 import { AccountConnections } from "./AccountConnections";
+import { UpdateToast } from "./UpdateToast";
 import { api } from "./api";
 import { setupCanFinish } from "./setupGate";
 import {
@@ -40,6 +42,10 @@ import {
   ViewSwitch,
 } from "./motion";
 import { RichText } from "./RichText";
+import { BrowseVirtualGrid, BrowseVirtualList } from "./BrowseResults";
+import { estimateListRowHeight } from "./browseVirtual";
+import { AppNavHistory, type NavEntry } from "./appNavHistory";
+import { attachMouseNavigationListeners } from "./mouseNavigation";
 import { browseGameVersionOptions } from "./gameVersion";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
 import { Modal } from "./Modal";
@@ -552,7 +558,13 @@ function PlaceholderIcon() {
   );
 }
 
-function ListPoster({ src }: { src: string | null }) {
+function ListPoster({
+  src,
+  decoding,
+}: {
+  src: string | null;
+  decoding?: "async";
+}) {
   return (
     <div className="list-poster" aria-hidden="true">
       {src ? (
@@ -560,6 +572,7 @@ function ListPoster({ src }: { src: string | null }) {
           src={src}
           alt=""
           loading="lazy"
+          decoding={decoding}
           onError={(e) => {
             (e.currentTarget as HTMLImageElement).style.display = "none";
           }}
@@ -796,6 +809,8 @@ function MediaCard(props: {
   unsupported?: boolean;
   onClick?: () => void;
   enterIndex?: number;
+  /** Skip the motion wrapper. Browse virtualization mounts cards while scrolling. */
+  plain?: boolean;
 }) {
   const {
     title,
@@ -813,6 +828,7 @@ function MediaCard(props: {
     unsupported,
     onClick,
     enterIndex,
+    plain,
   } = props;
   const classes = [
     "media-card",
@@ -821,31 +837,29 @@ function MediaCard(props: {
   ]
     .filter(Boolean)
     .join(" ");
-  return (
-    <MotionCard
-      className={classes}
-      enterIndex={enterIndex}
-      onClick={onClick}
-      onKeyDown={
-        onClick
-          ? (e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onClick();
-              }
-            }
-          : undefined
+  const onKeyDown = onClick
+    ? (event: ReactKeyboardEvent<HTMLElement>) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick();
+        }
       }
-      role={onClick ? "button" : undefined}
-      tabIndex={onClick ? 0 : undefined}
-    >
+    : undefined;
+  const body = (
+    <>
       <div className="media-cover">
         {badge ? <span className="media-badge">{badge}</span> : null}
         {installed ? <span className="media-status">Installed</span> : null}
         {imageSrc ? (
-          <img src={imageSrc} alt="" loading="lazy" onError={(e) => {
-            (e.currentTarget as HTMLImageElement).style.display = "none";
-          }} />
+          <img
+            src={imageSrc}
+            alt=""
+            loading="lazy"
+            decoding={plain ? "async" : undefined}
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
+          />
         ) : (
           <PlaceholderIcon />
         )}
@@ -891,6 +905,31 @@ function MediaCard(props: {
           {actions}
         </div>
       ) : null}
+    </>
+  );
+  if (plain) {
+    return (
+      <article
+        className={classes}
+        onClick={onClick}
+        onKeyDown={onKeyDown}
+        role={onClick ? "button" : undefined}
+        tabIndex={onClick ? 0 : undefined}
+      >
+        {body}
+      </article>
+    );
+  }
+  return (
+    <MotionCard
+      className={classes}
+      enterIndex={enterIndex}
+      onClick={onClick}
+      onKeyDown={onKeyDown}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+    >
+      {body}
     </MotionCard>
   );
 }
@@ -985,6 +1024,7 @@ export default function App() {
   const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
   const [installingAppUpdate, setInstallingAppUpdate] = useState(false);
   const [appUpdateMessage, setAppUpdateMessage] = useState<string | null>(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const [error, setErrorMessage] = useState<string | null>(null);
   const [errorAction, setErrorAction] = useState<BannerAction | null>(null);
   const setError = useCallback((message: string | null, action?: BannerAction | null) => {
@@ -1074,6 +1114,7 @@ export default function App() {
   const [tagsOpen, setTagsOpen] = useState(false);
   const [browseTotalCount, setBrowseTotalCount] = useState(0);
   const [browseHasMore, setBrowseHasMore] = useState(false);
+  const [browsePageCount, setBrowsePageCount] = useState(24);
   const [browseSearched, setBrowseSearched] = useState(false);
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseMeta, setBrowseMeta] = useState<BrowseMeta | null>(null);
@@ -1132,6 +1173,21 @@ export default function App() {
   const tabRef = useRef(tab);
   tabRef.current = tab;
   const setupCompleteRef = useRef(false);
+  const navHistoryRef = useRef<AppNavHistory | null>(null);
+  const navBusyRef = useRef(false);
+  const skipHistoryPushRef = useRef(false);
+  const browseReturnTabRef = useRef(browseReturnTab);
+  browseReturnTabRef.current = browseReturnTab;
+  const browseDetailRef = useRef(browseDetail);
+  browseDetailRef.current = browseDetail;
+  const libraryDetailRef = useRef(libraryDetail);
+  libraryDetailRef.current = libraryDetail;
+  const gameSavedDetailRef = useRef(gameSavedDetail);
+  gameSavedDetailRef.current = gameSavedDetail;
+  const savedDetailRef = useRef(savedDetail);
+  savedDetailRef.current = savedDetail;
+  const managedRef = useRef(managed);
+  managedRef.current = managed;
 
   function rememberBrowseScroll() {
     if (!browseResultsVisibleRef.current) return;
@@ -1173,6 +1229,12 @@ export default function App() {
   searchQueryRef.current = searchQuery;
   const browseHasMoreRef = useRef(browseHasMore);
   browseHasMoreRef.current = browseHasMore;
+  const browsePageCountRef = useRef(browsePageCount);
+  browsePageCountRef.current = browsePageCount;
+  const onBrowsePageSize = useCallback((count: number) => {
+    browsePageCountRef.current = count;
+    setBrowsePageCount((prev) => (prev === count ? prev : count));
+  }, []);
   const browseOptsRef = useRef<BrowseSearchOpts>({
     sort: browseSort,
     category: browseCategory || null,
@@ -1242,12 +1304,168 @@ export default function App() {
     setBrowseReturnTab(null);
   }, [closeBrowseDetail]);
 
-  function leaveBrowseDetail() {
-    const returnTab = browseReturnTab;
-    setBrowseReturnTab(null);
-    closeBrowseDetail();
-    if (returnTab) setTab(returnTab);
+  function navTab(): NavEntry["tab"] {
+    return tabRef.current ?? "setup";
   }
+
+  function captureNavEntry(): NavEntry {
+    const detail = browseDetailRef.current;
+    const library = libraryDetailRef.current;
+    return {
+      tab: navTab(),
+      browseReturnTab: browseReturnTabRef.current,
+      browseDetail: detail
+        ? detail.kind === "mod"
+          ? { kind: "mod", hit: detail.hit, tab: detail.tab }
+          : { kind: "collection", hit: detail.hit, tab: detail.tab }
+        : null,
+      libraryDetail: library
+        ? { gameId: library.game.id, tab: library.tab }
+        : null,
+      gameSavedDetailId: gameSavedDetailRef.current?.entry.id ?? null,
+      savedDetailId: savedDetailRef.current?.entry.id ?? null,
+    };
+  }
+
+  function pushNavTarget(next: NavEntry) {
+    const journal = navHistoryRef.current;
+    if (!journal || skipHistoryPushRef.current) return;
+    journal.replaceCurrent(captureNavEntry());
+    journal.push(next);
+  }
+
+  async function restoreNavEntry(entry: NavEntry) {
+    navBusyRef.current = true;
+    skipHistoryPushRef.current = true;
+    try {
+      closeBrowseDetail();
+      setLibraryDetail(null);
+      setGameInfo(null);
+      setGameSavedDetail(null);
+      setSavedDetail(null);
+      setSavedRename("");
+      setBrowseReturnTab(entry.browseReturnTab);
+
+      if (entry.tab !== tabRef.current) {
+        setTabState(entry.tab);
+      }
+
+      if (entry.libraryDetail) {
+        const game = managedRef.current.find((g) => g.id === entry.libraryDetail!.gameId);
+        if (game) {
+          setLibraryDetail({ game, tab: entry.libraryDetail.tab });
+          if (entry.libraryDetail.tab === "collections") {
+            void refreshSavedCollections();
+          }
+          if (game.nexus_domain) {
+            try {
+              setGameInfo(await api.getGame(game.nexus_domain));
+            } catch {
+              /* Nexus metadata is optional */
+            }
+          }
+        }
+      }
+
+      if (entry.gameSavedDetailId) {
+        await openGameSavedCollection(entry.gameSavedDetailId, { skipHistoryPush: true });
+      }
+
+      if (entry.savedDetailId) {
+        await openSavedCollection(entry.savedDetailId, { skipHistoryPush: true });
+      }
+
+      if (entry.browseDetail) {
+        if (entry.browseDetail.kind === "mod") {
+          await openMod(entry.browseDetail.hit, entry.browseDetail.tab, {
+            skipHistoryPush: true,
+          });
+        } else {
+          await openCollection(entry.browseDetail.hit, entry.browseDetail.tab, {
+            skipHistoryPush: true,
+          });
+        }
+      } else if (entry.browseReturnTab) {
+        setBrowseReturnTab(null);
+      }
+    } finally {
+      skipHistoryPushRef.current = false;
+      navBusyRef.current = false;
+    }
+  }
+
+  async function navBack() {
+    if (navBusyRef.current) return;
+    const journal = navHistoryRef.current;
+    if (!journal) return;
+    const entry = journal.back();
+    if (!entry) return;
+    await restoreNavEntry(entry);
+  }
+
+  async function navForward() {
+    if (navBusyRef.current) return;
+    const journal = navHistoryRef.current;
+    if (!journal) return;
+    const entry = journal.forward();
+    if (!entry) return;
+    await restoreNavEntry(entry);
+  }
+
+  function tryCloseOverlayOnBack(): boolean {
+    if (quickInstall) {
+      setQuickInstall(null);
+      return true;
+    }
+    if (modOptionsFor) {
+      setModOptionsFor(null);
+      return true;
+    }
+    if (loadDiagnosis) {
+      setLoadDiagnosis(null);
+      return true;
+    }
+    if (requirementsModal) {
+      setRequirementsModal(null);
+      return true;
+    }
+    if (ignoredRequirementsOpen) {
+      setIgnoredRequirementsOpen(false);
+      return true;
+    }
+    if (relinkPrompt) {
+      setRelinkPrompt(null);
+      return true;
+    }
+    if (nexusLoginOpenRef.current) {
+      closeNexusLogin();
+      return true;
+    }
+    if (tagsOpen) {
+      setTagsOpen(false);
+      return true;
+    }
+    if (profileImportOpen) {
+      setProfileImportOpen(false);
+      return true;
+    }
+    if (shareExportOpen) {
+      setShareExportOpen(false);
+      return true;
+    }
+    if (shareImportOpen) {
+      setShareImportOpen(false);
+      return true;
+    }
+    return false;
+  }
+
+  const tryCloseOverlayOnBackRef = useRef(tryCloseOverlayOnBack);
+  tryCloseOverlayOnBackRef.current = tryCloseOverlayOnBack;
+  const navBackRef = useRef(navBack);
+  navBackRef.current = navBack;
+  const navForwardRef = useRef(navForward);
+  navForwardRef.current = navForward;
 
   const resetLibraryEphemeralState = useCallback(() => {
     setShareExportOpen(false);
@@ -1616,6 +1834,11 @@ export default function App() {
   }, [settings, tab]);
 
   useEffect(() => {
+    if (!settings?.initial_setup_complete) return;
+    void checkForAppUpdate(true);
+  }, [settings?.initial_setup_complete, checkForAppUpdate]);
+
+  useEffect(() => {
     if (tab !== "settings") return;
     void loadAppInfo();
     void checkForAppUpdate(true);
@@ -1910,6 +2133,28 @@ export default function App() {
       window.clearTimeout(id);
     };
   }, [tagsOpen]);
+
+  useEffect(() => {
+    navHistoryRef.current = new AppNavHistory(captureNavEntry());
+  }, []);
+
+  useEffect(() => {
+    if (skipHistoryPushRef.current || navBusyRef.current) return;
+    navHistoryRef.current?.replaceCurrent(captureNavEntry());
+  }, [tab, browseDetail, browseReturnTab, libraryDetail, gameSavedDetail, savedDetail]);
+
+  useEffect(() => {
+    return attachMouseNavigationListeners((direction) => {
+      if (!setupCompleteRef.current) return;
+      if (navBusyRef.current) return;
+      if (direction === "back") {
+        if (tryCloseOverlayOnBackRef.current()) return;
+        void navBackRef.current();
+        return;
+      }
+      void navForwardRef.current();
+    });
+  }, []);
 
   useEffect(() => {
     // List (and sentinel) unmount while browseDetail is open — re-bind on Back.
@@ -3163,11 +3408,21 @@ export default function App() {
 
   async function unmanageFromLibrary(game: ManagedGame) {
     await withBusy("Removing…", async () => {
+      const closedDetail = libraryDetail?.game.id === game.id;
+      const wasActive = activeId === game.id;
       await api.unmanageGame(game.id);
-      if (libraryDetail?.game.id === game.id) {
+      if (closedDetail) {
         closeLibraryDetail();
       }
-      await refreshManaged();
+      const list = await refreshManaged();
+      const settings = await refreshSettings();
+      const nextActive =
+        list.find((g) => g.id === settings.last_active_game_id) ?? list[0] ?? null;
+      setActiveId(nextActive?.id ?? null);
+      if (closedDetail || wasActive) {
+        setMods([]);
+        setInstalledCollections([]);
+      }
       await scan();
     });
   }
@@ -3363,7 +3618,11 @@ export default function App() {
 
     const requestId = ++browseRequestIdRef.current;
     const offset = append ? browseNextOffsetRef.current : 0;
-    const requestOpts: BrowseSearchOpts = { ...opts, offset };
+    const requestOpts: BrowseSearchOpts = {
+      ...opts,
+      offset,
+      count: browsePageCountRef.current,
+    };
     let appendOk = false;
 
     const applyModPage = (
@@ -3539,11 +3798,10 @@ export default function App() {
     }
   }
 
-  function isBrowseSentinelNearView(): boolean {
+  function isBrowseSentinelNearView(margin = 240): boolean {
     const sentinel = browseSentinelRef.current;
     const root = browseResultsRef.current;
     if (!sentinel || !root) return false;
-    const margin = 240;
     const rootRect = root.getBoundingClientRect();
     const sentRect = sentinel.getBoundingClientRect();
     return (
@@ -3551,6 +3809,33 @@ export default function App() {
       sentRect.bottom > rootRect.top - margin
     );
   }
+
+  useEffect(() => {
+    if (tab !== "browse" || browseDetail || !browseHasMore) return;
+    const loaded = browseMode === "mods" ? modHits.length : collectionHits.length;
+    if (loaded === 0) return;
+    const id = requestAnimationFrame(() => {
+      if (!isBrowseSentinelNearView(0)) return;
+      void runSearch(
+        browseModeRef.current,
+        searchQueryRef.current,
+        browseOptsRef.current,
+        true,
+      );
+    });
+    return () => cancelAnimationFrame(id);
+    // runSearch and the sentinel check read the latest filters through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    tab,
+    browseDetail,
+    browseHasMore,
+    browseMode,
+    browseView,
+    browsePageCount,
+    modHits.length,
+    collectionHits.length,
+  ]);
 
   async function search() {
     await runSearch();
@@ -3584,8 +3869,20 @@ export default function App() {
     });
   }
 
-  async function openMod(hit: CatalogHit, detailTab: DetailTab = "info") {
+  async function openMod(
+    hit: CatalogHit,
+    detailTab: DetailTab = "info",
+    opts?: { skipHistoryPush?: boolean; navOverrides?: Partial<NavEntry> },
+  ) {
     if (!activeGame) return;
+    if (!opts?.skipHistoryPush) {
+      pushNavTarget({
+        ...captureNavEntry(),
+        ...opts?.navOverrides,
+        tab: opts?.navOverrides?.tab ?? navTab(),
+        browseDetail: { kind: "mod", hit, tab: detailTab },
+      });
+    }
     rememberBrowseScroll();
     setBrowseDetail({ kind: "mod", hit, tab: detailTab });
     setModDetail(null);
@@ -3642,7 +3939,9 @@ export default function App() {
     if (!hit) return;
     setBrowseReturnTab("library");
     setTab("browse");
-    await openMod(hit, "info");
+    await openMod(hit, "info", {
+      navOverrides: { tab: "browse", browseReturnTab: "library" },
+    });
   }
 
   async function openRecentDownload(item: DownloadItem) {
@@ -3671,11 +3970,23 @@ export default function App() {
     }
     setBrowseReturnTab("downloads");
     setTab("browse");
-    await openMod(hit);
+    await openMod(hit, "info", {
+      navOverrides: { tab: "browse", browseReturnTab: "downloads" },
+    });
   }
 
-  async function openCollection(hit: CollectionHit, detailTab: DetailTab = "info") {
+  async function openCollection(
+    hit: CollectionHit,
+    detailTab: DetailTab = "info",
+    opts?: { skipHistoryPush?: boolean },
+  ) {
     if (!activeGame) return;
+    if (!opts?.skipHistoryPush) {
+      pushNavTarget({
+        ...captureNavEntry(),
+        browseDetail: { kind: "collection", hit, tab: detailTab },
+      });
+    }
     rememberBrowseScroll();
     setBrowseDetail({ kind: "collection", hit, tab: detailTab });
     setModDetail(null);
@@ -3819,7 +4130,21 @@ export default function App() {
     }
   }
 
-  async function openGame(game: ManagedGame, detailTab: GameDetailTab = "info") {
+  async function openGame(
+    game: ManagedGame,
+    detailTab: GameDetailTab = "info",
+    opts?: { skipHistoryPush?: boolean },
+  ) {
+    if (!opts?.skipHistoryPush) {
+      pushNavTarget({
+        tab: "library",
+        browseReturnTab: null,
+        browseDetail: null,
+        libraryDetail: { gameId: game.id, tab: detailTab },
+        gameSavedDetailId: null,
+        savedDetailId: null,
+      });
+    }
     await api.setActiveGame(game.id);
     setActiveId(game.id);
     resetBrowseState();
@@ -4274,7 +4599,17 @@ export default function App() {
     }
   }
 
-  async function openSavedCollection(id: string) {
+  async function openSavedCollection(
+    id: string,
+    opts?: { skipHistoryPush?: boolean },
+  ) {
+    if (!opts?.skipHistoryPush) {
+      pushNavTarget({
+        ...captureNavEntry(),
+        tab: "collections",
+        savedDetailId: id,
+      });
+    }
     setBusy("Loading collection…");
     setError(null);
     try {
@@ -4298,7 +4633,16 @@ export default function App() {
     }
   }
 
-  async function openGameSavedCollection(id: string) {
+  async function openGameSavedCollection(
+    id: string,
+    opts?: { skipHistoryPush?: boolean },
+  ) {
+    if (!opts?.skipHistoryPush) {
+      pushNavTarget({
+        ...captureNavEntry(),
+        gameSavedDetailId: id,
+      });
+    }
     setBusy("Loading collection…");
     setError(null);
     try {
@@ -4539,6 +4883,40 @@ export default function App() {
       await api.importModArchive({ gameId: activeGame.id, path: selected });
       await refreshMods(activeGame.id);
       await refreshCollections(activeGame.id);
+    });
+  }
+
+  async function importFolder() {
+    if (!activeGame) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Import mods from folder",
+    });
+    if (!selected || Array.isArray(selected)) return;
+    await withBusy("Importing folder…", async () => {
+      const result = await api.importModFolder({
+        gameId: activeGame.id,
+        path: selected,
+      });
+      await refreshMods(activeGame.id);
+      await refreshCollections(activeGame.id);
+      const count = result.mods.length;
+      if (result.errors.length > 0) {
+        const imported =
+          count > 0
+            ? `Imported ${count} mod${count === 1 ? "" : "s"}. `
+            : "";
+        setError(`${imported}${result.errors.join(" ")}`);
+        return;
+      }
+      if (count > 0) {
+        setNotice({
+          kind: "ok",
+          message: `Imported ${count} mod${count === 1 ? "" : "s"}.`,
+        });
+      }
     });
   }
 
@@ -4945,11 +5323,7 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">E</span>
-          <div>
-            <strong>Emperor Mod Manager</strong>
-            <small>MVP+</small>
-          </div>
+          <img className="brand-mark" src={appLogo} alt="Emperor Mod Manager" />
         </div>
         <nav>
           {navItems.map(([id, label]) => (
@@ -5084,7 +5458,7 @@ export default function App() {
               <>
                 <div className="panel-head">
                   <div className="detail-head-title">
-                    <button type="button" onClick={closeLibraryDetail}>
+                    <button type="button" onClick={() => void navBack()}>
                       ← Back
                     </button>
                     <h1>{libraryDetail.game.title}</h1>
@@ -5124,39 +5498,7 @@ export default function App() {
                     </Segment>
                     <button
                       className="danger"
-                      onClick={() =>
-                        withBusy("Removing…", async () => {
-                          await api.unmanageGame(libraryDetail.game.id);
-                          const list = await refreshManaged();
-                          const settings = await refreshSettings();
-                          const next =
-                            list.find((g) => g.id === settings.last_active_game_id) ??
-                            list[0] ??
-                            null;
-                          if (next) {
-                            setActiveId(next.id);
-                            setLibraryDetail({ game: next, tab: "mods" });
-                            setGameSavedDetail(null);
-                            setMods([]);
-                            setInstalledCollections([]);
-                            setGameInfo(null);
-                            if (next.nexus_domain) {
-                              try {
-                                setGameInfo(await api.getGame(next.nexus_domain));
-                              } catch {
-                                /* Nexus metadata is optional for local game info */
-                              }
-                            }
-                            await refreshMods(next.id);
-                            await refreshCollections(next.id);
-                          } else {
-                            closeLibraryDetail();
-                            setActiveId(null);
-                            setMods([]);
-                            setInstalledCollections([]);
-                          }
-                        })
-                      }
+                      onClick={() => void unmanageFromLibrary(libraryDetail.game)}
                     >
                       Unmanage
                     </button>
@@ -5234,6 +5576,7 @@ export default function App() {
                             Import code
                           </button>
                           <button onClick={importArchive}>Import archive</button>
+                          <button onClick={importFolder}>Import folder</button>
                         </>
                       )}
                     </div>
@@ -5882,7 +6225,7 @@ export default function App() {
                           <button
                             type="button"
                             className="linkish"
-                            onClick={() => setGameSavedDetail(null)}
+                            onClick={() => void navBack()}
                           >
                             ← Back
                           </button>
@@ -6577,7 +6920,7 @@ export default function App() {
               <>
                 <div className="panel-head">
                   <div className="detail-head-title">
-                    <button type="button" onClick={leaveBrowseDetail}>
+                    <button type="button" onClick={() => void navBack()}>
                       ← Back
                     </button>
                     <h1>{browseDetail.hit.name}</h1>
@@ -7533,134 +7876,147 @@ export default function App() {
                   <div className="browse-results" ref={browseResultsRef}>
                     {browseMode === "mods" ? (
                       browseView === "grid" ? (
-                        <FadeIn
-                          key={modHits[0]?.id ?? `mods:${searchQuery}`}
-                          className="media-grid browse-grid"
-                          style={
-                            {
-                              "--browse-card-min": `${browseGridMin}px`,
-                            } as CSSProperties
-                          }
-                        >
-                          {modHits.map((m, index) => {
-                            const sourceLabel =
-                              m.source === "thunderstore"
-                                ? "Thunderstore"
-                                : m.source === "modio"
-                                  ? "mod.io"
-                                  : "Nexus";
-                            const meta = [sourceLabel, m.category]
-                              .filter(Boolean)
-                              .join(" · ");
-                            return (
-                              <MediaCard
-                                key={m.id}
-                                enterIndex={index}
-                                title={m.name}
-                                imageSrc={mediaSrc(null, m.picture_url)}
-                                badge={m.author ?? "Mod"}
-                                overlay={
-                                  m.source === "nexus" && m.endorsements != null
-                                    ? `${m.endorsements.toLocaleString()} endorsements`
-                                    : m.downloads != null
-                                      ? `${m.downloads.toLocaleString()} downloads`
-                                      : null
-                                }
-                                meta={meta}
-                                installed={installedIds.has(m.id)}
-                                onClick={() => openMod(m, "info")}
-                                coverActions={
-                                  m.source === "thunderstore" ? (
-                                    installedIds.has(m.id) ? (
-                                      <button
-                                        type="button"
-                                        className="danger"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void uninstallCatalogMod(m);
-                                        }}
-                                      >
-                                        Uninstall
-                                      </button>
-                                    ) : (
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          openMod(m, "info");
-                                        }}
-                                      >
-                                        Install
-                                      </button>
-                                    )
-                                  ) : m.source === "nexus" ? (
-                                    <>
-                                      {installedIds.has(m.id) ? (
-                                        <button
-                                          type="button"
-                                          className="danger"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void uninstallCatalogMod(m);
-                                          }}
-                                        >
-                                          Uninstall
-                                        </button>
-                                      ) : (
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void quickInstallMod(m);
-                                          }}
-                                        >
-                                          {isPremium ? "Install" : "Download Assist"}
-                                        </button>
-                                      )}
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          openMod(m, "files");
-                                        }}
-                                      >
-                                        Files
-                                      </button>
-                                    </>
-                                  ) : (
-                                    <>
-                                      {installedIds.has(m.id) ? (
-                                        <button
-                                          type="button"
-                                          className="danger"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void uninstallCatalogMod(m);
-                                          }}
-                                        >
-                                          Uninstall
-                                        </button>
-                                      ) : null}
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          openMod(m, "files");
-                                        }}
-                                      >
-                                        Files
-                                      </button>
-                                    </>
-                                  )
-                                }
-                              />
-                            );
-                          })}
-                          {modHits.length === 0 && (
+                        <FadeIn key={modHits[0]?.id ?? `mods:${searchQuery}`}>
+                          {modHits.length === 0 ? (
                             <p className="note">{browseResultsNote("mods")}</p>
+                          ) : (
+                            <BrowseVirtualGrid
+                              items={modHits}
+                              scrollRef={browseResultsRef}
+                              minCardPx={browseGridMin}
+                              onPageSize={onBrowsePageSize}
+                              getKey={(m) => m.id}
+                              renderItem={(m) => {
+                                const sourceLabel =
+                                  m.source === "thunderstore"
+                                    ? "Thunderstore"
+                                    : m.source === "modio"
+                                      ? "mod.io"
+                                      : "Nexus";
+                                const meta = [sourceLabel, m.category]
+                                  .filter(Boolean)
+                                  .join(" · ");
+                                return (
+                                  <MediaCard
+                                    plain
+                                    title={m.name}
+                                    imageSrc={mediaSrc(null, m.picture_url)}
+                                    badge={m.author ?? "Mod"}
+                                    overlay={
+                                      m.source === "nexus" && m.endorsements != null
+                                        ? `${m.endorsements.toLocaleString()} endorsements`
+                                        : m.downloads != null
+                                          ? `${m.downloads.toLocaleString()} downloads`
+                                          : null
+                                    }
+                                    meta={meta}
+                                    installed={installedIds.has(m.id)}
+                                    onClick={() => openMod(m, "info")}
+                                    coverActions={
+                                      m.source === "thunderstore" ? (
+                                        installedIds.has(m.id) ? (
+                                          <button
+                                            type="button"
+                                            className="danger"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              void uninstallCatalogMod(m);
+                                            }}
+                                          >
+                                            Uninstall
+                                          </button>
+                                        ) : (
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              openMod(m, "info");
+                                            }}
+                                          >
+                                            Install
+                                          </button>
+                                        )
+                                      ) : m.source === "nexus" ? (
+                                        <>
+                                          {installedIds.has(m.id) ? (
+                                            <button
+                                              type="button"
+                                              className="danger"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                void uninstallCatalogMod(m);
+                                              }}
+                                            >
+                                              Uninstall
+                                            </button>
+                                          ) : (
+                                            <button
+                                              type="button"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                void quickInstallMod(m);
+                                              }}
+                                            >
+                                              {isPremium ? "Install" : "Download Assist"}
+                                            </button>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              openMod(m, "files");
+                                            }}
+                                          >
+                                            Files
+                                          </button>
+                                        </>
+                                      ) : (
+                                        <>
+                                          {installedIds.has(m.id) ? (
+                                            <button
+                                              type="button"
+                                              className="danger"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                void uninstallCatalogMod(m);
+                                              }}
+                                            >
+                                              Uninstall
+                                            </button>
+                                          ) : null}
+                                          <button
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              openMod(m, "files");
+                                            }}
+                                          >
+                                            Files
+                                          </button>
+                                        </>
+                                      )
+                                    }
+                                  />
+                                );
+                              }}
+                            />
                           )}
                         </FadeIn>
-                      ) : (
+                      ) : modHits.length === 0 ? (
                         <ul className="list">
-                          {modHits.map((m) => {
+                          <li className="empty">{browseResultsNote("mods")}</li>
+                        </ul>
+                      ) : (
+                        <BrowseVirtualList
+                          items={modHits}
+                          scrollRef={browseResultsRef}
+                          onPageSize={onBrowsePageSize}
+                          getKey={(m) => m.id}
+                          rowClassName={
+                            browseListDensity === "posters"
+                              ? "list-row-clickable list-row-poster"
+                              : "list-row-clickable"
+                          }
+                          estimateSize={estimateListRowHeight(browseListDensity === "posters")}
+                          renderItem={(m) => {
                             const posterDetail =
                               browseListDensity === "posters" ? posterModDetail(m) : null;
                             const posterTags =
@@ -7668,66 +8024,86 @@ export default function App() {
                                 ? m.tags.filter((tag) => tag.trim()).slice(0, 4)
                                 : [];
                             return (
-                            <li
-                              key={m.id}
-                              className={
-                                browseListDensity === "posters"
-                                  ? "list-row-clickable list-row-poster"
-                                  : "list-row-clickable"
-                              }
-                            >
-                              {browseListDensity === "posters" ? (
-                                <ListPoster src={mediaSrc(null, m.picture_url)} />
-                              ) : null}
-                              <div
-                                className="list-row-main"
-                                onClick={() => openMod(m, "info")}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" || e.key === " ") {
-                                    e.preventDefault();
-                                    openMod(m, "info");
-                                  }
-                                }}
-                                role="button"
-                                tabIndex={0}
-                              >
-                                <strong>
-                                  {m.name}
-                                  {installedIds.has(m.id) ? (
-                                    <span className="pill ok">Installed</span>
+                              <>
+                                {browseListDensity === "posters" ? (
+                                  <ListPoster
+                                    src={mediaSrc(null, m.picture_url)}
+                                    decoding="async"
+                                  />
+                                ) : null}
+                                <div
+                                  className="list-row-main"
+                                  onClick={() => openMod(m, "info")}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      openMod(m, "info");
+                                    }
+                                  }}
+                                  role="button"
+                                  tabIndex={0}
+                                >
+                                  <strong>
+                                    {m.name}
+                                    {installedIds.has(m.id) ? (
+                                      <span className="pill ok">Installed</span>
+                                    ) : null}
+                                  </strong>
+                                  <small>
+                                    {m.source === "thunderstore"
+                                      ? "Thunderstore"
+                                      : m.source === "modio"
+                                        ? "mod.io"
+                                        : "Nexus"}
+                                    {" · "}
+                                    {m.author ?? "unknown"}
+                                    {m.source === "nexus" && m.endorsements != null
+                                      ? ` · ${m.endorsements} endorsements`
+                                      : m.downloads != null
+                                        ? ` · ${m.downloads.toLocaleString()} downloads`
+                                        : ""}
+                                  </small>
+                                  {posterDetail ? (
+                                    <small className="list-row-detail">{posterDetail}</small>
                                   ) : null}
-                                </strong>
-                                <small>
-                                  {m.source === "thunderstore"
-                                    ? "Thunderstore"
-                                    : m.source === "modio"
-                                      ? "mod.io"
-                                      : "Nexus"}
-                                  {" · "}
-                                  {m.author ?? "unknown"}
-                                  {m.source === "nexus" && m.endorsements != null
-                                    ? ` · ${m.endorsements} endorsements`
-                                    : m.downloads != null
-                                      ? ` · ${m.downloads.toLocaleString()} downloads`
-                                      : ""}
-                                </small>
-                                {posterDetail ? (
-                                  <small className="list-row-detail">{posterDetail}</small>
-                                ) : null}
-                                {posterTags.length > 0 ? (
-                                  <div className="list-row-tags">
-                                    {posterTags.map((tag) => (
-                                      <span key={tag} className="pill">
-                                        {tag}
-                                      </span>
-                                    ))}
+                                  {posterTags.length > 0 ? (
+                                    <div className="list-row-tags">
+                                      {posterTags.map((tag) => (
+                                        <span key={tag} className="pill">
+                                          {tag}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  ) : null}
+                                  {m.summary && <p className="summary">{m.summary}</p>}
+                                </div>
+                                {m.source === "nexus" ? (
+                                  <div className="list-row-actions">
+                                    {installedIds.has(m.id) ? (
+                                      <button
+                                        type="button"
+                                        className="danger"
+                                        onClick={() => void uninstallCatalogMod(m)}
+                                      >
+                                        Uninstall
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => void quickInstallMod(m)}
+                                      >
+                                        {isPremium ? "Install" : "Download Assist"}
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => openMod(m, "files")}
+                                    >
+                                      Files
+                                    </button>
                                   </div>
-                                ) : null}
-                                {m.summary && <p className="summary">{m.summary}</p>}
-                              </div>
-                              {m.source === "nexus" ? (
-                                <div className="list-row-actions">
-                                  {installedIds.has(m.id) ? (
+                                ) : m.source === "thunderstore" ? (
+                                  installedIds.has(m.id) ? (
                                     <button
                                       type="button"
                                       className="danger"
@@ -7736,53 +8112,26 @@ export default function App() {
                                       Uninstall
                                     </button>
                                   ) : (
+                                    <button onClick={() => openMod(m, "info")}>Install</button>
+                                  )
+                                ) : installedIds.has(m.id) ? (
+                                  <div className="list-row-actions">
                                     <button
                                       type="button"
-                                      onClick={() => void quickInstallMod(m)}
+                                      className="danger"
+                                      onClick={() => void uninstallCatalogMod(m)}
                                     >
-                                      {isPremium ? "Install" : "Download Assist"}
+                                      Uninstall
                                     </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    onClick={() => openMod(m, "files")}
-                                  >
-                                    Files
-                                  </button>
-                                </div>
-                              ) : m.source === "thunderstore" ? (
-                                installedIds.has(m.id) ? (
-                                  <button
-                                    type="button"
-                                    className="danger"
-                                    onClick={() => void uninstallCatalogMod(m)}
-                                  >
-                                    Uninstall
-                                  </button>
+                                    <button onClick={() => openMod(m, "files")}>Files</button>
+                                  </div>
                                 ) : (
-                                  <button onClick={() => openMod(m, "info")}>Install</button>
-                                )
-                              ) : installedIds.has(m.id) ? (
-                                <div className="list-row-actions">
-                                  <button
-                                    type="button"
-                                    className="danger"
-                                    onClick={() => void uninstallCatalogMod(m)}
-                                  >
-                                    Uninstall
-                                  </button>
                                   <button onClick={() => openMod(m, "files")}>Files</button>
-                                </div>
-                              ) : (
-                                <button onClick={() => openMod(m, "files")}>Files</button>
-                              )}
-                            </li>
+                                )}
+                              </>
                             );
-                          })}
-                          {modHits.length === 0 && (
-                            <li className="empty">{browseResultsNote("mods")}</li>
-                          )}
-                        </ul>
+                          }}
+                        />
                       )
                     ) : browseView === "grid" ? (
                       <FadeIn
@@ -7791,120 +8140,128 @@ export default function App() {
                             ? collectionHitKey(collectionHits[0])
                             : `collections:${searchQuery}`
                         }
-                        className="media-grid browse-grid"
-                        style={
-                          {
-                            "--browse-card-min": `${browseGridMin}px`,
-                          } as CSSProperties
-                        }
                       >
-                        {collectionHits.map((c, index) => {
-                          const meta = [
-                            collectionHitSource(c) === "thunderstore"
-                              ? "Thunderstore"
-                              : "Nexus",
-                            c.mod_count != null
-                              ? `${c.mod_count.toLocaleString()} mods`
-                              : null,
-                            c.file_size != null && c.file_size > 0
-                              ? formatBytes(c.file_size)
-                              : null,
-                          ]
-                            .filter(Boolean)
-                            .join(" · ");
-                          return (
-                            <MediaCard
-                              key={collectionHitKey(c)}
-                              enterIndex={index}
-                              title={c.name}
-                              imageSrc={mediaSrc(null, c.tile_image_url)}
-                              badge={
-                                collectionHitSource(c) === "thunderstore"
-                                  ? "Modpack"
-                                  : "Collection"
-                              }
-                              overlay={
-                                c.endorsements != null
-                                  ? `${c.endorsements.toLocaleString()} endorsements`
-                                  : c.total_downloads != null
-                                    ? `${c.total_downloads.toLocaleString()} downloads`
-                                    : null
-                              }
-                              meta={meta}
-                              onClick={() => openCollection(c, "info")}
-                              coverActions={
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    installCollection(c);
-                                  }}
-                                >
-                                  Install
-                                </button>
-                              }
-                            />
-                          );
-                        })}
-                        {collectionHits.length === 0 && (
+                        {collectionHits.length === 0 ? (
                           <p className="note">{browseResultsNote("collections")}</p>
+                        ) : (
+                          <BrowseVirtualGrid
+                            items={collectionHits}
+                            scrollRef={browseResultsRef}
+                            minCardPx={browseGridMin}
+                            onPageSize={onBrowsePageSize}
+                            getKey={collectionHitKey}
+                            renderItem={(c) => {
+                              const meta = [
+                                collectionHitSource(c) === "thunderstore"
+                                  ? "Thunderstore"
+                                  : "Nexus",
+                                c.mod_count != null
+                                  ? `${c.mod_count.toLocaleString()} mods`
+                                  : null,
+                                c.file_size != null && c.file_size > 0
+                                  ? formatBytes(c.file_size)
+                                  : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+                              return (
+                                <MediaCard
+                                  plain
+                                  title={c.name}
+                                  imageSrc={mediaSrc(null, c.tile_image_url)}
+                                  badge={
+                                    collectionHitSource(c) === "thunderstore"
+                                      ? "Modpack"
+                                      : "Collection"
+                                  }
+                                  overlay={
+                                    c.endorsements != null
+                                      ? `${c.endorsements.toLocaleString()} endorsements`
+                                      : c.total_downloads != null
+                                        ? `${c.total_downloads.toLocaleString()} downloads`
+                                        : null
+                                  }
+                                  meta={meta}
+                                  onClick={() => openCollection(c, "info")}
+                                  coverActions={
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        installCollection(c);
+                                      }}
+                                    >
+                                      Install
+                                    </button>
+                                  }
+                                />
+                              );
+                            }}
+                          />
                         )}
                       </FadeIn>
-                    ) : (
+                    ) : collectionHits.length === 0 ? (
                       <ul className="list">
-                        {collectionHits.map((c) => {
+                        <li className="empty">{browseResultsNote("collections")}</li>
+                      </ul>
+                    ) : (
+                      <BrowseVirtualList
+                        items={collectionHits}
+                        scrollRef={browseResultsRef}
+                        onPageSize={onBrowsePageSize}
+                        getKey={collectionHitKey}
+                        rowClassName={
+                          browseListDensity === "posters"
+                            ? "list-row-clickable list-row-poster"
+                            : "list-row-clickable"
+                        }
+                        estimateSize={estimateListRowHeight(browseListDensity === "posters")}
+                        renderItem={(c) => {
                           const posterDetail =
                             browseListDensity === "posters" ? posterCollectionDetail(c) : null;
                           return (
-                          <li
-                            key={collectionHitKey(c)}
-                            className={
-                              browseListDensity === "posters"
-                                ? "list-row-clickable list-row-poster"
-                                : "list-row-clickable"
-                            }
-                          >
-                            {browseListDensity === "posters" ? (
-                              <ListPoster src={mediaSrc(null, c.tile_image_url)} />
-                            ) : null}
-                            <div
-                              className="list-row-main"
-                              onClick={() => openCollection(c, "info")}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" || e.key === " ") {
-                                  e.preventDefault();
-                                  openCollection(c, "info");
-                                }
-                              }}
-                              role="button"
-                              tabIndex={0}
-                            >
-                              <strong>{c.name}</strong>
-                              <small>
-                                {collectionHitSource(c) === "thunderstore"
-                                  ? "Thunderstore"
-                                  : "Nexus"}
-                                {" · "}
-                                {c.author ?? c.slug}
-                                {c.mod_count != null
-                                  ? ` · ${c.mod_count.toLocaleString()} mods`
-                                  : ""}
-                                {c.file_size != null && c.file_size > 0
-                                  ? ` · ${formatBytes(c.file_size)}`
-                                  : ""}
-                              </small>
-                              {posterDetail ? (
-                                <small className="list-row-detail">{posterDetail}</small>
+                            <>
+                              {browseListDensity === "posters" ? (
+                                <ListPoster
+                                  src={mediaSrc(null, c.tile_image_url)}
+                                  decoding="async"
+                                />
                               ) : null}
-                              {c.summary && <p className="summary">{c.summary}</p>}
-                            </div>
-                            <button onClick={() => installCollection(c)}>Install</button>
-                          </li>
+                              <div
+                                className="list-row-main"
+                                onClick={() => openCollection(c, "info")}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" || e.key === " ") {
+                                    e.preventDefault();
+                                    openCollection(c, "info");
+                                  }
+                                }}
+                                role="button"
+                                tabIndex={0}
+                              >
+                                <strong>{c.name}</strong>
+                                <small>
+                                  {collectionHitSource(c) === "thunderstore"
+                                    ? "Thunderstore"
+                                    : "Nexus"}
+                                  {" · "}
+                                  {c.author ?? c.slug}
+                                  {c.mod_count != null
+                                    ? ` · ${c.mod_count.toLocaleString()} mods`
+                                    : ""}
+                                  {c.file_size != null && c.file_size > 0
+                                    ? ` · ${formatBytes(c.file_size)}`
+                                    : ""}
+                                </small>
+                                {posterDetail ? (
+                                  <small className="list-row-detail">{posterDetail}</small>
+                                ) : null}
+                                {c.summary && <p className="summary">{c.summary}</p>}
+                              </div>
+                              <button onClick={() => installCollection(c)}>Install</button>
+                            </>
                           );
-                        })}
-                        {collectionHits.length === 0 && (
-                          <li className="empty">{browseResultsNote("collections")}</li>
-                        )}
-                      </ul>
+                        }}
+                      />
                     )}
                     <div
                       ref={browseSentinelRef}
@@ -7944,7 +8301,7 @@ export default function App() {
                   <button
                     type="button"
                     className="linkish"
-                    onClick={() => setSavedDetail(null)}
+                    onClick={() => void navBack()}
                   >
                     ← Back
                   </button>
@@ -8478,6 +8835,27 @@ export default function App() {
           onUnignore={unignoreRequirement}
         />
       )}
+      <UpdateToast
+        show={
+          Boolean(appUpdate?.update_available && appUpdate.latest_version) &&
+          dismissedUpdateVersion !== appUpdate?.latest_version &&
+          tab != null &&
+          tab !== "settings" &&
+          tab !== "setup"
+        }
+        version={appUpdate?.latest_version ?? ""}
+        progress={installingAppUpdate ? appUpdateMessage : null}
+        canInstall={Boolean(appUpdate?.asset_name)}
+        checking={checkingAppUpdate}
+        installing={installingAppUpdate}
+        onUpdate={() => void installAppUpdate()}
+        onOpenRelease={() => {
+          if (appUpdate?.release_url) void openUrl(appUpdate.release_url);
+        }}
+        onLater={() => {
+          if (appUpdate?.latest_version) setDismissedUpdateVersion(appUpdate.latest_version);
+        }}
+      />
       {modOptionsFor && activeGame && (
         <ModOptionsDialog
           gameId={activeGame.id}

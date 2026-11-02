@@ -1541,13 +1541,40 @@ fn stage_mod_inner(
     file_name: Option<String>,
     archive: &Path,
 ) -> Result<StagedMod> {
+    stage_filled_mod(
+        paths,
+        game_id,
+        replace_id,
+        name,
+        domain,
+        mod_id,
+        file_id,
+        version,
+        file_name,
+        |temp| extract_archive(archive, temp),
+    )
+}
+
+/// Fill a temp directory, then commit it as a local Nexus-shaped staged mod.
+fn stage_filled_mod(
+    paths: &Paths,
+    game_id: &str,
+    replace_id: Option<&str>,
+    name: &str,
+    domain: &str,
+    mod_id: u64,
+    file_id: u64,
+    version: Option<String>,
+    file_name: Option<String>,
+    fill: impl FnOnce(&Path) -> Result<()>,
+) -> Result<StagedMod> {
     crate::config::ensure_game_dirs(paths, game_id)?;
     let safe = sanitize_filename::sanitize(name);
     let staging = paths
         .mods_dir(game_id)
         .join(format!("{safe}_{mod_id}_{file_id}"));
     let temp = temp_extract_dir(&staging);
-    if let Err(e) = extract_archive(archive, &temp) {
+    if let Err(e) = fill(&temp) {
         let _ = fs::remove_dir_all(&temp);
         return Err(e);
     }
@@ -1623,6 +1650,234 @@ fn stage_mod_inner(
         let _ = fs::remove_dir_all(&temp);
     }
     committed
+}
+
+/// Mods staged from one picked folder: each top-level archive, plus the extracted remainder.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportFolderResult {
+    pub mods: Vec<StagedMod>,
+    pub errors: Vec<String>,
+}
+
+/// Copy an already-extracted mod folder into staging, and stage each immediate
+/// `.zip`, `.7z`, or `.rar` as its own mod. The source folder is left in place.
+pub fn import_folder(
+    paths: &Paths,
+    game_id: &str,
+    folder: &Path,
+    domain: &str,
+    install_path: Option<&Path>,
+) -> Result<ImportFolderResult> {
+    if !folder.exists() {
+        bail!("Folder not found: {}", folder.display());
+    }
+    if !folder.is_dir() {
+        bail!("Not a folder: {}", folder.display());
+    }
+    if let Some(install) = install_path.filter(|path| !path.as_os_str().is_empty()) {
+        if same_import_path(folder, install) {
+            bail!("Refusing to import the game install folder");
+        }
+    }
+    let staging = paths.mods_dir(game_id);
+    if same_import_path(folder, &staging)
+        || import_path_contains(folder, &staging)
+        || import_path_contains(&staging, folder)
+    {
+        bail!("Refusing to import the staging folder");
+    }
+
+    let (archives, remainder) = folder_import_entries(folder)?;
+    if archives.is_empty() && remainder.is_empty() {
+        bail!("Folder is empty");
+    }
+
+    let order = read_loadorder(paths, game_id)?;
+    let mut used_file_ids: HashSet<u64> = order
+        .mods
+        .iter()
+        .filter(|staged| staged.nexus_mod_id == 0)
+        .map(|staged| staged.nexus_file_id)
+        .collect();
+
+    let mut mods = Vec::new();
+    let mut errors = Vec::new();
+    for archive in &archives {
+        let file_id = allocate_import_file_id(&mut used_file_ids);
+        let label = archive_import_label(archive);
+        let imported_name = archive
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        match stage_mod(
+            paths,
+            game_id,
+            &label,
+            domain,
+            0,
+            file_id,
+            None,
+            pick_staged_file_name(&label, None, imported_name.as_deref()),
+            archive,
+        ) {
+            Ok(staged) => mods.push(staged),
+            Err(err) => {
+                let name = imported_name.unwrap_or_else(|| archive.display().to_string());
+                log::warn!("import folder archive {name}: {err:#}");
+                errors.push(format!("{name}: {err}"));
+            }
+        }
+    }
+
+    if !remainder.is_empty() {
+        let file_id = allocate_import_file_id(&mut used_file_ids);
+        let label = folder_import_label(folder);
+        match stage_filled_mod(
+            paths,
+            game_id,
+            None,
+            &label,
+            domain,
+            0,
+            file_id,
+            None,
+            None,
+            |temp| copy_import_remainder(&remainder, temp),
+        ) {
+            Ok(staged) => mods.push(staged),
+            Err(err) => {
+                log::warn!("import folder {label}: {err:#}");
+                errors.push(format!("{label}: {err}"));
+            }
+        }
+    }
+
+    Ok(ImportFolderResult { mods, errors })
+}
+
+fn folder_import_entries(folder: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut archives = Vec::new();
+    let mut remainder = Vec::new();
+    for entry in fs::read_dir(folder).with_context(|| format!("read {}", folder.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || is_hidden_import_name(&name) || is_junk_import_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_file() && is_unextracted_archive(&path) {
+            archives.push(path);
+        } else if path.is_file() || path.is_dir() {
+            remainder.push(path);
+        }
+    }
+    archives.sort_by_key(|path| import_sort_key(path));
+    remainder.sort_by_key(|path| import_sort_key(path));
+    Ok((archives, remainder))
+}
+
+fn import_sort_key(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_hidden_import_name(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+fn is_junk_import_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "desktop.ini" | "thumbs.db" | ".ds_store"
+    )
+}
+
+fn is_unextracted_archive(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "zip" | "7z" | "rar"))
+}
+
+fn archive_import_label(archive: &Path) -> String {
+    archive
+        .file_stem()
+        .map(|name| name.to_string_lossy().trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Imported mod".into())
+}
+
+fn folder_import_label(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Imported mod".into())
+}
+
+fn allocate_import_file_id(used: &mut HashSet<u64>) -> u64 {
+    let mut id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(1)
+        .max(1);
+    while used.contains(&id) {
+        id = id.checked_add(1).unwrap_or(1);
+    }
+    used.insert(id);
+    id
+}
+
+fn normalized_import_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn same_import_path(left: &Path, right: &Path) -> bool {
+    normalized_import_path(left) == normalized_import_path(right)
+}
+
+fn import_path_contains(parent: &Path, child: &Path) -> bool {
+    let parent = normalized_import_path(parent);
+    let child = normalized_import_path(child);
+    child.starts_with(&parent) && child != parent
+}
+
+fn copy_import_remainder(entries: &[PathBuf], dest: &Path) -> Result<()> {
+    if dest.exists() {
+        fs::remove_dir_all(dest)?;
+    }
+    fs::create_dir_all(dest)?;
+    for path in entries {
+        let name = path.file_name().context("import entry has no name")?;
+        let out = dest.join(name);
+        if path.is_dir() {
+            copy_dir_all(path, &out)?;
+        } else if path.is_file() {
+            fs::copy(path, &out)
+                .with_context(|| format!("copy {} to {}", path.display(), out.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Record a file label on a staged row that does not have one yet.
@@ -4299,5 +4554,151 @@ mod tests {
         assert!(ids.contains(&"W"));
         assert!(ids.contains(&"B"));
         assert!(!ids.contains(&"A"));
+    }
+
+    #[test]
+    fn import_folder_stages_an_extracted_tree() {
+        let (tmp, paths) = test_paths();
+        let folder = tmp.path().join("Cool Mod");
+        fs::create_dir_all(folder.join("data")).unwrap();
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        fs::write(folder.join("data").join("mod.dll"), b"abc").unwrap();
+        fs::write(folder.join("nested").join("inner.zip"), zip_bytes()).unwrap();
+        fs::write(folder.join(".secret"), b"no").unwrap();
+
+        let result = import_folder(&paths, "game", &folder, "skyrim", None).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.mods.len(), 1);
+        assert_eq!(result.mods[0].name, "Cool Mod");
+        assert_eq!(result.mods[0].nexus_mod_id, 0);
+        assert!(result.mods[0].enabled);
+        assert!(result.mods[0].independent);
+        let staged = PathBuf::from(&result.mods[0].staging_path);
+        assert_eq!(
+            fs::read(staged.join("data").join("mod.dll")).unwrap(),
+            b"abc"
+        );
+        assert!(staged.join("nested").join("inner.zip").is_file());
+        assert!(!staged.join(".secret").exists());
+        assert_eq!(
+            fs::read(folder.join("data").join("mod.dll")).unwrap(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn import_folder_stages_each_archive() {
+        let (tmp, paths) = test_paths();
+        let folder = tmp.path().join("downloads");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("One.zip"), zip_bytes()).unwrap();
+        fs::write(folder.join("Two.ZIP"), zip_bytes()).unwrap();
+        fs::write(folder.join("Bad.rar"), b"not a rar").unwrap();
+
+        let result = import_folder(&paths, "game", &folder, "skyrim", None).unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("Bad.rar"));
+        assert_eq!(result.mods.len(), 2);
+        let mut names: Vec<_> = result
+            .mods
+            .iter()
+            .map(|staged| staged.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["One", "Two"]);
+        assert_ne!(result.mods[0].id, result.mods[1].id);
+        for staged in &result.mods {
+            let path = PathBuf::from(&staged.staging_path);
+            assert_eq!(fs::read(path.join("readme.txt")).unwrap(), b"hello");
+        }
+        assert!(folder.join("One.zip").is_file());
+    }
+
+    #[test]
+    fn import_folder_splits_archive_from_extracted_files() {
+        let (tmp, paths) = test_paths();
+        let folder = tmp.path().join("Mixed");
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        fs::write(folder.join("nested").join("mod.dll"), b"dll").unwrap();
+        fs::write(folder.join("Extra.zip"), zip_bytes()).unwrap();
+        fs::write(folder.join("desktop.ini"), b"junk").unwrap();
+
+        let result = import_folder(&paths, "game", &folder, "skyrim", None).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.mods.len(), 2);
+        let archive = result
+            .mods
+            .iter()
+            .find(|staged| staged.name == "Extra")
+            .unwrap();
+        let extracted = result
+            .mods
+            .iter()
+            .find(|staged| staged.name == "Mixed")
+            .unwrap();
+        assert!(PathBuf::from(&archive.staging_path)
+            .join("readme.txt")
+            .is_file());
+        let staged = PathBuf::from(&extracted.staging_path);
+        assert_eq!(
+            fs::read(staged.join("nested").join("mod.dll")).unwrap(),
+            b"dll"
+        );
+        assert!(!staged.join("Extra.zip").exists());
+        assert!(!staged.join("desktop.ini").exists());
+    }
+
+    #[test]
+    fn import_folder_keeps_package_files_together() {
+        let (tmp, paths) = test_paths();
+        let folder = tmp.path().join("Household");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.package"), b"p").unwrap();
+        fs::write(folder.join("b.PACKAGE"), b"q").unwrap();
+
+        let result = import_folder(&paths, "game", &folder, "skyrim", None).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.mods.len(), 1);
+        assert_eq!(result.mods[0].name, "Household");
+        let staged = PathBuf::from(&result.mods[0].staging_path);
+        assert_eq!(fs::read(staged.join("a.package")).unwrap(), b"p");
+        assert_eq!(fs::read(staged.join("b.PACKAGE")).unwrap(), b"q");
+    }
+
+    #[test]
+    fn import_folder_rejects_an_empty_folder() {
+        let (tmp, paths) = test_paths();
+        let folder = tmp.path().join("empty");
+        fs::create_dir_all(&folder).unwrap();
+        let err = import_folder(&paths, "game", &folder, "skyrim", None).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+
+        let junk = tmp.path().join("junk-only");
+        fs::create_dir_all(&junk).unwrap();
+        fs::write(junk.join("desktop.ini"), b"x").unwrap();
+        fs::write(junk.join(".hidden"), b"x").unwrap();
+        let err = import_folder(&paths, "game", &junk, "skyrim", None).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn import_folder_rejects_the_install_and_staging_dirs() {
+        let (tmp, paths) = test_paths();
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("game.exe"), b"x").unwrap();
+        let err =
+            import_folder(&paths, "game", &install, "skyrim", Some(install.as_path())).unwrap_err();
+        assert!(err.to_string().contains("install"), "{err}");
+
+        let staging = paths.mods_dir("game");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("One.zip"), zip_bytes()).unwrap();
+        let err = import_folder(&paths, "game", &staging, "skyrim", None).unwrap_err();
+        assert!(err.to_string().contains("staging"), "{err}");
     }
 }

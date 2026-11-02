@@ -4563,6 +4563,37 @@ pub fn import_mod_archive(
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn import_mod_folder(
+    state: State<'_, AppState>,
+    game_id: String,
+    path: String,
+) -> Result<mods::ImportFolderResult, String> {
+    let folder = PathBuf::from(&path);
+    let (domain, install_path) = {
+        let cfg = state.config.lock().map_err(|e| e.to_string())?;
+        match cfg.managed_games.iter().find(|game| game.id == game_id) {
+            Some(game) => {
+                let domain = if game.nexus_domain.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    game.nexus_domain.clone()
+                };
+                (domain, Some(PathBuf::from(&game.install_path)))
+            }
+            None => ("unknown".to_string(), None),
+        }
+    };
+    mods::import_folder(
+        &state.paths,
+        &game_id,
+        &folder,
+        &domain,
+        install_path.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Intercept a Nexus CDN URL from Download Assist, fetch with webview cookies, stage in background.
 pub async fn start_assist_cdn_download(
     app: &tauri::AppHandle,

@@ -33,6 +33,7 @@ mod nomanssky;
 mod projectzomboid;
 mod re_engine;
 mod rimworld;
+mod scstrucksim;
 mod sevendaystodie;
 mod sims3;
 mod sims4;
@@ -78,6 +79,7 @@ pub use re_engine::{
     ResidentEvilRequiemPlugin, ResidentEvilVillagePlugin,
 };
 pub use rimworld::RimWorldPlugin;
+pub use scstrucksim::{AmericanTruckSimulatorPlugin, EuroTruckSimulator2Plugin};
 pub use sevendaystodie::SevenDaysToDiePlugin;
 pub use sims3::Sims3Plugin;
 pub use sims4::Sims4Plugin;
@@ -432,6 +434,8 @@ pub fn all_plugins() -> Vec<&'static dyn GamePlugin> {
         &Sims4Plugin,
         &Sims3Plugin,
         &SnowRunnerPlugin,
+        &EuroTruckSimulator2Plugin,
+        &AmericanTruckSimulatorPlugin,
         &SpaceEngineersPlugin,
         &SkyrimSpecialEditionPlugin,
         &Fallout4Plugin,
@@ -817,6 +821,15 @@ mod tests {
         );
         assert_eq!(match_plugin("Pavlov VR", None).unwrap().id, "pavlov");
         assert_eq!(match_plugin("SnowRunner", None).unwrap().id, "snowrunner");
+        assert_eq!(
+            match_plugin("Euro Truck Simulator 2", None).unwrap().id,
+            "eurotrucksimulator2"
+        );
+        assert_eq!(
+            match_plugin("American Truck Simulator", None).unwrap().id,
+            "americantrucksimulator"
+        );
+        assert!(match_plugin("Euro Truck Simulator", None).is_none());
         assert_eq!(
             match_plugin("Space Engineers", None).unwrap().id,
             "spaceengineers"

@@ -574,6 +574,11 @@ export type StagedMod = {
   version_support_generation?: number;
 };
 
+export type ImportFolderResult = {
+  mods: StagedMod[];
+  errors: string[];
+};
+
 export type ModSubOption = {
   id: string;
   name: string;

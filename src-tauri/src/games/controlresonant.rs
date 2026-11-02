@@ -184,40 +184,9 @@ fn dir_contains_dll(dir: &Path) -> bool {
     false
 }
 
-/// True when launch options contain a valid `winmm=…n…` override.
-/// Catches the common typo `winmm,n,b` (comma) which Wine ignores.
-pub fn launch_options_have_winmm_native(opts: &str) -> bool {
-    // dll[=overrides]; accept winmm=n,b or winmm,version=n,b (comma-separated dlls).
-    let lower = opts.to_lowercase();
-    if lower.contains("winmm=") {
-        // winmm=n,b or winmm=n
-        if let Some(rest) = lower.split("winmm=").nth(1) {
-            let token = rest.split_whitespace().next().unwrap_or("");
-            return token.starts_with('n') || token.contains(",n") || token.starts_with("n,");
-        }
-    }
-    // Multi-dll form: winmm,version=n,b
-    if let Some(idx) = lower.find("winedlloverrides") {
-        let slice = &lower[idx..];
-        if let Some(eq) = slice.find('=') {
-            let value = &slice[eq + 1..];
-            let value = value.trim_start_matches(|c| c == '"' || c == '\\');
-            // Find a segment that lists winmm among dll names before '='
-            for part in value.split_whitespace() {
-                let part = part.trim_matches('"');
-                if let Some((names, order)) = part.split_once('=') {
-                    let names = names.trim_matches('\\').trim_matches('"');
-                    if names.split(',').any(|n| n.trim() == "winmm")
-                        && order.split(',').any(|o| o.trim() == "n")
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
+pub use super::wine_overrides::{
+    launch_options_have_winmm_native, repair_winmm_override,
+};
 
 fn resolve_steam_app_id(install_path: &Path) -> String {
     #[cfg(target_os = "linux")]
@@ -232,106 +201,21 @@ fn resolve_steam_app_id(install_path: &Path) -> String {
     }
 }
 
-/// Repair `winmm,n,b` → `winmm=n,b` and ensure an override exists on Linux.
 fn ensure_winmm_override(install_path: &Path) -> Vec<String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = install_path;
-        Vec::new()
+    if !loader_present(install_path) {
+        return Vec::new();
     }
-    #[cfg(target_os = "linux")]
-    {
-        use crate::tools::steam_launch::{read_launch_options, write_launch_options};
-
-        if !loader_present(install_path) {
-            return Vec::new();
-        }
-        let app_id = resolve_steam_app_id(install_path);
-        let existing = match read_launch_options(&app_id) {
-            Ok(v) => v.unwrap_or_default(),
-            Err(e) => {
-                return vec![format!(
-                    "Could not read Steam launch options for CONTROL Resonant ({e:#}). \
-                     Set WINEDLLOVERRIDES=\"winmm=n,b\" %command% manually."
-                )];
-            }
-        };
-
-        if launch_options_have_winmm_native(&existing) {
-            return Vec::new();
-        }
-
-        let repaired = repair_winmm_override(&existing);
-        match write_launch_options(&app_id, &repaired) {
-            Ok(()) => vec![
-                "Updated Steam launch options to WINEDLLOVERRIDES=\"winmm=n,b\" \
-                 (was missing or used a comma typo like winmm,n,b). Restart Steam if the game \
-                 was already open, then launch again — crloader.log should appear next to winmm.dll."
-                    .into(),
-            ],
-            Err(e) => vec![format!(
-                "Steam launch options need WINEDLLOVERRIDES=\"winmm=n,b\" %command% \
-                 (not winmm,n,b). Could not write them automatically ({e:#})."
-            )],
-        }
-    }
+    super::wine_overrides::ensure_winmm_launch_options(
+        install_path,
+        "crloader.log should appear next to winmm.dll.",
+    )
 }
 
 fn winmm_override_warnings(install_path: &Path) -> Vec<String> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = install_path;
-        Vec::new()
+    if !loader_present(install_path) {
+        return Vec::new();
     }
-    #[cfg(target_os = "linux")]
-    {
-        use crate::tools::steam_launch::read_launch_options;
-
-        if !loader_present(install_path) {
-            return Vec::new();
-        }
-        let app_id = resolve_steam_app_id(install_path);
-        let existing = read_launch_options(&app_id)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        if launch_options_have_winmm_native(&existing) {
-            return Vec::new();
-        }
-        if existing.to_lowercase().contains("winmm,n") {
-            return vec![
-                "Steam launch options have WINEDLLOVERRIDES=\"winmm,n,b\" (comma). \
-                 Wine needs an equals sign: WINEDLLOVERRIDES=\"winmm=n,b\". Without it, \
-                 crloader never runs and no crloader.log is written."
-                    .into(),
-            ];
-        }
-        vec![
-            "Proton needs WINEDLLOVERRIDES=\"winmm=n,b\" in Steam launch options or \
-             the f2g loader never runs (no crloader.log)."
-                .into(),
-        ]
-    }
-}
-
-/// Fix `winmm,n,b` typo and/or prepend a proper override.
-pub fn repair_winmm_override(existing: &str) -> String {
-    let mut opts = existing.to_string();
-    // Common typo: winmm,n,b instead of winmm=n,b (not the multi-dll form winmm,version=n,b).
-    opts = opts.replace("winmm,n,b", "winmm=n,b");
-    opts = opts.replace("WINMM,N,B", "winmm=n,b");
-    if launch_options_have_winmm_native(&opts) {
-        return opts;
-    }
-    let trimmed = opts.trim();
-    if trimmed.is_empty() {
-        return "WINEDLLOVERRIDES=\"winmm=n,b\" %command%".into();
-    }
-    if trimmed.contains("%command%") {
-        format!("WINEDLLOVERRIDES=\"winmm=n,b\" {trimmed}")
-    } else {
-        format!("WINEDLLOVERRIDES=\"winmm=n,b\" {trimmed} %command%")
-    }
+    super::wine_overrides::winmm_launch_option_warnings(install_path, "the f2g loader")
 }
 
 fn path_has_dll(relative: &Path) -> bool {

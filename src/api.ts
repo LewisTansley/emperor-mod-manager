@@ -15,6 +15,7 @@ import type {
   GameHealth,
   GameInfo,
   GameVersionReport,
+  ImportFolderResult,
   InstalledCollection,
   IgnoredRequirement,
   ManagedGame,
@@ -410,6 +411,8 @@ export const api = {
     modId?: number | null;
     fileId?: number | null;
   }) => invoke<StagedMod>("import_mod_archive", args),
+  importModFolder: (args: { gameId: string; path: string }) =>
+    invoke<ImportFolderResult>("import_mod_folder", args),
   importAssistDownload: (path: string) =>
     invoke<StagedMod | null>("import_assist_download", { path }),
   listMods: (gameId: string) => invoke<StagedMod[]>("list_mods", { gameId }),

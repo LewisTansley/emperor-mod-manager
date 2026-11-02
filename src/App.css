@@ -105,29 +105,21 @@ a {
 }
 
 .brand {
-  display: flex;
-  gap: 0.75rem;
-  align-items: center;
-  padding: 0.25rem 0.4rem 0.75rem;
+  display: block;
+  width: 100%;
+  padding: 0 0 0.75rem;
+  aspect-ratio: 1024 / 1118;
+  overflow: hidden;
+  border-radius: 0.55rem;
 }
 
 .brand-mark {
-  width: 2.2rem;
-  height: 2.2rem;
-  border-radius: 0.55rem;
-  display: grid;
-  place-items: center;
-  background: var(--accent-2);
-  font-weight: 700;
-}
-
-.brand strong {
+  width: 100%;
+  height: 100%;
+  max-width: none;
   display: block;
-  font-size: 0.95rem;
-}
-
-.brand small {
-  color: #b9c4be;
+  object-fit: cover;
+  object-position: center;
 }
 
 .sidebar nav {
@@ -594,6 +586,30 @@ button.tag-picker-trigger[aria-expanded="true"] {
 
 .browse-page-status {
   margin-top: 0.75rem;
+}
+
+.browse-virtual {
+  position: relative;
+  width: 100%;
+}
+
+ul.list.browse-virtual {
+  display: block;
+}
+
+.browse-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+.browse-virtual-grid-row {
+  display: grid;
+}
+
+.browse-virtual-cell {
+  min-width: 0;
 }
 
 .filters-clear,
@@ -2195,6 +2211,10 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
     align-items: center;
   }
 
+  .sidebar .brand {
+    width: 100%;
+  }
+
   .sidebar nav {
     flex-direction: row;
     flex-wrap: wrap;
@@ -2548,6 +2568,60 @@ button.path-link:focus-visible:not(:disabled):not(.nav) {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.update-toast-slot {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 40;
+  width: min(18rem, calc(100vw - 2rem));
+}
+
+.update-toast {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  box-shadow: var(--shadow);
+  padding: 0.75rem 0.85rem;
+}
+
+.update-toast-title {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.update-toast-version,
+.update-toast-progress {
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.update-toast-actions {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  margin-top: 0.65rem;
+}
+
+.update-toast-actions button {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.82rem;
+}
+
+.update-toast-later {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.update-toast button.update-toast-later:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  border-color: var(--line);
+  color: var(--ink);
 }
 
 @media (prefers-reduced-motion: reduce) {
