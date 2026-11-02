@@ -1,35 +1,18 @@
 # Emperor Mod Manager
 
-Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, and mod.io on **Linux** and **Windows**.
+Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, and mod.io — on **Linux** and **Windows**.
 
-**MVP+ features**
+Browse, download, and deploy mods for dozens of games across Unity/BepInEx, Unreal, RE Engine, FromSoftware, Bethesda/Creation Engine, and many more titles. Detects installs from Steam, Heroic, Lutris, and Bottles on Linux, and Steam (plus optional Heroic) on Windows.
 
-- Detect installed games (Linux: Steam / Heroic / Lutris / Bottles via `lib_game_detector`; Windows: Steam registry + libraries, optional Heroic)
-- Manage supported titles: **Stardew Valley**, **Baldur's Gate 3**, **Cyberpunk 2077**, **The Witcher 3**, **CONTROL Resonant**, **Days Gone**, **S.T.A.L.K.E.R. 2: Heart of Chornobyl**, **Palworld**, **Hogwarts Legacy**, **Ready or Not**, **Subnautica 2**, **Marvel Rivals**, **Deep Rock Galactic**, **Pavlov VR**, **Oblivion Remastered**, **Helldivers 2**, **Warhammer 40,000: Darktide**, **Dark Souls** (PTDE), **Dark Souls Remastered**, **Dark Souls 2**, **Dark Souls 3**, **Elden Ring**, **Resident Evil 7**, **Village**, **Requiem**, **2/3/4 Remake**, **Monster Hunter Wilds**, **Monster Hunter Rise**, **Monster Hunter: World**, **Kingdom Come: Deliverance** 1 and 2, **Mount & Blade II: Bannerlord**, **Mount & Blade: Warband**, **The Forest**, **My Summer Car**, **Dressmaker**, **7 Days to Die**, **Project Zomboid**, **RimWorld**, **No Man's Sky**, **SnowRunner**, **Euro Truck Simulator 2**, **American Truck Simulator**, **Space Engineers**, **The Sims 3**, **The Sims 4**, **Skyrim Special Edition**, **Fallout 4**, **Starfield**, **Blade & Sorcery**, **BONELAB**, **BONEWORKS**, a **generic Unreal Engine** pipeline for other UE4/UE5 installs, and **Unity/BepInEx** titles (**Lethal Company**, **Valheim**, **Risk of Rain 2**, **Among Us**, **Content Warning**, **GTFO**, **Timberborn**, **Cult of the Lamb**, **Against the Storm**, **ROUNDS**, **Sons of the Forest**, **Subnautica**, **Subnautica: Below Zero**, **Schedule I**, **R.E.P.O.**, **PEAK**, **H3VR**, **ULTRAKILL**, **ATLYSS**, **Dyson Sphere Program**, **Inscryption**, **Hollow Knight: Silksong**, plus generic BepInEx)
-- CONTROL Resonant: mods deploy into the install root (`crmods/` for DLL mods and sidecars, `data/CRLooseFiles/` / `data/CRMods/` for loose files). Install the [f2g DLL Mod Loader](https://www.nexusmods.com/controlresonant/mods/9) (`winmm.dll`) first; on Proton/Steam Deck add `WINEDLLOVERRIDES="winmm=n,b" %command%` to launch options.
-- Days Gone: `.pak` mods deploy to `BendGame/Saved/Paks` (Windows `%LOCALAPPDATA%` or Steam Proton compatdata). First deploy renames `startuppackages.pak` → `startuppackages_modsenabled.pak` when needed so custom paks load.
-- Darktide: mods deploy under `<game>/mods/`; enabled names are written to `mods/mod_load_order.txt`. Deploy runs `tools/dtkit-patch --patch bundle` (idempotent enable; not `--toggle`). Install the Darktide Mod Loader first so the patcher binary is present.
-- Witcher 3: `mods/`, `dlc/`, and `bin/` deploy at the install root; enabled packs are written to `mods.settings` (Windows Documents or Proton `compatdata/292030`). Script Merger is not included.
-- Helldivers 2: patch archives deploy to `data/` and are renamed to sequential `.patch_N` (plus `.stream` / `.gpu_resources`) per archive id from load order. `.dl-bin` files go to `data/game/`. Mods packaged for **Arsenal** / **HD2MM** (a `manifest.json` at the mod root, V1 or legacy) expose their **Options** on the mod row: options are checkboxes, sub-options are a pick-one group, and only the selected include folders deploy. Files at the mod root always deploy; folders the manifest never includes never do. New mods start with every option on and the first sub-option chosen, and your picks survive a mod update. Deploy again after changing options.
-- Kingdom Come: Deliverance 1/2: mods deploy under `Mods/<ModName>/`; enabled names are written to `Mods/mod_order.txt` (KCD2 treats this as a whitelist).
-- Monster Hunter: World deploys to `nativePC/` (Stracker's Loader). Rise and Wilds use the same RE Engine layout as the Resident Evil titles (`natives/`, `reframework/`, `pak_mods/`).
-- Bannerlord modules deploy to `Modules/`; the app warns if BLSE is missing. Warband uses the same `Modules/` layout.
-- Blade & Sorcery SDK mods (`manifest.json`) deploy to `*_Data/StreamingAssets/Mods/`.
-- RE Engine Resident Evil titles deploy `natives/`, `reframework/`, and `pak_mods/` into the game install (plus REF injectors like `dinput8.dll`). Install [REFramework](https://github.com/praydog/reframework) and enable **Loose File Loader** for loose-file mods; this app does not perform Fluffy-style PAK invalidation.
-- FromSoftware: resolves the Steam `Game/` subfolder when present. **Dark Souls** (PTDE), **Remastered**, and **Dark Souls 2** merge into `<Game>/mod/` and set `modOverrideDirectory="\mod"` in `modengine.ini`; deploy auto-installs legacy Mod Engine (`dinput8.dll`) when missing (DS2 from GitHub; DS1/DSR via Nexus — Premium one-click API download, free accounts with an API key open **Download Assist** for the curated Mod Engine file and install it into the tools cache / Game folder instead of staging a mod). On Proton, set `WINEDLLOVERRIDES="dinput8=n,b" %command%`. **Dark Souls 3** and **Elden Ring** deploy under `<Game>/mods/<ModName>/`, write `emperor.me3` + `config_emperor.toml`, download me3 and Mod Engine 2 into the app tools cache when missing, and add `launch_emperor_me3` / `launch_emperor_me2` helpers in the Game folder — use those instead of the vanilla Steam shortcut.
-- Unity/BepInEx titles deploy plugins under `BepInEx/plugins/` (Doorstop / BepInExPack trees deploy to the install root, and packages shipping `BepInEx/patchers`, `config`, or `monomod` merge into those folders). Install BepInEx or a Thunderstore BepInExPack first; the app warns when the loader is missing. When a BepInEx.GUI console patcher is deployed, the console is switched on in `BepInEx.cfg` so its window actually appears.
-- Dressmaker: every pack in a download deploys to `Mods/<PackName>/mod.json` (a sibling DLL stays in that folder; extra wrapper folders are removed so `mod.json` sits directly inside it). A DLL archive with no `mod.json` deploys to `BepInEx/plugins/`. Install [Yuuma's Dressmaker Mod Loader](https://www.nexusmods.com/dressmaker/mods/1) first (`BepInEx/plugins/DressmakerMods.dll`, at the install root). On Proton, deploy sets `WINEDLLOVERRIDES="winhttp=n,b" %command%` when `winhttp.dll` is present. Restart Dressmaker so the Mod Manager lists the new packs.
-- MelonLoader titles (BONELAB, BONEWORKS) deploy under `Mods/` (loader packs to the install root). Install MelonLoader first.
-- 7 Days to Die and RimWorld wrap mod folders under `Mods/`. No Man's Sky uses `GAMEDATA/MODS` (not legacy `PCBANKS/MODS`); merge-style packs (e.g. Absolute Flight) also deploy `Binaries/winmm.dll` at the game install root. On Proton use `WINEDLLOVERRIDES="winmm=n,b" %command%` (not `winmm=n`) and force a Proton compatibility tool — deploy can write launch options when Steam app id is known. If mods showed a warning but did nothing, purge and redeploy so stale `GAMEDATA/MODS/Binaries` copies are removed. Space Engineers local mods go to the user-data `Mods` folder (`%APPDATA%` or Proton compatdata). SnowRunner paks go to `preload/paks/client`. **Euro Truck Simulator 2** and **American Truck Simulator** deploy `.scs` files and unpacked mod folders to the user **`mod`** directory (`Documents/<Game Name>/mod` on Windows and Proton, `~/.local/share/<Game Name>/mod` on native Linux). Enable mods in the in-game Mod Manager — Emperor load order does not set SCS priority. Project Zomboid mods go to the user `Zomboid/mods` folder (`~/Zomboid`, `%USERPROFILE%\Zomboid`, or Proton `compatdata/108600`); enabled ids are merged into `mods/default.txt`.
-- The Sims 4: mods deploy to `Documents/Electronic Arts/The Sims 4/Mods/<ModName>/` (Windows Documents, Proton `compatdata/1222670`, or a Wine prefix for EA App installs). `Mods/Resource.cfg` is written when missing; a `.ts4script` nested deeper than one folder is flattened into the mod folder so the game can load it. Only `.package` and `.ts4script` files deploy, and `localthumbcache.package` is deleted after each deploy. Enable **Script Mods Allowed** in Game Options yourself — the app only warns when it is off.
-- The Sims 3: `.package` mods deploy to `Documents/Electronic Arts/The Sims 3/Mods/Packages/<ModName>/`; archives shipping their own `Mods/`, `Overrides/`, or `DCCache/` tree keep that layout. The framework `Resource.cfg` is written when missing, and the regenerable caches (`scriptCache`, `CASPartCache`, `compositorCache`, `simCompositorCache`, `socialCache`, `WorldCaches`) are cleared after deploy. `.sims3pack` files land in `Downloads/` and still need the Sims 3 Launcher to install them — uninstalling the mod here will not undo that.
-- Single-file mods (`.package`, `.ts4script`, `.dbc`, `.sims3pack`) can be imported directly, not only as zip/7z/rar archives.
-- Creation Engine titles (Skyrim Special Edition, Fallout 4, Starfield) overlay into `Data/` and rewrite `Plugins.txt`. Starfield deploy also writes `StarfieldCustom.ini` in My Games. Oblivion Remastered maps ESPs to `OblivionRemastered/Content/Dev/ObvData/Data` and UE paks to `Content/Paks/~mods`. Script extenders (SKSE/F4SE/SFSE/OBSE), LOOT, and FOMOD are not installed by this app.
-- Search mods & Collections on Nexus (GraphQL v2 + REST v1). **Browse** can merge **Nexus**, **Thunderstore**, and **mod.io** in one list when each source is configured (source badges; All / Nexus / Thunderstore / mod.io filter). Thunderstore and mod.io installs resolve soft dependencies automatically and keep a **single version** of each package: dependencies install at the version they are pinned to (highest pin wins), so a mod set loads with the builds it was tested against. **Collections** merge Nexus Collections with Thunderstore **Modpacks**; paste an r2modman/Gale **profile code** to import a Thunderstore profile. Installed collections/profiles are tracked per game so you can filter or uninstall one set without removing shared requirements.
-- **Premium:** one-click API downloads and Collection batch install
-- **Free:** visible **Download Assist** WebView on the Nexus file page (persistent website session in-app), optional **autoclick** (Nexus Fast Download–style) on Mod Manager / Slow Download when the button is enabled, keyed `nxm://` staging, local archive import, and **Collection install** via a sequential Download Assist queue
-- Hardlink deploy with copy fallback across drives (basic load order)
-- Handle `nxm://` deep links from the Nexus website
+## Highlights
+
+- **One browse list** for Nexus, Thunderstore, and mod.io (filter by source when you want)
+- **Collections and modpacks** — install Nexus Collections, Thunderstore Modpacks, or paste an r2modman/Gale profile code
+- **Deploy with load order** — hardlinks when possible, copy fallback across drives
+- **Nexus Premium** — one-click API downloads and Collection batch install
+- **Download Assist** — free Nexus accounts download in-app (optional autoclick), with `nxm://` staging and local archive import
+- **Browser deep links** — “Download with manager” (`nxm://`) opens in Emperor after install
+- Soft dependency resolution on Thunderstore and mod.io, with a single pinned version per package
 
 ## Install
 
@@ -39,9 +22,9 @@ Desktop mod manager for [Nexus Mods](https://www.nexusmods.com/), Thunderstore, 
 curl -fsSL https://raw.githubusercontent.com/LewisTansley/emperor-mod-manager/main/scripts/install-arch.sh | bash
 ```
 
-That downloads the latest release, builds a pacman package from [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) and installs it, so the app shows up in your menu and `nxm://` links work right away. It needs `base-devel` (`sudo pacman -S --needed base-devel`) and asks for sudo only at the pacman step.
+That downloads the latest release, builds a pacman package, and installs it so the app appears in your menu and `nxm://` links work right away. You need `base-devel` (`sudo pacman -S --needed base-devel`); sudo is only asked at the pacman step.
 
-Prefer not to pipe a script into your shell? The same thing by hand, using the PKGBUILD published with the latest release (it carries the real tarball checksum):
+Prefer not to pipe a script into your shell? Same result by hand:
 
 ```bash
 mkdir -p "$HOME/.cache/emperor-mod-manager" && cd "$HOME/.cache/emperor-mod-manager"
@@ -49,100 +32,54 @@ curl -fsSL -o PKGBUILD https://github.com/LewisTansley/emperor-mod-manager/relea
 makepkg -si
 ```
 
-Pin a version with `EMM_VERSION=0.4.0` before the installer, and uninstall with `sudo pacman -R emperor-mod-manager-bin`. After the first install, Settings → Check for updates builds the new release with `makepkg` and installs it with pacman. That still needs `base-devel`, and asks for your password once. You can also update by re-running this installer.
+Pin a version with `EMM_VERSION=0.4.0` before the installer. Uninstall with `sudo pacman -R emperor-mod-manager-bin`. After the first install, **Settings → Check for updates** builds and installs the new release (still needs `base-devel`, asks for your password once). You can also update by re-running this installer.
 
 ### Other Linux distros
 
-Grab the `.deb` or `.AppImage` from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest). Each release also ships `emperor-mod-manager-<version>-x86_64.tar.gz` (binary, desktop entry, icons) with a `SHA256SUMS` file if you package it yourself. Settings updates a `.deb` with apt, replaces an AppImage in place, or replaces a user-writable copy of the binary from that tarball.
+Grab the `.deb` or `.AppImage` from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest). Each release also ships a `.tar.gz` with the binary, desktop entry, and icons, plus a `SHA256SUMS` file. Settings updates a `.deb` with apt, replaces an AppImage in place, or replaces a user-writable copy of the binary from that tarball.
 
 ### Windows
 
-Run the `..._x64-setup.exe` installer from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest); it bootstraps WebView2 and registers the `nxm` protocol.
+Run the `..._x64-setup.exe` installer from the [latest release](https://github.com/LewisTansley/emperor-mod-manager/releases/latest). It sets up WebView2 if needed and registers the `nxm` protocol so browser download links open in the app.
 
-## Requirements
+## Getting started
 
-- Linux or Windows 10+
-- Rust toolchain + Node.js 20+ (only to build from source)
-- **Linux:** system packages typically needed for Tauri: `webkit2gtk`, `libayatana-appindicator`, etc. (see [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/))
-- **Windows:** [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) (installer can bootstrap it)
-- A Nexus Mods account and **personal API key**
-- **Nexus Premium** for one-click `download_link.json` without a site-issued key (and API Collection batch install)
-- Optional [mod.io API key](https://mod.io/me/access) (read-only) to browse/download from mod.io for managed games with a mod.io game ID
+You need Linux or Windows 10+, a [Nexus Mods](https://www.nexusmods.com/) account, and a personal API key. Nexus Premium enables one-click downloads and Collection batch install; free accounts use Download Assist (below). An optional [mod.io API key](https://mod.io/me/access) unlocks browsing and downloading from mod.io for games that have a mod.io ID.
 
-## Setup (from source)
-
-```bash
-npm install
-npm run tauri dev
-```
-
-Production build (host OS only):
-
-```bash
-npm run tauri build
-```
-
-Release builds for **both** Linux and Windows run in parallel via CI (`npm run build:release` documents this; see `.github/workflows/build.yml`).
-
-To free Cargo/frontend build artifacts (next `tauri` build recompiles from scratch): `npm run clean`.
-
-### API key
+### Nexus API key
 
 1. Open [Nexus API Access](https://www.nexusmods.com/users/myaccount?tab=api)
-2. Create / copy a personal API key
-3. Paste it in **Setup** inside the app
+2. Create or copy a personal API key
+3. Paste it under **Setup** in the app
 
-The key is stored in the OS keyring when available (Linux Secret Service / Windows Credential Manager), otherwise in the app config directory as `nexus_api_key` (mode `0600` on Unix).
+The key is stored in your OS keyring when available, otherwise in the app config directory (mode `0600` on Linux).
 
-### mod.io API key
+### mod.io (optional)
 
-1. Open [mod.io Access](https://mod.io/me/access) and create / copy an API key
-2. Paste it under **Setup → mod.io** in the app
-3. Set a **mod.io game ID** on the managed game (Library → Catalog & deploy settings), or rely on a seeded ID when one exists
-
-The key is stored like the Nexus key (`modio-api-key` in the keyring, or `modio_api_key` in the config directory). Auth is **API key only** — no OAuth, Steam login, upload, subscribe, rate, or comments.
+1. Open [mod.io Access](https://mod.io/me/access) and create or copy an API key
+2. Paste it under **Setup → mod.io**
+3. Set a **mod.io game ID** on the managed game (Library → Catalog & deploy settings), or use a seeded ID when one exists
 
 ### Free-account downloads
 
-1. Browse a mod file → **Download Assist**
-2. A visible Nexus window opens. The **API key does not log you into the website** — the first time (or after clearing the session), sign in there and enable **Stay signed in**. Cookies are stored under the app data directory (`assist-webview/`) so later assists reuse that session.
-3. With **autoclick** enabled (Settings, default on), the assist waits for the free download button countdown then clicks **Mod Manager Download** (preferred) or **Slow Download** (autoclick is skipped on login pages)
-4. `nxm://` keys stage via the API; Slow Download archives are imported when the assist window finishes saving the file
-5. Or use **Import archive** on the Mods tab for a manual zip/7z/rar
-6. **Collections:** Install queues every required mod (optional mods if enabled) and opens Download Assist one-by-one with the same autoclick flow; failed mods are skipped and summarized at the end. Completed files are recorded as an installed collection so you can uninstall that set later. Use **Cancel** on the status banner to stop the queue.
-7. Settings → **Clear Nexus website session** deletes the assist WebView profile if you need to re-authenticate
+1. Open a mod file and choose **Download Assist**
+2. Sign in to Nexus in the assist window the first time (enable **Stay signed in**). Later assists reuse that session.
+3. With **autoclick** on (Settings, default on), the assist waits for the free download button, then clicks **Mod Manager Download** or **Slow Download**
+4. Or use **Import archive** on the Mods tab for a zip/7z/rar you already have
+5. **Collections** queue each required mod through Download Assist one-by-one; use **Cancel** on the status banner to stop
 
-Autoclick only runs in the user-opened assist window and only clicks Nexus’s free download controls after they are enabled — it does not mint Premium CDN links without credentials.
+**Settings → Clear Nexus website session** resets the assist login if you need to sign in again.
 
-### `nxm://` handler
+## Your data
 
-- **Linux:** the bundled desktop entry declares `MimeType=x-scheme-handler/nxm`. After installing the package, browsers can open “Download with manager” links in Emperor Mod Manager. The Arch package installs that entry system-wide, and pacman's `desktop-file-utils` hook refreshes the MIME database for you.
-- **Windows:** the NSIS installer / deep-link plugin registers the `nxm` protocol for the app.
-
-## Data layout
-
-Paths use the OS conventions via the `directories` crate:
-
-| Purpose | Linux (XDG) | Windows |
-|---------|-------------|---------|
-| Config (`config.toml`) | `~/.config/emperor-mod-manager/` | `%APPDATA%\emperormodmanager\emperor-mod-manager\` |
-| Staged mods / load order | `~/.local/share/emperor-mod-manager/` | `%APPDATA%\emperormodmanager\emperor-mod-manager\` (data) |
+| Purpose | Linux | Windows |
+|---------|-------|---------|
+| Config | `~/.config/emperor-mod-manager/` | `%APPDATA%\emperormodmanager\emperor-mod-manager\` |
+| Staged mods / load order | `~/.local/share/emperor-mod-manager/` | `%APPDATA%\emperormodmanager\emperor-mod-manager\` |
 | Download cache | `~/.cache/emperor-mod-manager/` | `%LOCALAPPDATA%\emperormodmanager\emperor-mod-manager\cache\` |
 
-Exact folder names follow `ProjectDirs` (`dev` / `emperormodmanager` / `emperor-mod-manager`).
-
-### Recovering data from Nexus Manager
-
-Emperor copies staged game data from the legacy `nexus-manager` app-data location at startup
-when its matching game folder is empty, then rewrites the saved staging paths. The legacy data
-is never deleted automatically because an existing game deployment may still hardlink to it.
-Use **Settings → Mod recovery** to scan or rerun recovery, deploy each recovered game, and only
-then remove the old data directory manually.
+If you previously used the legacy Nexus Manager app, Emperor can copy staged game data at startup when the matching folder is empty. Use **Settings → Mod recovery** to scan or rerun recovery, deploy each recovered game, then remove the old data directory yourself when you are done.
 
 ## License
 
-AGPL-3.0-or-later (required by `lib_game_detector` on Linux).
-
-## Not in MVP+
-
-FOMOD wizards, LOOT sorting, BSA/BA2 packing, Proton script-extender shims, multi-profile workflows, MelonLoader, mod.io OAuth / upload / ratings, bundling a shared app-wide mod.io key. Bethesda titles, Mass Effect (ME3Tweaks), and Ghost Recon Breakpoint (AnvilToolkit forge repack) are not supported.
+[AGPL-3.0-or-later](LICENSE)
