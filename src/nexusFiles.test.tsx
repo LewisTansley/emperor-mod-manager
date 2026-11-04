@@ -11,6 +11,7 @@ function file(partial: Partial<ModFileInfo> & Pick<ModFileInfo, "file_id" | "nam
     size_kb: null,
     uploaded_timestamp: null,
     is_primary: false,
+    description: null,
     ...partial,
   };
 }
@@ -45,6 +46,33 @@ describe("NexusModFileList", () => {
     ).toEqual(["Previous build", "Retired pack"]);
   });
 
+  it("collapses files with a null category as archived", () => {
+    const html = renderToStaticMarkup(
+      <NexusModFileList
+        files={[
+          file({ file_id: 1, name: "Current pack", category_name: "MAIN" }),
+          file({ file_id: 2, name: "Superseded pack", category_name: null }),
+        ]}
+        installLabel="Install"
+        onInstall={() => {}}
+      />,
+    );
+    const root = document.createElement("div");
+    root.innerHTML = html;
+    const visible = [...root.querySelectorAll(":scope > ul strong")].map(
+      (node) => node.textContent,
+    );
+    const archived = root.querySelector("details");
+
+    expect(visible).toEqual(["Current pack"]);
+    expect(archived?.querySelector("summary")?.textContent).toBe(
+      "Archived and old versions (1)",
+    );
+    expect(
+      [...(archived?.querySelectorAll("strong") ?? [])].map((node) => node.textContent),
+    ).toEqual(["Superseded pack"]);
+  });
+
   it("shows the empty state only when there are no files", () => {
     const html = renderToStaticMarkup(
       <NexusModFileList files={[]} installLabel="Install" onInstall={() => {}} />,
@@ -68,9 +96,17 @@ describe("pickMainModFile", () => {
       category_name: "OLD_VERSION",
       is_primary: true,
     });
+    const nullCategory = file({
+      file_id: 4,
+      name: "Null category",
+      category_name: null,
+      is_primary: true,
+    });
 
     expect(pickMainModFile([old, main, primary])?.file_id).toBe(1);
     expect(pickMainModFile([old, main])?.file_id).toBe(2);
     expect(pickMainModFile([old])).toBeNull();
+    expect(pickMainModFile([nullCategory, main])?.file_id).toBe(2);
+    expect(pickMainModFile([nullCategory])).toBeNull();
   });
 });

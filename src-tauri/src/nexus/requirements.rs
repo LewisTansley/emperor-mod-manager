@@ -189,10 +189,9 @@ fn category_key(name: Option<&str>) -> String {
 }
 
 fn is_historical_file(file: &ModFileInfo) -> bool {
-    matches!(
-        category_key(file.category_name.as_deref()).as_str(),
-        "old_version" | "old version" | "archived"
-    )
+    let key = category_key(file.category_name.as_deref());
+    key.is_empty()
+        || matches!(key.as_str(), "old_version" | "old version" | "archived")
 }
 
 /// Current primary file, else a Main-category file, else the first current file.
@@ -809,6 +808,7 @@ mod tests {
             size_kb: None,
             uploaded_timestamp: Some(id),
             is_primary: primary,
+            description: None,
         }
     }
 
@@ -918,6 +918,8 @@ mod tests {
         let old = file(1, "OLD_VERSION", false);
         let main = file(2, "MAIN", false);
         let primary = file(3, "OPTIONAL", true);
+        let mut null_category = file(5, "MAIN", true);
+        null_category.category_name = None;
         assert_eq!(
             pick_main_mod_file(&[old.clone(), main.clone(), primary.clone()])
                 .unwrap()
@@ -936,7 +938,14 @@ mod tests {
                 .file_id,
             4
         );
+        assert_eq!(
+            pick_main_mod_file(&[null_category.clone(), main.clone()])
+                .unwrap()
+                .file_id,
+            2
+        );
         assert!(pick_main_mod_file(&[old]).is_none());
+        assert!(pick_main_mod_file(&[null_category]).is_none());
     }
 
     #[test]

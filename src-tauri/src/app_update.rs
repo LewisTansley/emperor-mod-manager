@@ -810,7 +810,9 @@ fn apply_windows(app: &AppHandle, downloaded: &Path) -> Result<AppInstallResult,
     // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — survive parent exit.
     const DETACHED: u32 = 0x00000008 | 0x00000200;
 
+    // /S = silent (no wizard); /R = relaunch the app after install (Tauri NSIS).
     Command::new(downloaded)
+        .args(["/S", "/R"])
         .creation_flags(DETACHED)
         .spawn()
         .map_err(|e| format!("Failed to start installer: {e}"))?;
@@ -818,8 +820,7 @@ fn apply_windows(app: &AppHandle, downloaded: &Path) -> Result<AppInstallResult,
     let path = downloaded.display().to_string();
     schedule_exit(app);
     Ok(AppInstallResult {
-        message: "Installer started. Emperor Mod Manager will close so files can be replaced."
-            .into(),
+        message: "Update installing. The app will restart…".into(),
         path: Some(path),
         will_exit: true,
     })

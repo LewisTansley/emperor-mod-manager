@@ -152,6 +152,8 @@ pub struct ModFileInfo {
     pub size_kb: Option<u64>,
     pub uploaded_timestamp: Option<u64>,
     pub is_primary: bool,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,6 +724,10 @@ impl NexusClient {
                         .get("is_primary")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
+                    description: n
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                 })
             })
             .collect();

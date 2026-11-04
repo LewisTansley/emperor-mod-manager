@@ -84,6 +84,9 @@ export function QuickInstallDialog({
               <div>
                 <strong>{file.name}</strong>
                 <small>{fileMeta(file)}</small>
+                {file.description?.trim() ? (
+                  <p className="summary">{file.description.trim()}</p>
+                ) : null}
               </div>
             </label>
           </li>
@@ -105,6 +108,9 @@ export function QuickInstallDialog({
                   <div>
                     <strong>{file.name}</strong>
                     <small>{fileMeta(file)}</small>
+                    {file.description?.trim() ? (
+                      <p className="summary">{file.description.trim()}</p>
+                    ) : null}
                   </div>
                 </label>
               </li>

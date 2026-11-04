@@ -689,7 +689,12 @@ function categoryKey(name: string | null | undefined): string {
 
 function isHistoricalModFile(file: Pick<ModFileInfo, "category_name">): boolean {
   const key = categoryKey(file.category_name);
-  return key === "old_version" || key === "old version" || key === "archived";
+  return (
+    key === "" ||
+    key === "old_version" ||
+    key === "old version" ||
+    key === "archived"
+  );
 }
 
 function isMainCategoryFile(file: Pick<ModFileInfo, "category_name">): boolean {
@@ -716,6 +721,7 @@ function NexusFileRow(props: {
   onInstall: (file: ModFileInfo) => void;
 }) {
   const { file, installLabel, onInstall } = props;
+  const description = file.description?.trim() || null;
   return (
     <li>
       <div>
@@ -726,6 +732,7 @@ function NexusFileRow(props: {
           {file.is_primary ? " · primary" : ""}
           {file.size_kb != null ? ` · ${(file.size_kb / 1024).toFixed(1)} MB` : ""}
         </small>
+        {description ? <p className="summary">{description}</p> : null}
       </div>
       <button type="button" onClick={() => onInstall(file)}>
         {installLabel}
@@ -1012,7 +1019,7 @@ function installViaLabel(via: AppInstallVia): string {
     case "portable":
       return "a direct binary replacement";
     case "nsis":
-      return "the Windows installer";
+      return "a silent Windows update";
   }
 }
 

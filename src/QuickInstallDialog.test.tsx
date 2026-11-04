@@ -13,6 +13,7 @@ function file(partial: Partial<ModFileInfo> & Pick<ModFileInfo, "file_id" | "nam
     size_kb: null,
     uploaded_timestamp: null,
     is_primary: false,
+    description: null,
     ...partial,
   };
 }

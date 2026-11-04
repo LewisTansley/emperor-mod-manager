@@ -461,8 +461,7 @@ fn category_key(name: Option<&str>) -> String {
 }
 
 fn is_main_category(name: Option<&str>) -> bool {
-    let k = category_key(name);
-    k.is_empty() || k.contains("main")
+    category_key(name).contains("main")
 }
 
 fn nexus_file_is_newer(candidate: &NexusFileMeta, baseline: &NexusFileMeta) -> bool {

@@ -325,6 +325,7 @@ export type ModFileInfo = {
   size_kb: number | null;
   uploaded_timestamp: number | null;
   is_primary: boolean;
+  description: string | null;
 };
 
 export type CollectionHit = {
