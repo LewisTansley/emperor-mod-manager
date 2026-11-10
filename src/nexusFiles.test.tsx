@@ -79,6 +79,25 @@ describe("NexusModFileList", () => {
     );
     expect(html).toContain("No files found for this mod.");
   });
+
+  it("marks installed file ids with an Installed pill", () => {
+    const html = renderToStaticMarkup(
+      <NexusModFileList
+        files={[
+          file({ file_id: 1, name: "Main pack", category_name: "MAIN" }),
+          file({ file_id: 2, name: "Optional pack", category_name: "OPTIONAL" }),
+        ]}
+        installLabel="Install"
+        installedFileIds={new Set([2])}
+        onInstall={() => {}}
+      />,
+    );
+    const root = document.createElement("div");
+    root.innerHTML = html;
+    const rows = [...root.querySelectorAll("li")];
+    expect(rows[0]?.querySelector("strong .pill.ok")).toBeNull();
+    expect(rows[1]?.querySelector("strong .pill.ok")?.textContent).toBe("Installed");
+  });
 });
 
 describe("pickMainModFile", () => {

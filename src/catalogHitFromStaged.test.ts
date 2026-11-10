@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   catalogHitFromStaged,
   installedCatalogIds,
+  installedFileIdsForCatalog,
   stagedModsForCatalogId,
 } from "./App";
 import type { ManagedGame, StagedMod } from "./types";
@@ -214,5 +215,83 @@ describe("stagedModsForCatalogId", () => {
     expect(stagedModsForCatalogId(rows, game(), "nexus:skyrimspecialedition:999")).toEqual(
       [],
     );
+  });
+});
+
+describe("installedFileIdsForCatalog", () => {
+  it("collects Nexus and mod.io file ids for the catalog id", () => {
+    const ids = installedFileIdsForCatalog(
+      [
+        staged({
+          id: "n1",
+          name: "SkyUI",
+          source: "nexus",
+          domain: "skyrimspecialedition",
+          nexus_mod_id: 12604,
+          nexus_file_id: 99,
+        }),
+        staged({
+          id: "n1b",
+          name: "SkyUI extra",
+          source: "nexus",
+          domain: "skyrimspecialedition",
+          nexus_mod_id: 12604,
+          nexus_file_id: 100,
+        }),
+        staged({
+          id: "n2",
+          name: "Other",
+          source: "nexus",
+          domain: "skyrimspecialedition",
+          nexus_mod_id: 1,
+          nexus_file_id: 50,
+        }),
+        staged({
+          id: "m1",
+          name: "Graphics",
+          source: "modio",
+          modio_game_id: 306,
+          modio_mod_id: 12345,
+          modio_file_id: 777,
+        }),
+        staged({
+          id: "unset",
+          name: "Unset file",
+          source: "nexus",
+          domain: "skyrimspecialedition",
+          nexus_mod_id: 12604,
+          nexus_file_id: 0,
+        }),
+      ],
+      game(),
+      "nexus:skyrimspecialedition:12604",
+    );
+    expect([...ids].sort((a, b) => a - b)).toEqual([99, 100]);
+  });
+
+  it("collects mod.io file ids for a mod.io catalog id", () => {
+    const ids = installedFileIdsForCatalog(
+      [
+        staged({
+          id: "m1",
+          name: "Graphics",
+          source: "modio",
+          modio_game_id: 306,
+          modio_mod_id: 12345,
+          modio_file_id: 777,
+        }),
+        staged({
+          id: "m2",
+          name: "Other",
+          source: "modio",
+          modio_game_id: 306,
+          modio_mod_id: 999,
+          modio_file_id: 1,
+        }),
+      ],
+      game(),
+      "modio:306:12345",
+    );
+    expect([...ids]).toEqual([777]);
   });
 });

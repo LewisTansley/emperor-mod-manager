@@ -6047,7 +6047,8 @@ pub fn export_share_code(
 ) -> Result<ExportShareResult, String> {
     let game = managed_game(&state, &game_id)?;
     let order = mods::load_loadorder(&state.paths, &game_id).map_err(|e| e.to_string())?;
-    let (manifest, skipped) = share::build_manifest_from_loadorder(&order, &game, name.clone());
+    let (manifest, skipped, member_ids) =
+        share::build_manifest_from_loadorder(&order, &game, name.clone());
     if manifest.mods.is_empty() {
         return Err(if skipped.is_empty() {
             "No enabled mods to share.".into()
@@ -6067,14 +6068,40 @@ pub fn export_share_code(
             skipped.join("; ")
         ));
     }
-    if code.len() > 100 * 1024 {
+    warnings.push(
+        "Discord and other chat apps often break share codes when pasted. Prefer Save as file (.emperor-share) or a plain text file."
+            .into(),
+    );
+    if code.len() > 2 * 1024 {
         warnings.push(format!(
-            "Share code is large ({:.1} KB); some chat apps may truncate it.",
+            "Share code is large ({:.1} KB); chat paste is especially unreliable — send a file instead.",
             code.len() as f64 / 1024.0
         ));
     }
-    let saved = share::entry_from_code(&code, name, Some(game_id)).map_err(|e| e.to_string())?;
+    let saved = share::entry_from_code(&code, name, Some(game_id.clone()))
+        .map_err(|e| e.to_string())?;
     let saved = share::add_saved_collection(&state.paths, saved).map_err(|e| e.to_string())?;
+    let collection_id = share::emperor_share_id(&code);
+    let collection = InstalledCollection {
+        id: collection_id.clone(),
+        source: CollectionSource::Emperor,
+        kind: CollectionKind::Share,
+        name: saved.name.clone(),
+        slug: Some(content_slug_from_id(&collection_id)),
+        namespace: None,
+        package_name: None,
+        community: None,
+        revision: None,
+        version: None,
+        profile_code: Some(code.clone()),
+        mod_ids: member_ids,
+        installed_at: String::new(),
+        game_versions: None,
+    };
+    // Empty new_mod_ids: mods were already staged; keep independent so uninstall
+    // of this share collection does not delete the user's loadout.
+    mods::record_installed_collection(&state.paths, &game_id, collection, &[])
+        .map_err(|e| e.to_string())?;
     Ok(ExportShareResult {
         code,
         warnings,
@@ -6082,6 +6109,21 @@ pub fn export_share_code(
         mod_count: manifest.mods.len(),
         saved,
     })
+}
+
+#[tauri::command]
+pub fn write_share_file(path: String, code: String) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::write(&path, code).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn read_share_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

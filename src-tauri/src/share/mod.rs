@@ -14,7 +14,9 @@ use crate::{
 };
 
 pub const SHARE_PREFIX: &str = "#emperor1\n";
-const SOFT_SIZE_WARN: usize = 100 * 1024;
+/// Chat apps (Discord ~2K) often mangle or truncate pastes above this size.
+const SOFT_SIZE_WARN: usize = 2 * 1024;
+const ALTERED_SHARE_HINT: &str = "Share code looks altered or damaged (often by Discord/chat paste). Re-copy from Emperor or send an .emperor-share / text file instead.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,8 +178,20 @@ pub fn encode_share_manifest(manifest: &ShareManifest) -> Result<String> {
     Ok(format!("{SHARE_PREFIX}{encoded}"))
 }
 
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+/// Discord and other chat apps wrap long pastes; strip all whitespace from the base64 body.
+fn compact_base64_payload(encoded: &str) -> String {
+    encoded
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
 pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
-    let trimmed = raw.trim();
+    let trimmed = strip_bom(raw).trim();
     let encoded = trimmed
         .strip_prefix(SHARE_PREFIX)
         .or_else(|| {
@@ -186,16 +200,17 @@ pub fn decode_share_code(raw: &str) -> Result<ShareManifest> {
                 .map(|s| s.trim_start_matches(['\n', '\r', ' ']))
         })
         .ok_or_else(|| anyhow!("not an Emperor share code (missing #emperor1 prefix)"))?;
+    let compact = compact_base64_payload(encoded);
     let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded.trim().as_bytes())
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded.trim().as_bytes()))
+        .decode(compact.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(compact.as_bytes()))
         .context("decode share payload")?;
     let mut decoder = DeflateDecoder::new(compressed.as_slice());
     let mut json = Vec::new();
-    decoder
-        .read_to_end(&mut json)
-        .context("inflate share payload")?;
-    let manifest: ShareManifest = serde_json::from_slice(&json).context("parse share manifest")?;
+    // Discord truncation often still base64-decodes; inflate may fail, or yield
+    // partial bytes that then fail JSON parse — treat both as altered paste.
+    decoder.read_to_end(&mut json).map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
+    let manifest: ShareManifest = serde_json::from_slice(&json).map_err(|_| anyhow!(ALTERED_SHARE_HINT))?;
     if manifest.v != 1 {
         bail!("unsupported share format version {}", manifest.v);
     }
@@ -358,13 +373,15 @@ fn display_name(m: &StagedMod) -> String {
 }
 
 /// Convert enabled load-order mods into portable share entries.
+/// Returns `(manifest, skipped labels, staged member ids included in the share)`.
 pub fn build_manifest_from_loadorder(
     order: &LoadOrder,
     game: &ManagedGame,
     name: Option<String>,
-) -> (ShareManifest, Vec<String>) {
+) -> (ShareManifest, Vec<String>, Vec<String>) {
     let mut mods = Vec::new();
     let mut skipped = Vec::new();
+    let mut member_ids = Vec::new();
 
     let mut enabled: Vec<&StagedMod> = order.mods.iter().filter(|m| m.enabled).collect();
     enabled.sort_by_key(|m| m.order);
@@ -395,6 +412,7 @@ pub fn build_manifest_from_loadorder(
                     display_name: Some(display_name(m)),
                     version: m.version.clone(),
                 });
+                member_ids.push(m.id.clone());
             }
             ModSource::Thunderstore => {
                 let (Some(ns), Some(pkg)) = (m.ts_namespace.as_deref(), m.ts_name.as_deref())
@@ -414,6 +432,7 @@ pub fn build_manifest_from_loadorder(
                     display_name: Some(display_name(m)),
                     version: m.version.clone(),
                 });
+                member_ids.push(m.id.clone());
             }
             ModSource::Modio => {
                 let (Some(gid), Some(mid)) = (m.modio_game_id, m.modio_mod_id) else {
@@ -432,6 +451,7 @@ pub fn build_manifest_from_loadorder(
                     display_name: Some(display_name(m)),
                     version: m.version.clone(),
                 });
+                member_ids.push(m.id.clone());
             }
         }
     }
@@ -442,7 +462,7 @@ pub fn build_manifest_from_loadorder(
         game: game_hint_from_managed(game),
         mods,
     };
-    (manifest, skipped)
+    (manifest, skipped, member_ids)
 }
 
 pub fn entry_from_code(
@@ -640,6 +660,54 @@ mod tests {
     }
 
     #[test]
+    fn decode_tolerates_whitespace_wrapped_payload() {
+        let code = encode_share_manifest(&sample_manifest()).unwrap();
+        let (prefix, payload) = code.split_once('\n').expect("prefix newline");
+        let mut wrapped = format!("{prefix}\n");
+        for (i, c) in payload.chars().enumerate() {
+            if i > 0 && i % 40 == 0 {
+                wrapped.push('\n');
+            }
+            wrapped.push(c);
+        }
+        let bom_wrapped = format!("\u{feff}{wrapped}");
+        let back = decode_share_code(&bom_wrapped).unwrap();
+        assert_eq!(back.mods.len(), 3);
+        assert_eq!(back.name.as_deref(), Some("Test pack"));
+    }
+
+    #[test]
+    fn corrupt_payload_gives_discord_hint() {
+        let code = encode_share_manifest(&sample_manifest()).unwrap();
+        let (prefix, payload) = code.split_once('\n').expect("prefix newline");
+        let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload.as_bytes())
+            .unwrap();
+        // Truncated DEFLATE may still "inflate" under raw deflate; either that or
+        // the subsequent JSON parse must surface the Discord/file hint.
+        let truncated = &compressed[..compressed.len() / 2];
+        let corrupt = format!(
+            "{prefix}\n{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(truncated)
+        );
+        let err = decode_share_code(&corrupt).unwrap_err().to_string();
+        assert!(
+            err.contains("Discord") || err.contains(".emperor-share"),
+            "unexpected error: {err}"
+        );
+
+        let garbage = format!(
+            "{prefix}\n{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not-a-deflate-stream!!!!")
+        );
+        let err = decode_share_code(&garbage).unwrap_err().to_string();
+        assert!(
+            err.contains("Discord") || err.contains(".emperor-share"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn detect_kinds() {
         let code = encode_share_manifest(&sample_manifest()).unwrap();
         assert_eq!(detect_code_kind(&code), ImportCodeKind::Emperor);
@@ -717,10 +785,11 @@ mod tests {
                 },
             ],
         };
-        let (manifest, skipped) = build_manifest_from_loadorder(&order, &game, None);
+        let (manifest, skipped, member_ids) = build_manifest_from_loadorder(&order, &game, None);
         assert_eq!(manifest.mods.len(), 1);
         assert_eq!(manifest.mods[0].mod_id, Some(1));
         assert_eq!(skipped.len(), 2);
+        assert_eq!(member_ids, vec!["1_2".to_string()]);
     }
 
     #[test]

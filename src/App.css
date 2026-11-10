@@ -952,6 +952,43 @@ ul.list.browse-virtual {
   min-width: 0;
 }
 
+.list.mods .mod-collection-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+}
+
+.list.mods button.mod-collection-chip {
+  margin: 0;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.72rem;
+  line-height: 1.3;
+  border-radius: 0.25rem;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+  transform: none;
+}
+
+.list.mods button.mod-collection-chip:hover:not(:disabled) {
+  background: transparent;
+  color: var(--ink);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.list.mods button.mod-collection-chip:active:not(:disabled) {
+  transform: none;
+}
+
+.list.mods button.mod-collection-chip.active,
+.list.mods button.mod-collection-chip.active:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .list.mods .mod-version-warn {
   display: block;
   color: var(--warn);

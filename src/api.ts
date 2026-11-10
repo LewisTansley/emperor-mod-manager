@@ -331,6 +331,9 @@ export const api = {
       gameId,
       name: name ?? null,
     }),
+  writeShareFile: (path: string, code: string) =>
+    invoke<void>("write_share_file", { path, code }),
+  readShareFile: (path: string) => invoke<string>("read_share_file", { path }),
   decodeShareCode: (code: string) =>
     invoke<ShareDecodePreview>("decode_share_code", { code }),
   detectImportCode: (code: string) =>

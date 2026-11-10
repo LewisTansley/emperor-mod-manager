@@ -114,6 +114,8 @@ pub fn run() {
             commands::install_collection,
             commands::import_thunderstore_profile,
             commands::export_share_code,
+            commands::write_share_file,
+            commands::read_share_file,
             commands::decode_share_code,
             commands::detect_import_code,
             commands::import_code,

@@ -286,6 +286,26 @@ export function stagedModsForCatalogId(
   return mods.filter((mod) => catalogHitFromStaged(mod, game)?.id === catalogId);
 }
 
+/** Nexus / mod.io file ids already staged for a browse catalog id. */
+export function installedFileIdsForCatalog(
+  mods: StagedMod[],
+  game: ManagedGame,
+  catalogId: string,
+): Set<number> {
+  const ids = new Set<number>();
+  for (const mod of stagedModsForCatalogId(mods, game, catalogId)) {
+    const source = mod.source ?? "nexus";
+    if (source === "modio") {
+      if (mod.modio_file_id != null && mod.modio_file_id > 0) {
+        ids.add(mod.modio_file_id);
+      }
+    } else if (source === "nexus" && mod.nexus_file_id > 0) {
+      ids.add(mod.nexus_file_id);
+    }
+  }
+  return ids;
+}
+
 
 type BrowseDetail =
   | { kind: "mod"; hit: CatalogHit; tab: DetailTab }
@@ -411,6 +431,9 @@ const COLLECTION_SORTS = [
 type ModsStatusFilter = "all" | "enabled" | "disabled";
 type ModsSort = "loadOrder" | "nameAsc" | "nameDesc";
 
+/** Sentinel for the staging Collection filter: mods with no collection membership. */
+const MODS_COLLECTION_FILTER_NONE = "__none__";
+
 const STAGED_MOD_SORTS = [
   { value: "loadOrder", label: "Load order" },
   { value: "nameAsc", label: "Name A–Z" },
@@ -429,7 +452,40 @@ function stagedModSource(m: StagedMod): "nexus" | "thunderstore" | "modio" {
   return m.source ?? "nexus";
 }
 
-function stagedModSearchText(m: StagedMod): string {
+function formatInstalledAt(iso: string | null | undefined): string | null {
+  if (!iso?.trim()) return null;
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    return `Installed ${d.toLocaleString()}`;
+  } catch {
+    return null;
+  }
+}
+
+function installedCollectionSourceLabel(c: InstalledCollection): string {
+  if (c.source === "emperor") return "Emperor share";
+  if (c.source === "thunderstore") {
+    return c.kind === "profile" ? "Thunderstore profile" : "Thunderstore modpack";
+  }
+  return "Nexus collection";
+}
+
+function collectionsForMod(
+  mod: StagedMod,
+  installedCollections: InstalledCollection[],
+): { id: string; name: string }[] {
+  if (!mod.collection_ids?.length || installedCollections.length === 0) return [];
+  const byId = new Map(installedCollections.map((c) => [c.id, c.name]));
+  const out: { id: string; name: string }[] = [];
+  for (const id of mod.collection_ids) {
+    const name = byId.get(id);
+    if (name) out.push({ id, name });
+  }
+  return out;
+}
+
+function stagedModSearchText(m: StagedMod, collectionNames: string[] = []): string {
   return [
     m.name,
     m.version ?? "",
@@ -440,6 +496,7 @@ function stagedModSearchText(m: StagedMod): string {
     m.ts_name ?? "",
     m.modio_mod_id != null ? String(m.modio_mod_id) : "",
     m.modio_file_id != null ? String(m.modio_file_id) : "",
+    ...collectionNames,
   ]
     .join(" ")
     .toLowerCase();
@@ -453,12 +510,18 @@ function filterAndSortStagedMods(
     source: CatalogSourceFilter;
     collectionId: string;
     sort: ModsSort;
+    collectionNamesByModId?: Map<string, string[]>;
   },
 ): StagedMod[] {
   const q = opts.query.trim().toLowerCase();
   let filtered = list;
   if (q) {
-    filtered = filtered.filter((m) => stagedModSearchText(m).includes(q));
+    filtered = filtered.filter((m) =>
+      stagedModSearchText(
+        m,
+        opts.collectionNamesByModId?.get(m.id) ?? [],
+      ).includes(q),
+    );
   }
   if (opts.status === "enabled") {
     filtered = filtered.filter((m) => m.enabled);
@@ -468,7 +531,9 @@ function filterAndSortStagedMods(
   if (opts.source !== "all") {
     filtered = filtered.filter((m) => stagedModSource(m) === opts.source);
   }
-  if (opts.collectionId) {
+  if (opts.collectionId === MODS_COLLECTION_FILTER_NONE) {
+    filtered = filtered.filter((m) => !(m.collection_ids ?? []).length);
+  } else if (opts.collectionId) {
     filtered = filtered.filter((m) =>
       (m.collection_ids ?? []).includes(opts.collectionId),
     );
@@ -718,14 +783,18 @@ export function pickMainModFile(files: ModFileInfo[]): ModFileInfo | null {
 function NexusFileRow(props: {
   file: ModFileInfo;
   installLabel: string;
+  installed?: boolean;
   onInstall: (file: ModFileInfo) => void;
 }) {
-  const { file, installLabel, onInstall } = props;
+  const { file, installLabel, installed, onInstall } = props;
   const description = file.description?.trim() || null;
   return (
     <li>
       <div>
-        <strong>{file.name}</strong>
+        <strong>
+          {file.name}
+          {installed ? <span className="pill ok">Installed</span> : null}
+        </strong>
         <small>
           {file.category_name ?? "file"}
           {file.version ? ` · v${file.version}` : ""}
@@ -744,9 +813,10 @@ function NexusFileRow(props: {
 export function NexusModFileList(props: {
   files: ModFileInfo[];
   installLabel: string;
+  installedFileIds?: ReadonlySet<number>;
   onInstall: (file: ModFileInfo) => void;
 }) {
-  const { files, installLabel, onInstall } = props;
+  const { files, installLabel, installedFileIds, onInstall } = props;
   const current = files.filter((file) => !isHistoricalModFile(file));
   const historical = files.filter((file) => isHistoricalModFile(file));
   return (
@@ -762,6 +832,7 @@ export function NexusModFileList(props: {
               key={file.file_id}
               file={file}
               installLabel={installLabel}
+              installed={installedFileIds?.has(file.file_id)}
               onInstall={onInstall}
             />
           ))}
@@ -776,6 +847,7 @@ export function NexusModFileList(props: {
                 key={file.file_id}
                 file={file}
                 installLabel={installLabel}
+                installed={installedFileIds?.has(file.file_id)}
                 onInstall={onInstall}
               />
             ))}
@@ -1260,11 +1332,19 @@ export default function App() {
     () => (activeGame ? installedCatalogIds(mods, activeGame) : new Set<string>()),
     [mods, activeGame],
   );
+  const detailInstalledFileIds = useMemo(() => {
+    if (!activeGame || !browseDetail || browseDetail.kind !== "mod") {
+      return new Set<number>();
+    }
+    return installedFileIdsForCatalog(mods, activeGame, browseDetail.hit.id);
+  }, [activeGame, browseDetail, mods]);
   const activeGameRef = useRef(activeGame);
   activeGameRef.current = activeGame;
   const prevActiveGameIdRef = useRef<string | null>(null);
   const pendingDownloadPageRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
   const modUpdatesReqRef = useRef(0);
+  const modFilesReqRef = useRef(0);
+  const modFilesModIdRef = useRef<number | null>(null);
   const wineAdviceReqRef = useRef(0);
   const missingReqRef = useRef(0);
   const gameVersionReqRef = useRef(0);
@@ -1273,6 +1353,22 @@ export default function App() {
   const pictureFillSkippedRef = useRef(new Set<string>());
   const [pictureFillTick, setPictureFillTick] = useState(0);
 
+  const clearModFiles = useCallback(() => {
+    modFilesReqRef.current += 1;
+    modFilesModIdRef.current = null;
+    setModFiles([]);
+  }, []);
+
+  const loadModFiles = useCallback(async (domain: string, modId: number) => {
+    const reqId = ++modFilesReqRef.current;
+    modFilesModIdRef.current = null;
+    setModFiles([]);
+    const files = await api.modFiles(domain, modId);
+    if (reqId !== modFilesReqRef.current) return;
+    modFilesModIdRef.current = modId;
+    setModFiles(files);
+  }, []);
+
   const closeBrowseDetail = useCallback(() => {
     setBrowseDetail(null);
     setModDetail(null);
@@ -1280,10 +1376,10 @@ export default function App() {
     setTsVersion("");
     setModioDetail(null);
     setModioFiles([]);
-    setModFiles([]);
+    clearModFiles();
     setCollectionModFiles([]);
     setCollectionDetail(null);
-  }, []);
+  }, [clearModFiles]);
 
   const resetBrowseState = useCallback(() => {
     browseRequestIdRef.current += 1;
@@ -1507,6 +1603,15 @@ export default function App() {
     return map;
   }, [gameHealth]);
 
+  const collectionNamesByModId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const m of mods) {
+      const names = collectionsForMod(m, installedCollections).map((c) => c.name);
+      if (names.length) map.set(m.id, names);
+    }
+    return map;
+  }, [mods, installedCollections]);
+
   const visibleMods = useMemo(
     () =>
       filterAndSortStagedMods(mods, {
@@ -1515,8 +1620,17 @@ export default function App() {
         source: modsSourceFilter,
         collectionId: modsCollectionFilter,
         sort: modsSort,
+        collectionNamesByModId,
       }),
-    [mods, modsQuery, modsStatusFilter, modsSourceFilter, modsCollectionFilter, modsSort],
+    [
+      mods,
+      modsQuery,
+      modsStatusFilter,
+      modsSourceFilter,
+      modsCollectionFilter,
+      modsSort,
+      collectionNamesByModId,
+    ],
   );
 
   const modsFiltersActive =
@@ -3926,6 +4040,7 @@ export default function App() {
     setCollectionDetail(null);
     setModioDetail(null);
     setModioFiles([]);
+    clearModFiles();
     if (hit.source === "thunderstore") {
       if (!hit.community || !hit.namespace || !hit.package_name) return;
       await withBusy("Loading package…", async () => {
@@ -3956,9 +4071,8 @@ export default function App() {
     const modId = hit.mod_id;
     if (!modId) return;
     if (detailTab === "files") {
-      setModFiles([]);
       await withBusy("Loading files…", async () => {
-        setModFiles(await api.modFiles(domain, modId));
+        await loadModFiles(domain, modId);
       });
     } else {
       await withBusy("Loading mod…", async () => {
@@ -4024,7 +4138,7 @@ export default function App() {
     rememberBrowseScroll();
     setBrowseDetail({ kind: "collection", hit, tab: detailTab });
     setModDetail(null);
-    setModFiles([]);
+    clearModFiles();
     setCollectionModFiles([]);
     setCollectionDetail(null);
     setTsDetail(null);
@@ -4103,13 +4217,15 @@ export default function App() {
             },
           );
         }
-      } else if (detailTab === "files" && modFiles.length === 0 && next.hit.mod_id) {
+      } else if (
+        detailTab === "files" &&
+        next.hit.mod_id &&
+        modFilesModIdRef.current !== next.hit.mod_id
+      ) {
         await withBusy("Loading files…", async () => {
-          setModFiles(
-            await api.modFiles(
-              next.hit.domain_name || activeGame.nexus_domain,
-              next.hit.mod_id!,
-            ),
+          await loadModFiles(
+            next.hit.domain_name || activeGame.nexus_domain,
+            next.hit.mod_id!,
           );
         });
       } else if (detailTab === "info" && !modDetail && next.hit.mod_id) {
@@ -4593,6 +4709,48 @@ export default function App() {
     }
   }
 
+  async function saveShareCodeToFile(code: string, suggestedName?: string) {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const path = await save({
+      defaultPath: `${(suggestedName || "loadout").replace(/[^\w.-]+/g, "_") || "loadout"}.emperor-share`,
+      filters: [
+        { name: "Emperor share", extensions: ["emperor-share"] },
+        { name: "Text", extensions: ["txt"] },
+      ],
+    });
+    if (!path) return false;
+    await api.writeShareFile(path, code);
+    return true;
+  }
+
+  async function openShareCodeFile() {
+    if (!activeGame) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: "Emperor share", extensions: ["emperor-share", "txt"] },
+        { name: "Text", extensions: ["txt"] },
+      ],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setBusy("Reading share file…");
+    setError(null);
+    try {
+      const code = (await api.readShareFile(selected)).trim();
+      if (!code) {
+        setError("Share file is empty.");
+        return;
+      }
+      setShareImportCode(code);
+      await runUnifiedImport(activeGame.id, code);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function exportShareLoadout() {
     if (!activeGame) return;
     setBusy("Creating share code…");
@@ -4603,20 +4761,22 @@ export default function App() {
         shareExportName.trim() || null,
       );
       setLastShareCode(result.code);
-      let message = `Copied share code for ${result.mod_count} mod(s). Saved to Collections.`;
+      let message = `Copied share code for ${result.mod_count} mod(s). Saved to Collections. Prefer Save as file for Discord.`;
       try {
         await navigator.clipboard.writeText(result.code);
       } catch {
-        message = `Share code ready for ${result.mod_count} mod(s). Saved to Collections (copy from the box below).`;
+        message = `Share code ready for ${result.mod_count} mod(s). Saved to Collections (copy from the box below, or Save as file for Discord).`;
       }
       setNotice({
-        kind: result.warnings.length > 0 ? "warn" : "ok",
+        kind: "warn",
         message,
         details: result.warnings.length > 0 ? result.warnings : undefined,
       });
       setShareExportOpen(false);
       setShareExportName("");
       await refreshSavedCollections();
+      await refreshCollections(activeGame.id);
+      await refreshMods(activeGame.id);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -5751,7 +5911,8 @@ export default function App() {
                             <h2>Share loadout</h2>
                             <p className="note">
                               Encodes enabled portable mods (Nexus, Thunderstore, mod.io) into a
-                              pasteable code. Saved under Collections.
+                              pasteable code. Saved under Collections. For Discord, use Save as
+                              file — chat paste often breaks the code.
                             </p>
                             <label>
                               Name (optional)
@@ -5800,6 +5961,12 @@ export default function App() {
                                 }}
                               >
                                 Import
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void openShareCodeFile()}
+                              >
+                                Open file
                               </button>
                               <button
                                 type="button"
@@ -5853,6 +6020,30 @@ export default function App() {
                               >
                                 Copy again
                               </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void (async () => {
+                                    try {
+                                      const saved = await saveShareCodeToFile(
+                                        lastShareCode,
+                                        shareExportName.trim() || "loadout",
+                                      );
+                                      if (saved) {
+                                        setNotice({
+                                          kind: "ok",
+                                          message:
+                                            "Saved .emperor-share file. Send that instead of pasting into Discord.",
+                                        });
+                                      }
+                                    } catch (e) {
+                                      setError(String(e));
+                                    }
+                                  })()
+                                }
+                              >
+                                Save as file
+                              </button>
                             </div>
                           </>
                         )}
@@ -5861,49 +6052,47 @@ export default function App() {
                       <div className="installed-collections">
                         <h2>Installed collections</h2>
                         <ul className="list">
-                          {installedCollections.map((c) => (
-                            <li key={c.id}>
-                              <div>
-                                <strong>{c.name}</strong>
-                                <small>
-                                  {c.source === "emperor"
-                                    ? "Emperor share"
-                                    : c.source === "thunderstore"
-                                      ? c.kind === "profile"
-                                        ? "Thunderstore profile"
-                                        : "Thunderstore modpack"
-                                      : "Nexus collection"}
-                                  {` · ${c.mod_ids.length} mods`}
-                                </small>
-                              </div>
-                              <div className="actions">
-                                <button
-                                  type="button"
-                                  className={
-                                    modsCollectionFilter === c.id ? "active" : ""
-                                  }
-                                  onClick={() =>
-                                    setModsCollectionFilter((prev) =>
-                                      prev === c.id ? "" : c.id,
-                                    )
-                                  }
-                                >
-                                  {modsCollectionFilter === c.id
-                                    ? "Showing"
-                                    : "Filter"}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="danger"
-                                  onClick={() =>
-                                    void uninstallInstalledCollection(c)
-                                  }
-                                >
-                                  Uninstall
-                                </button>
-                              </div>
-                            </li>
-                          ))}
+                          {installedCollections.map((c) => {
+                            const installedLabel = formatInstalledAt(c.installed_at);
+                            return (
+                              <li key={c.id}>
+                                <div>
+                                  <strong>{c.name}</strong>
+                                  <small>
+                                    {installedCollectionSourceLabel(c)}
+                                    {` · ${c.mod_ids.length} mods`}
+                                    {installedLabel ? ` · ${installedLabel}` : ""}
+                                  </small>
+                                </div>
+                                <div className="actions">
+                                  <button
+                                    type="button"
+                                    className={
+                                      modsCollectionFilter === c.id ? "active" : ""
+                                    }
+                                    onClick={() =>
+                                      setModsCollectionFilter((prev) =>
+                                        prev === c.id ? "" : c.id,
+                                      )
+                                    }
+                                  >
+                                    {modsCollectionFilter === c.id
+                                      ? "Showing"
+                                      : "Filter"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    onClick={() =>
+                                      void uninstallInstalledCollection(c)
+                                    }
+                                  >
+                                    Uninstall
+                                  </button>
+                                </div>
+                              </li>
+                            );
+                          })}
                         </ul>
                       </div>
                     )}
@@ -5976,6 +6165,7 @@ export default function App() {
                             onChange={(e) => setModsCollectionFilter(e.target.value)}
                           >
                             <option value="">All</option>
+                            <option value={MODS_COLLECTION_FILTER_NONE}>None</option>
                             {installedCollections.map((c) => (
                               <option key={c.id} value={c.id}>
                                 {c.name}
@@ -6122,12 +6312,40 @@ export default function App() {
                         const versionWarning = versionWarnings.find(
                           (row) => row.stagedId === m.id,
                         );
+                        const modCollections = collectionsForMod(
+                          m,
+                          installedCollections,
+                        );
                         const identity = (
                           <>
                             <ListPoster src={mediaSrc(null, m.picture_url)} />
                             <div className="mod-identity-text">
                               <strong>{m.name}</strong>
                               <small>{stagedModSourceLine(m)}</small>
+                              {modCollections.length > 0 && (
+                                <div className="mod-collection-chips">
+                                  {modCollections.map((c) => (
+                                    <button
+                                      key={c.id}
+                                      type="button"
+                                      className={
+                                        modsCollectionFilter === c.id
+                                          ? "mod-collection-chip active"
+                                          : "mod-collection-chip"
+                                      }
+                                      title={`Filter by ${c.name}`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setModsCollectionFilter((prev) =>
+                                          prev === c.id ? "" : c.id,
+                                        );
+                                      }}
+                                    >
+                                      {c.name}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
                               {versionWarning && (
                                 <small className="mod-version-warn">
                                   {versionWarning.message}
@@ -6390,6 +6608,59 @@ export default function App() {
                       </>
                     ) : (
                       <>
+                        {installedCollections.length > 0 && (
+                          <div className="installed-collections">
+                            <h2>Installed collections</h2>
+                            <ul className="list">
+                              {installedCollections.map((c) => {
+                                const installedLabel = formatInstalledAt(
+                                  c.installed_at,
+                                );
+                                return (
+                                  <li key={c.id}>
+                                    <div>
+                                      <strong>{c.name}</strong>
+                                      <small>
+                                        {installedCollectionSourceLabel(c)}
+                                        {` · ${c.mod_ids.length} mods`}
+                                        {installedLabel
+                                          ? ` · ${installedLabel}`
+                                          : ""}
+                                      </small>
+                                    </div>
+                                    <div className="actions">
+                                      <button
+                                        type="button"
+                                        className={
+                                          modsCollectionFilter === c.id
+                                            ? "active"
+                                            : ""
+                                        }
+                                        onClick={() => {
+                                          setModsCollectionFilter(c.id);
+                                          setGameDetailTab("mods");
+                                        }}
+                                      >
+                                        {modsCollectionFilter === c.id
+                                          ? "Showing"
+                                          : "Filter"}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="danger"
+                                        onClick={() =>
+                                          void uninstallInstalledCollection(c)
+                                        }
+                                      >
+                                        Uninstall
+                                      </button>
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                        )}
                         <h2>Saved share codes</h2>
                         <p className="note">
                           Emperor share codes that match this game (Nexus domain,
@@ -7279,7 +7550,12 @@ export default function App() {
                             {modioFiles.map((f) => (
                               <li key={f.file_id}>
                                 <div>
-                                  <strong>{f.filename}</strong>
+                                  <strong>
+                                    {f.filename}
+                                    {detailInstalledFileIds.has(f.file_id) ? (
+                                      <span className="pill ok">Installed</span>
+                                    ) : null}
+                                  </strong>
                                   <small>
                                     {f.version ? `v${f.version}` : "file"}
                                     {f.is_primary ? " · primary" : ""}
@@ -7305,6 +7581,7 @@ export default function App() {
                           <NexusModFileList
                             files={modFiles}
                             installLabel={isPremium ? "Install" : "Download Assist"}
+                            installedFileIds={detailInstalledFileIds}
                             onInstall={(file) => void installFile(file)}
                           />
                         )}
