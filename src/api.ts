@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { EmperorOpenMod } from "./modDeepLink";
 import type {
   BrowseMeta,
   BrowseSearchOpts,
@@ -407,6 +408,8 @@ export const api = {
       existingModIds: args.existingModIds ?? null,
     }),
   handleNxm: (url: string) => invoke<DownloadItem>("handle_nxm", { url }),
+  takePendingEmperorModLink: () =>
+    invoke<EmperorOpenMod | null>("take_pending_emperor_mod_link"),
   importModArchive: (args: {
     gameId: string;
     path: string;

@@ -1,6 +1,6 @@
 [package]
 name = "emperor-mod-manager"
-version = "0.6.5"
+version = "0.6.6"
 description = "Mod manager for Linux and Windows"
 authors = ["emperor-mod-manager contributors"]
 edition = "2021"
@@ -63,6 +63,9 @@ winreg = "0.56"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [dev-dependencies]
 tempfile = "3"

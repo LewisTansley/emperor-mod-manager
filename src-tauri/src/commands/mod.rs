@@ -115,6 +115,10 @@ pub struct AppState {
     pub last_nxm_handled: Mutex<Option<(String, Instant)>>,
     /// Debounce identical CDN download intercepts.
     pub last_cdn_handled: Mutex<Option<(String, Instant)>>,
+    /// Debounce identical emperor:// mod deep-link emits.
+    pub last_emperor_mod_emit: Mutex<Option<(String, Instant)>>,
+    /// Pending emperor:// mod open (cold start before the UI listens).
+    pub pending_emperor_mod: Mutex<Option<crate::deep_link::EmperorOpenMod>>,
     /// Last embedded assist panel bounds (logical px, relative to main window).
     pub assist_bounds: Mutex<AssistBounds>,
     /// Whether the assist webview should be shown (Downloads tab). Bounds/open must not force-show.
@@ -287,6 +291,8 @@ impl AppState {
             last_nxm_emit: Mutex::new(None),
             last_nxm_handled: Mutex::new(None),
             last_cdn_handled: Mutex::new(None),
+            last_emperor_mod_emit: Mutex::new(None),
+            pending_emperor_mod: Mutex::new(None),
             assist_bounds: Mutex::new(AssistBounds::default()),
             assist_desired_visible: AtomicBool::new(false),
             assist_pending_url: Mutex::new(None),

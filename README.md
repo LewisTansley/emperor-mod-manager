@@ -12,6 +12,7 @@ Browse, download, and deploy mods for dozens of games across Unity/BepInEx, Unre
 - **Nexus Premium** — one-click API downloads and Collection batch install
 - **Download Assist** — free Nexus accounts download in-app (optional autoclick), with `nxm://` staging and local archive import
 - **Browser deep links** — “Download with manager” (`nxm://`) opens in Emperor after install
+- **Shareable mod links** — Copy link on a mod page copies an `emperor://mod/...` URL that opens that mod in Emperor (Nexus, Thunderstore, and mod.io)
 - Soft dependency resolution on Thunderstore and mod.io, with a single pinned version per package
 
 ## Install

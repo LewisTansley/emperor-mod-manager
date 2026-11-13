@@ -3,6 +3,7 @@ mod app_update;
 mod assist;
 mod commands;
 mod config;
+mod deep_link;
 mod detection;
 mod diagnostics;
 mod games;
@@ -47,7 +48,22 @@ pub fn run() {
         }
     };
 
-    tauri::Builder::default()
+    // Single-instance must be first: on Linux/Windows a deep link starts a second
+    // process; with the deep-link feature that process forwards the URL into the
+    // primary instance's on_open_url instead of opening another window.
+    let mut builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
@@ -127,6 +143,7 @@ pub fn run() {
             commands::rename_saved_collection,
             commands::delete_saved_collection,
             commands::handle_nxm,
+            deep_link::take_pending_emperor_mod_link,
             commands::import_mod_archive,
             commands::import_mod_folder,
             commands::import_assist_download,
@@ -184,7 +201,7 @@ pub fn run() {
             tools::sync_game_tools,
         ])
         .setup(|app| {
-            // Register nxm:// with the OS when supported (Windows installer / Linux desktop).
+            // Register nxm:// and emperor:// with the OS when supported (Windows installer / Linux desktop).
             if let Err(e) = app.deep_link().register_all() {
                 log::warn!("deep-link register_all failed: {e}");
             }
@@ -194,12 +211,16 @@ pub fn run() {
                     let s = url.to_string();
                     if s.starts_with("nxm://") {
                         assist::emit_nxm_url(&handle, &s);
+                    } else if s.starts_with("emperor://") {
+                        deep_link::emit_emperor_mod_url(&handle, &s);
                     }
                 }
             });
             for arg in std::env::args().skip(1) {
                 if arg.starts_with("nxm://") {
                     assist::emit_nxm_url(app.handle(), &arg);
+                } else if arg.starts_with("emperor://") {
+                    deep_link::emit_emperor_mod_url(app.handle(), &arg);
                 }
             }
             Ok(())

@@ -47,6 +47,12 @@ import { estimateListRowHeight } from "./browseVirtual";
 import { AppNavHistory, type NavEntry } from "./appNavHistory";
 import { attachMouseNavigationListeners } from "./mouseNavigation";
 import { browseGameVersionOptions } from "./gameVersion";
+import {
+  catalogHitFromModDeepLink,
+  managedGameForModDeepLink,
+  modDeepLinkFromHit,
+  type EmperorOpenMod,
+} from "./modDeepLink";
 import { chosenFileLabel, stagedModSourceLine } from "./stagedLabel";
 import { Modal } from "./Modal";
 import { LoadLogDialog } from "./LoadLogDialog";
@@ -186,6 +192,62 @@ function blankCatalogHit(source: CatalogHit["source"], id: string, name: string)
     modio_game_id: null,
     modio_mod_id: null,
     profile_url: null,
+  };
+}
+
+/** Fill sparse catalog hits (e.g. deep links) from a loaded Nexus mod detail. */
+export function enrichCatalogHitFromNexus(hit: CatalogHit, detail: ModDetail): CatalogHit {
+  return {
+    ...hit,
+    name: detail.name || hit.name,
+    summary: detail.summary ?? hit.summary,
+    picture_url: detail.picture_url ?? hit.picture_url,
+    author: detail.author ?? hit.author,
+    downloads: detail.downloads ?? hit.downloads,
+    endorsements: detail.endorsements ?? hit.endorsements,
+    category: detail.category ?? hit.category,
+    domain_name: detail.domain_name || hit.domain_name,
+    mod_id: detail.mod_id || hit.mod_id,
+  };
+}
+
+/** Fill sparse catalog hits from a loaded Thunderstore package (mirrors catalog_from_ts). */
+export function enrichCatalogHitFromThunderstore(
+  hit: CatalogHit,
+  detail: TsPackageDetail,
+): CatalogHit {
+  return {
+    ...hit,
+    name: detail.name || hit.name,
+    summary: detail.description ?? hit.summary,
+    picture_url: detail.icon_url ?? hit.picture_url,
+    author: detail.namespace || hit.author,
+    downloads: detail.downloads ?? hit.downloads,
+    category: detail.categories[0] ?? hit.category,
+    tags: detail.categories.length > 0 ? detail.categories : hit.tags,
+    community: detail.community || hit.community,
+    namespace: detail.namespace || hit.namespace,
+    package_name: detail.name || hit.package_name,
+    full_name: detail.full_name || hit.full_name,
+    package_url: detail.package_url || hit.package_url,
+    rating_score: detail.rating_score ?? hit.rating_score,
+    latest_version: detail.latest_version ?? hit.latest_version,
+  };
+}
+
+/** Fill sparse catalog hits from a loaded mod.io mod detail. */
+export function enrichCatalogHitFromModio(hit: CatalogHit, detail: ModioModDetail): CatalogHit {
+  return {
+    ...hit,
+    name: detail.name || hit.name,
+    summary: detail.summary || hit.summary,
+    picture_url: detail.picture_url ?? hit.picture_url,
+    author: detail.author ?? hit.author,
+    downloads: detail.downloads ?? hit.downloads,
+    tags: detail.tags.length > 0 ? detail.tags : hit.tags,
+    modio_game_id: detail.game_id || hit.modio_game_id,
+    modio_mod_id: detail.mod_id || hit.modio_mod_id,
+    profile_url: detail.profile_url || hit.profile_url,
   };
 }
 
@@ -1342,6 +1404,9 @@ export default function App() {
   activeGameRef.current = activeGame;
   const prevActiveGameIdRef = useRef<string | null>(null);
   const pendingDownloadPageRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
+  const pendingEmperorModRef = useRef<{ hit: CatalogHit; gameId: string } | null>(null);
+  const openEmperorModLinkRef = useRef<(payload: EmperorOpenMod) => void>(() => {});
+  const lastEmperorOpenRef = useRef<{ key: string; at: number } | null>(null);
   const modUpdatesReqRef = useRef(0);
   const modFilesReqRef = useRef(0);
   const modFilesModIdRef = useRef<number | null>(null);
@@ -1935,6 +2000,14 @@ export default function App() {
             /* key may be stale */
           }
         }
+        if (!cancelled) {
+          try {
+            const pending = await api.takePendingEmperorModLink();
+            if (pending) openEmperorModLinkRef.current(pending);
+          } catch {
+            /* cold-start deep link is best-effort */
+          }
+        }
       } catch (e) {
         if (cancelled) return;
         setError(String(e));
@@ -2022,6 +2095,14 @@ export default function App() {
       setBrowseReturnTab("downloads");
       setTab("browse");
       void openMod(pending.hit);
+    }
+    const pendingEmperor = pendingEmperorModRef.current;
+    if (pendingEmperor && activeGame?.id === pendingEmperor.gameId) {
+      pendingEmperorModRef.current = null;
+      setTab("browse");
+      void openMod(pendingEmperor.hit, "info", {
+        navOverrides: { tab: "browse" },
+      });
     }
   }, [
     activeGame,
@@ -2977,6 +3058,12 @@ export default function App() {
         }
       }
     });
+    const unlistenEmperorMod = listen<EmperorOpenMod>("emperor-open-mod", (event) => {
+      void api.takePendingEmperorModLink().catch(() => {
+        /* clear cold-start stash so bootstrap take does not reopen */
+      });
+      openEmperorModLinkRef.current(event.payload);
+    });
     const unlistenAssist = listen<string>("assist-download-finished", async (event) => {
       const q = assistQueueRef.current;
       setBusy(
@@ -3227,6 +3314,7 @@ export default function App() {
       if (changedTimer != null) window.clearTimeout(changedTimer);
       unlistenChanged.then((f) => f());
       unlistenNxm.then((f) => f());
+      unlistenEmperorMod.then((f) => f());
       unlistenAssist.then((f) => f());
       unlistenOpened.then((f) => f());
       unlistenNeedsLogin.then((f) => f());
@@ -4041,6 +4129,13 @@ export default function App() {
     setModioDetail(null);
     setModioFiles([]);
     clearModFiles();
+    const hitId = hit.id;
+    const patchBrowseHit = (enrich: (current: CatalogHit) => CatalogHit) => {
+      const current = browseDetailRef.current;
+      if (!current || current.kind !== "mod" || current.hit.id !== hitId) return;
+      const nextHit = enrich(current.hit);
+      setBrowseDetail({ ...current, hit: nextHit });
+    };
     if (hit.source === "thunderstore") {
       if (!hit.community || !hit.namespace || !hit.package_name) return;
       await withBusy("Loading package…", async () => {
@@ -4051,6 +4146,7 @@ export default function App() {
         );
         setTsDetail(detail);
         setTsVersion(detail.latest_version ?? detail.versions[0]?.version_number ?? "");
+        patchBrowseHit((current) => enrichCatalogHitFromThunderstore(current, detail));
       });
       return;
     }
@@ -4059,6 +4155,7 @@ export default function App() {
       await withBusy("Loading mod.io mod…", async () => {
         const detail = await api.getModioMod(hit.modio_game_id!, hit.modio_mod_id!);
         setModioDetail(detail);
+        patchBrowseHit((current) => enrichCatalogHitFromModio(current, detail));
         if (detailTab === "files") {
           setModioFiles(
             await api.modioFiles(hit.modio_game_id!, hit.modio_mod_id!),
@@ -4070,15 +4167,17 @@ export default function App() {
     const domain = hit.domain_name || activeGame.nexus_domain;
     const modId = hit.mod_id;
     if (!modId) return;
-    if (detailTab === "files") {
-      await withBusy("Loading files…", async () => {
-        await loadModFiles(domain, modId);
-      });
-    } else {
-      await withBusy("Loading mod…", async () => {
-        setModDetail(await api.getMod(domain, modId));
-      });
-    }
+    await withBusy(
+      detailTab === "files" ? "Loading files…" : "Loading mod…",
+      async () => {
+        const detail = await api.getMod(domain, modId);
+        setModDetail(detail);
+        patchBrowseHit((current) => enrichCatalogHitFromNexus(current, detail));
+        if (detailTab === "files") {
+          await loadModFiles(domain, modId);
+        }
+      },
+    );
   }
 
   async function openStagedMod(mod: StagedMod) {
@@ -4121,6 +4220,63 @@ export default function App() {
     await openMod(hit, "info", {
       navOverrides: { tab: "browse", browseReturnTab: "downloads" },
     });
+  }
+
+  async function openEmperorModLink(payload: EmperorOpenMod) {
+    const key = JSON.stringify(payload);
+    const now = Date.now();
+    const last = lastEmperorOpenRef.current;
+    if (last && last.key === key && now - last.at < 2000) return;
+    lastEmperorOpenRef.current = { key, at: now };
+
+    const game = managedGameForModDeepLink(managedRef.current, payload);
+    if (!game) {
+      setNotice({
+        kind: "warn",
+        message: "That game is not managed.",
+      });
+      return;
+    }
+    const hit = catalogHitFromModDeepLink(payload);
+    if (activeGameRef.current?.id !== game.id) {
+      pendingEmperorModRef.current = { hit, gameId: game.id };
+      try {
+        await api.setActiveGame(game.id);
+      } catch (e) {
+        pendingEmperorModRef.current = null;
+        setError(String(e));
+        return;
+      }
+      setActiveId(game.id);
+      return;
+    }
+    setTab("browse");
+    await openMod(hit, "info", {
+      navOverrides: { tab: "browse" },
+    });
+  }
+  openEmperorModLinkRef.current = (payload) => {
+    void openEmperorModLink(payload);
+  };
+
+  async function copyModDeepLink(hit: CatalogHit) {
+    const link = modDeepLinkFromHit(hit);
+    if (!link) {
+      setNotice({
+        kind: "warn",
+        message: "This mod has no shareable Emperor link.",
+      });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(link);
+      setNotice({ kind: "ok", message: "Emperor link copied." });
+    } catch {
+      setNotice({
+        kind: "warn",
+        message: "Could not copy the link to the clipboard.",
+      });
+    }
   }
 
   async function openCollection(
@@ -7228,7 +7384,14 @@ export default function App() {
                     <button type="button" onClick={() => void navBack()}>
                       ← Back
                     </button>
-                    <h1>{browseDetail.hit.name}</h1>
+                    <h1>
+                      {browseDetail.kind === "mod"
+                        ? (modDetail?.name ??
+                          tsDetail?.name ??
+                          modioDetail?.name ??
+                          browseDetail.hit.name)
+                        : browseDetail.hit.name}
+                    </h1>
                   </div>
                   <Segment>
                     <SegmentTab
@@ -7378,6 +7541,14 @@ export default function App() {
                               onClick={() => void uninstallCatalogMod(browseDetail.hit)}
                             >
                               Uninstall
+                            </button>
+                          ) : null}
+                          {modDeepLinkFromHit(browseDetail.hit) ? (
+                            <button
+                              type="button"
+                              onClick={() => void copyModDeepLink(browseDetail.hit)}
+                            >
+                              Copy link
                             </button>
                           ) : null}
                           {browseDetail.hit.source === "thunderstore" ? (
